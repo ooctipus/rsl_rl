@@ -7,5 +7,6 @@
 
 from .distillation import Distillation
 from .ppo import PPO
+from .success_estimator_ppo import SuccessEstimatorPPO
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "Distillation", "SuccessEstimatorPPO"]

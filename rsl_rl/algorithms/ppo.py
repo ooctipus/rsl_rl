@@ -51,6 +51,7 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
+        returns_method: str = "gae",
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -135,6 +136,7 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.returns_method = returns_method
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -185,26 +187,50 @@ class PPO:
         self.critic.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """Compute return and advantage targets from stored transitions."""
+        """Compute return and advantage targets from stored transitions.
+
+        Dispatches to the method selected by :attr:`returns_method`.
+        """
+        if self.returns_method == "gae":
+            self._compute_returns_gae(obs)
+        elif self.returns_method == "hindsight_mc":
+            self._compute_returns_hindsight_mc(obs)
+        else:
+            raise ValueError(f"Unknown returns_method: {self.returns_method!r}")
+
+    def _compute_returns_gae(self, obs: TensorDict) -> None:
+        """Standard GAE return computation."""
         st = self.storage
-        # Compute value for the last step
         last_values = self.critic(obs).detach()
-        # Compute returns and advantages
         advantage = 0
         for step in reversed(range(st.num_transitions_per_env)):
-            # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
-            # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - st.dones[step].float()
-            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
             delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
-            # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
-            # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
-        # Compute the advantages
         st.advantages = st.returns - st.values
-        # Normalize the advantages if per minibatch normalization is not used
+        if not self.normalize_advantage_per_mini_batch:
+            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+    def _compute_returns_hindsight_mc(self, obs: TensorDict) -> None:
+        """Hindsight Monte Carlo returns with bootstrap at the horizon cutoff.
+
+        Computes the discounted return by summing rewards backward. At terminal
+        steps (done=1) the return resets to the terminal reward — giving exact
+        MC returns for completed episodes. At the horizon cutoff (end of the
+        rollout buffer), bootstraps with V(s_last) for in-progress episodes.
+        Equivalent to GAE with lambda=1.
+        """
+        st = self.storage
+        mc_return = self.critic(obs).detach()
+
+        for step in reversed(range(st.num_transitions_per_env)):
+            next_is_not_terminal = 1.0 - st.dones[step].float()
+            mc_return = st.rewards[step] + next_is_not_terminal * self.gamma * mc_return
+            st.returns[step] = mc_return
+
+        st.advantages = st.returns - st.values
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
@@ -499,6 +525,10 @@ class PPO:
 
         # Initialize the storage
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+
+        # Remove keys that belong to SuccessEstimatorPPO (harmless when absent)
+        for key in ("success_returns_method", "success_estimator_learning_rate", "success_loss_coef"):
+            cfg["algorithm"].pop(key, None)
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])

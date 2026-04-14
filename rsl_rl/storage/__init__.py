@@ -6,5 +6,6 @@
 """Storage for the learning algorithms."""
 
 from .rollout_storage import RolloutStorage
+from .success_estimator_rollout_storage import SuccessEstimatorRolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["RolloutStorage", "SuccessEstimatorRolloutStorage"]
