@@ -46,6 +46,8 @@ class PPO:
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
+        weight_decay: float = 0.0,
+        log_weight_decay_metrics: bool = True,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -88,9 +90,16 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
+        if weight_decay < 0.0:
+            raise ValueError(f"Weight decay must be non-negative; got {weight_decay}.")
+        self.weight_decay = weight_decay
+        self.log_weight_decay_metrics = log_weight_decay_metrics
+
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            chain(self.actor.parameters(), self.critic.parameters()),
+            lr=learning_rate,
+            weight_decay=weight_decay,
         )  # type: ignore
 
         # Add storage
@@ -337,6 +346,15 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+
+        # Weight-decay diagnostics: total L2 norm of the optimized parameters, so the regularization
+        # pressure is visible. Only logged when weight decay is actually active.
+        if self.weight_decay > 0.0 and self.log_weight_decay_metrics:
+            with torch.no_grad():
+                weight_norm = torch.norm(
+                    torch.stack([p.detach().norm() for g in self.optimizer.param_groups for p in g["params"]])
+                )
+            loss_dict["weight_norm"] = weight_norm.item()
 
         # Clear the storage
         self.storage.clear()
