@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
@@ -63,6 +65,23 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     defaults.update(overrides)
     ppo = PPO(actor, critic, storage, **defaults)
     return ppo, obs
+
+
+class TestOptimizerConfig:
+    """Tests for PPO optimizer configuration."""
+
+    def test_weight_decay_sets_optimizer_param_groups(self) -> None:
+        """PPO should pass weight decay through to the selected optimizer."""
+        ppo, _ = _build_ppo(optimizer="adamw", weight_decay=1.0e-4)
+
+        assert ppo.weight_decay == 1.0e-4
+        assert ppo.optimizer.defaults["weight_decay"] == 1.0e-4
+        assert all(group["weight_decay"] == 1.0e-4 for group in ppo.optimizer.param_groups)
+
+    def test_negative_weight_decay_raises(self) -> None:
+        """Weight decay must be non-negative."""
+        with pytest.raises(ValueError, match="Weight decay must be non-negative"):
+            _build_ppo(weight_decay=-1.0)
 
 
 class TestGAEComputation:
