@@ -15,8 +15,11 @@ from rsl_rl.utils.log_writer import LogWriter
 
 try:
     import wandb
-except ModuleNotFoundError:
+except ImportError as exc:
     wandb = None
+    _wandb_import_error = exc
+else:
+    _wandb_import_error = None
 
 
 class WandbLogWriter(SummaryWriter, LogWriter):
@@ -25,7 +28,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
     def __init__(self, log_dir: str, project_name: str) -> None:
         """Initialize a W&B run for logging."""
         if wandb is None:
-            raise ModuleNotFoundError("wandb package is required to log to Weights and Biases.")
+            raise ModuleNotFoundError("wandb package is required to log to Weights and Biases.") from _wandb_import_error
         super().__init__(log_dir, flush_secs=10)
 
         # Get the run name
