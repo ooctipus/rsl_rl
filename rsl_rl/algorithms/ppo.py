@@ -12,7 +12,13 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.extensions import (
+    RandomNetworkDistillation,
+    Symmetry,
+    ValueShift,
+    resolve_rnd_config,
+    resolve_symmetry_config,
+)
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
@@ -57,6 +63,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Value-shift parameters (post-update critic value-drift signal)
+        value_shift_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -80,6 +88,9 @@ class PPO:
         if symmetry_cfg is not None and (actor.is_recurrent or critic.is_recurrent):
             raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
         self.symmetry = Symmetry(**symmetry_cfg) if symmetry_cfg else None
+
+        # Value-shift extension (post-update critic value-drift signal; no loss/gradient)
+        self.value_shift = ValueShift(**value_shift_cfg) if value_shift_cfg else None
 
         # PPO components
         self.actor = actor.to(self.device)
@@ -359,6 +370,10 @@ class PPO:
         # Clear the storage
         self.storage.clear()
 
+        # Value-shift augmentation: post-update per-state critic value-drift signal (no gradient)
+        if self.value_shift:
+            self.value_shift.after_update(self.critic)
+
         return loss_dict
 
     def train_mode(self) -> None:
@@ -462,6 +477,10 @@ class PPO:
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
+
+        # Bind the value-shift cache/buffers (owned by an external consumer) onto the extension
+        if alg.value_shift is not None:
+            alg.value_shift.bind(env, alg)
 
         return alg
 

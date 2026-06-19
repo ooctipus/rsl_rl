@@ -7,10 +7,12 @@
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
+from .value_shift import ValueShift
 
 __all__ = [
     "RandomNetworkDistillation",
     "Symmetry",
+    "ValueShift",
     "resolve_rnd_config",
     "resolve_symmetry_config",
 ]
