@@ -161,9 +161,28 @@ def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
         else:
             raise ImportError(f"Could not resolve '{callable_or_name}': no valid module.attr split found")
 
-    # Simple name - look for it in rsl_rl
-    for _, module_name, _ in pkgutil.iter_modules(rsl_rl.__path__, "rsl_rl."):
+    # Simple name - first check public rsl_rl modules.  Editable installs can
+    # merge unrelated namespace paths into ``rsl_rl.__path__``; blindly importing
+    # every discovered module may execute scripts such as ``rsl_rl.play``.
+    for module_name in (
+        "rsl_rl.algorithms",
+        "rsl_rl.models",
+        "rsl_rl.modules",
+        "rsl_rl.runners",
+        "rsl_rl.extensions",
+        "rsl_rl.utils",
+    ):
         module = importlib.import_module(module_name)
+        if hasattr(module, callable_or_name):
+            return getattr(module, callable_or_name)
+
+    # Fall back to a best-effort scan of rsl_rl modules, ignoring optional modules
+    # whose import-time dependencies are unavailable.
+    for _, module_name, _ in pkgutil.iter_modules(rsl_rl.__path__, "rsl_rl."):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
         if hasattr(module, callable_or_name):
             return getattr(module, callable_or_name)
 
