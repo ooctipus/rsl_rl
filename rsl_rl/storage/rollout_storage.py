@@ -52,6 +52,18 @@ class RolloutStorage:
             self.distribution_params: tuple[torch.Tensor, ...] | None = None
             """Parameters of the action distribution (RL only)."""
 
+            # For the successor-feature augmentation (optional)
+            self.next_observations: TensorDict | None = None
+            """Observations at the next step ``s'`` (the realized successor; successor augmentation only)."""
+
+            self.time_outs: torch.Tensor | None = None
+            """Truncation flags, to split true terminals from timeouts in the successor occupancy loss
+            (successor augmentation only)."""
+
+            self.command_indices: torch.Tensor | None = None
+            """Per-env task index (which goal each env was commanded to reach this step), for the z-conditioned
+            successor value ``z = B(goal_cache[command_indices])`` (successor augmentation only)."""
+
             # For distillation
             self.privileged_actions: torch.Tensor | None = None
             """Privileged (teacher) actions (distillation only)."""
@@ -84,6 +96,9 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            next_observations: TensorDict | None = None,
+            time_outs: torch.Tensor | None = None,
+            command_indices: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -121,6 +136,16 @@ class RolloutStorage:
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+
+            # For the successor-feature augmentation (optional)
+            self.next_observations: TensorDict | None = next_observations
+            """Batch of next-step observations ``s'`` (successor augmentation only)."""
+
+            self.time_outs: torch.Tensor | None = time_outs
+            """Batch of truncation flags (successor augmentation only)."""
+
+            self.command_indices: torch.Tensor | None = command_indices
+            """Batch of per-env task indices for the z-conditioned successor value (successor augmentation only)."""
 
     def __init__(
         self,
@@ -163,6 +188,11 @@ class RolloutStorage:
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
+        # For the successor-feature augmentation (lazily allocated on the first transition that carries a next obs)
+        self.next_observations: TensorDict | None = None
+        self.time_outs: torch.Tensor | None = None
+        self.command_indices: torch.Tensor | None = None
+
         # For recurrent networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
@@ -197,6 +227,31 @@ class RolloutStorage:
                 )
             for i, p in enumerate(transition.distribution_params):  # type: ignore
                 self.distribution_params[i][self.step].copy_(p)
+
+        # For the successor-feature augmentation
+        if transition.next_observations is not None:
+            if self.next_observations is None:
+                self.next_observations = TensorDict(
+                    {
+                        key: torch.zeros(
+                            self.num_transitions_per_env, *value.shape, dtype=value.dtype, device=self.device
+                        )
+                        for key, value in transition.next_observations.items()
+                    },
+                    batch_size=[self.num_transitions_per_env, self.num_envs],
+                    device=self.device,
+                )
+            self.next_observations[self.step].copy_(transition.next_observations)
+        if transition.time_outs is not None:
+            if self.time_outs is None:
+                self.time_outs = torch.zeros(self.num_transitions_per_env, self.num_envs, 1, device=self.device)
+            self.time_outs[self.step].copy_(transition.time_outs.view(-1, 1))
+        if transition.command_indices is not None:
+            if self.command_indices is None:
+                self.command_indices = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs, dtype=torch.long, device=self.device
+                )
+            self.command_indices[self.step].copy_(transition.command_indices.view(-1))
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -238,6 +293,12 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        # Successor-feature augmentation (optional): next-step obs (s'), timeouts, command indices, dones for
+        # the reward-free occupancy loss (the FB-native reward is recomputed in the update, not stored here).
+        next_observations = self.next_observations.flatten(0, 1) if self.next_observations is not None else None
+        time_outs = self.time_outs.flatten(0, 1) if self.time_outs is not None else None
+        command_indices = self.command_indices.flatten(0, 1) if self.command_indices is not None else None
+        dones = self.dones.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -255,6 +316,10 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    next_observations=next_observations[batch_idx] if next_observations is not None else None,
+                    time_outs=time_outs[batch_idx] if time_outs is not None else None,
+                    command_indices=command_indices[batch_idx] if command_indices is not None else None,
+                    dones=dones[batch_idx],
                 )
 
     # For reinforcement learning with recurrent networks

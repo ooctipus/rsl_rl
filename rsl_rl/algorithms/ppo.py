@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import (
     RandomNetworkDistillation,
+    SuccessorFeatures,
     Symmetry,
     ValueShift,
     resolve_rnd_config,
@@ -65,6 +66,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Value-shift parameters (post-update critic value-drift signal)
         value_shift_cfg: dict | None = None,
+        # Successor-feature parameters (auxiliary head + optional value coupling)
+        successor_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -101,12 +104,22 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
+        # Forward-backward successor-representation critic. The F/B maps live on the critic model; this
+        # extension owns only the reward-free occupancy losses and the forward-backward target net (built in
+        # ``construct_algorithm``). The value V = <F(s, z), z> is derived -- the extension has no learnable params.
+        if successor_cfg is not None:
+            if actor.is_recurrent or critic.is_recurrent:
+                raise ValueError("Successor augmentation is not supported for recurrent policies.")
+            if symmetry_cfg is not None:
+                raise ValueError("Successor augmentation is not supported together with symmetry augmentation.")
+        self.successor = SuccessorFeatures(gamma=gamma, device=self.device, **successor_cfg) if successor_cfg else None
+
         if weight_decay < 0.0:
             raise ValueError(f"Weight decay must be non-negative; got {weight_decay}.")
         self.weight_decay = weight_decay
         self.log_weight_decay_metrics = log_weight_decay_metrics
 
-        # Create the optimizer
+        # Create the optimizer (the successor F/B heads are on the critic, already covered).
         self.optimizer = resolve_optimizer(optimizer)(
             chain(self.actor.parameters(), self.critic.parameters()),
             lr=learning_rate,
@@ -132,13 +145,35 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+    def _state_value(self, obs: TensorDict) -> torch.Tensor:
+        """Return the state value ``V(s)`` -- the single source of truth for value across the algorithm.
+
+        This is the successor value ``<F(s, z), z>`` when the successor extension is enabled, else the critic's
+        scalar head. Shared by GAE bootstrapping (``act`` / ``compute_returns``) and the
+        value-shift hook so they never diverge. No masks: the successor path is non-recurrent and the
+        value-shift cache is a flat observation batch.
+        """
+        if self.successor is not None:
+            return self.successor.value(self.critic, obs)
+        return self.critic(obs)
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
+        if self.successor is not None:
+            # z-conditioned actor + value share ONE detached goal embedding z = B(current goal); the actor reads
+            # the goal only through z (its obs is goal-free), and the value is V = <F(s, z), z>. The per-env
+            # commanded task index is stored so the update recomputes the SAME z with the still-training B.
+            cmd_indices = self.successor.cmd_indices_fn() if self.successor.cmd_indices_fn is not None else None
+            self.transition.command_indices = cmd_indices
+            z = self.successor.goal_z(self.critic, cmd_indices)
+            self.transition.actions = self.actor(obs, z, stochastic_output=True).detach()
+            self.transition.values = self.successor.state_value(self.critic, obs, z).detach()
+        else:
+            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+            self.transition.values = self._state_value(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -159,6 +194,33 @@ class PPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+
+        # Successor-feature augmentation: record the realized next state s' for the occupancy objective and
+        # OVERRIDE the policy reward with the FB-native goal-alignment <B(s'), z> (w = z; no extrinsic success
+        # reward). The timeout value-bootstrap below still mutates ``transition.rewards`` (used for GAE).
+        if self.successor is not None:
+            # Realized next state s' for the FB occupancy. CRITICAL reset-state handling: the env auto-reset has
+            # overwritten ``obs`` with the NEXT EPISODE's reset state on every done env. Never let that reset
+            # obs be read as the successor of the last step. So:
+            #   - true terminal (absorbing): alias next_obs := the CURRENT obs (self-loop). No reset state, no
+            #     captured terminal obs (which poisoned training); the absorbing self-visit is the correct object.
+            #   - timeout: not absorbing and we lack the true continuation, so it is DROPPED from the FB loss
+            #     (keep mask); its stored next_obs is irrelevant.
+            #   - non-done: keep the real post-step next obs.
+            timeout = extras["time_outs"] if "time_outs" in extras else torch.zeros_like(dones)
+            terminal_mask = dones.bool() & ~timeout.bool()
+            next_obs = obs
+            if terminal_mask.any():
+                next_obs = obs.clone()
+                cur = self.transition.observations  # pre-step obs s_t (set in act())
+                for key in next_obs.keys():  # noqa: SIM118  (TensorDict iteration walks the batch dim, not keys)
+                    next_obs[key][terminal_mask] = cur[key][terminal_mask]
+            self.transition.next_observations = next_obs
+            self.transition.time_outs = timeout
+            # w = z reward: r(s') = <B(s'), z>, the goal-alignment whose successor value is V = <F(s, z), z>.
+            # z = the commanded goal embedding (same as act()). Replaces the extrinsic reward set above.
+            z = self.successor.goal_z(self.critic, self.transition.command_indices)
+            self.transition.rewards = self.successor.goal_alignment_reward(self.critic, next_obs, z)
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -185,7 +247,7 @@ class PPO:
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
-        last_values = self.critic(obs).detach()
+        last_values = self._state_value(obs).detach()
         # Restore the critic's hidden state so the next rollout is not affected by the forward pass
         self.critic.reset(hidden_state=critic_hidden_state)
         # Compute returns and advantages
@@ -216,6 +278,12 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # Successor-representation losses (FB measure / orthonormality) + ``||F(s,z)||``, the early-warning
+        # signal that must SELF-BOUND under z-conditioning (it inflates well before the loss does if F diverges).
+        mean_fb_loss = 0 if self.successor else None
+        mean_ortho_loss = 0 if self.successor else None
+        mean_f_norm = 0 if self.successor else None
+        mean_m_diag = 0 if self.successor else None  # E[M(s,s')] diagonal -> should converge to 1/(1-gamma)
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -238,14 +306,33 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
+            if self.successor is not None:
+                # z-conditioned actor + value share ONE detached goal embedding z = B(goal_cache[stored
+                # cmd_indices]) -- recomputed with the current (still-training) backward map (raw goal obs are
+                # cached, not stale embeddings). The actor reads the goal only through z; the value V=<F(s,z),z>
+                # is derived from F (no read-out), so F stays owned by the reward-free FB measure + ortho.
+                # (Successor forbids symmetry, so the batch is un-augmented.)
+                z_goal = self.successor.goal_z(self.critic, batch.command_indices)  # type: ignore
+                self.actor(
+                    batch.observations,
+                    z_goal,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+            else:
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            if self.successor is not None:
+                obs_s = batch.observations[:original_batch_size]
+                values = self.successor.state_value(self.critic, obs_s, z_goal[:original_batch_size])
+            else:
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
@@ -295,7 +382,25 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            loss = surrogate_loss - self.entropy_coef * entropy.mean()
+            # Critic objective (mutually exclusive): a scalar critic regresses V to returns; the successor critic
+            # instead trains the reward-free z-conditioned forward-backward occupancy + orthonormality, and its
+            # value V=<F(s,z),z> is DERIVED from F (no value regression -- ``value_loss`` stays only a diagnostic).
+            # ``representation_loss`` does its own F/B forwards on obs_s/next_obs, conditioned on the ON-POLICY
+            # goal z (the env's commanded goal via ``command_indices``) -- the z that generated the transition
+            # under the z-conditioned actor, which is what makes z load-bearing in on-policy PPO.
+            if self.successor is None:
+                loss = loss + self.value_loss_coef * value_loss
+            else:
+                next_obs = batch.next_observations[:original_batch_size]  # type: ignore
+                timeout = batch.time_outs[:original_batch_size].float()  # type: ignore
+                # true (absorbing) terminals = dones that are not timeouts (dones lumps both)
+                terminal = (batch.dones[:original_batch_size].bool() & ~timeout.bool()).float()  # type: ignore
+                cmd_idx = batch.command_indices[:original_batch_size] if batch.command_indices is not None else None  # type: ignore
+                fb_loss, ortho_loss, f_norm, m_diag = self.successor.representation_loss(
+                    self.critic, obs_s, next_obs, terminal, timeout, cmd_idx
+                )
+                loss = loss + fb_loss + self.successor.ortho_coef * ortho_loss
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -325,6 +430,9 @@ class PPO:
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
+            # Polyak-update the successor forward-backward target network toward the live critic.
+            if self.successor is not None:
+                self.successor.update_target(self.critic)
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -336,6 +444,12 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # Successor-representation losses
+            if mean_fb_loss is not None:
+                mean_fb_loss += fb_loss.item()
+                mean_ortho_loss += ortho_loss.item()
+                mean_f_norm += f_norm.item()
+                mean_m_diag += m_diag.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -346,6 +460,11 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_fb_loss is not None:
+            mean_fb_loss /= num_updates
+            mean_ortho_loss /= num_updates
+            mean_f_norm /= num_updates
+            mean_m_diag /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -357,6 +476,11 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.successor:
+            loss_dict["fb"] = mean_fb_loss
+            loss_dict["ortho"] = mean_ortho_loss
+            loss_dict["f_norm"] = mean_f_norm
+            loss_dict["m_diag"] = mean_m_diag
 
         # Weight-decay diagnostics: total L2 norm of the optimized parameters, so the regularization
         # pressure is visible. Only logged when weight decay is actually active.
@@ -370,9 +494,10 @@ class PPO:
         # Clear the storage
         self.storage.clear()
 
-        # Value-shift augmentation: post-update per-state critic value-drift signal (no gradient)
+        # Value-shift augmentation: post-update per-state value-drift signal (no gradient). Pass the algorithm's
+        # value function (``<F(s, z), z>`` under successor, scalar head otherwise) so the two extensions compose.
         if self.value_shift:
-            self.value_shift.after_update(self.critic)
+            self.value_shift.after_update(self._state_value)
 
         return loss_dict
 
@@ -400,6 +525,8 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.successor:
+            saved_dict["successor_state_dict"] = self.successor.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -412,6 +539,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "successor": True,
             }
 
         # Load the specified models
@@ -424,6 +552,8 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if load_cfg.get("successor") and self.successor and "successor_state_dict" in loaded_dict:
+            self.successor.load_state_dict(loaded_dict["successor_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -466,6 +596,8 @@ class PPO:
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
+        # The critic outputs a scalar by contract; in successor mode it is the SuccessorFeatureCriticModel,
+        # which ignores ``output_dim`` and exposes ``forward_map``/``backward`` (value = extension's <F(s,z), z>).
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
@@ -477,6 +609,20 @@ class PPO:
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
+
+        # Build the successor forward-backward target network (a frozen Polyak copy of the critic). The F/B
+        # heads are on the critic, so they are already in the optimizer; the extension has no learnable params.
+        # Copy the UNCOMPILED critic: the target net runs under no_grad (no need to compile it) and
+        # ``copy.deepcopy`` of a ``torch.compile`` OptimizedModule is fragile.
+        if alg.successor is not None:
+            alg.successor.build(alg._raw_critic)
+            # Bind the goal library for the z-conditioned value V = <F(s, z), z>, z = B(goal_cache[cmd_indices]).
+            # The command term named by ``successor_cfg.goal_command_name`` (a StateCommand) builds the per-task
+            # target-obs cache once (a teleport-to-target sweep, restored after) and exposes the per-env task
+            # index. Single deterministic lookup -- no discovery scan, no fallback: a wrong/missing name or a
+            # term lacking ``get_target_obs_cache`` fails loudly here at the boundary.
+            term = env.unwrapped.command_manager.get_term(alg.successor.goal_command_name)
+            alg.successor.bind_goals(term.get_target_obs_cache(), lambda: term.cmd_indices)
 
         # Bind the value-shift cache/buffers (owned by an external consumer) onto the extension
         if alg.value_shift is not None:

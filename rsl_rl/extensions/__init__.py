@@ -6,11 +6,13 @@
 """Extensions for the learning algorithms."""
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
+from .successor import SuccessorFeatures
 from .symmetry import Symmetry, resolve_symmetry_config
 from .value_shift import ValueShift
 
 __all__ = [
     "RandomNetworkDistillation",
+    "SuccessorFeatures",
     "Symmetry",
     "ValueShift",
     "resolve_rnd_config",
