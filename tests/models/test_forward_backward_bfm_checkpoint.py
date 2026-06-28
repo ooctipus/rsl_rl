@@ -69,9 +69,9 @@ def _make_model(*, normalization: bool = False) -> ForwardBackwardModel:
         forward_cfg=ForwardBackwardDualNetworkCfg(16, 1, 2),
         backward_hidden_dims=(16,),
         discriminator_hidden_dims=(1024, 1024, 1024),
-        observation_normalization=normalization,
+        normalization_type="exponential" if normalization else "none",
         normalization_eps=1e-5,
-        normalization_momentum=0.01 if normalization else None,
+        normalization_momentum=0.01,
         distribution_cfg={"class_name": "ClippedGaussianDistribution", "init_std": 0.05},
     ).to(_DEVICE)
 

@@ -109,7 +109,7 @@ def _make_model() -> ForwardBackwardModel:
         backward_hidden_dims=(256,),
         discriminator_hidden_dims=(1024, 1024, 1024),
         value_heads=(critic,),
-        observation_normalization=False,
+        normalization_type="none",
     ).to(_DEVICE)
 
 

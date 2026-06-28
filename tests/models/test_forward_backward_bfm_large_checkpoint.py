@@ -90,7 +90,7 @@ def _make_representation_model() -> ForwardBackwardModel:
         actor_cfg=ForwardBackwardDualNetworkCfg(16, 1, 2),
         forward_cfg=ForwardBackwardDualNetworkCfg(2048, 6, 6, True),
         backward_hidden_dims=(256,),
-        observation_normalization=False,
+        normalization_type="none",
     ).to(_DEVICE)
 
 
@@ -126,7 +126,7 @@ def _make_value_model() -> ForwardBackwardModel:
         forward_cfg=ForwardBackwardDualNetworkCfg(16, 1, 2),
         backward_hidden_dims=(16,),
         value_heads=(head,),
-        observation_normalization=False,
+        normalization_type="none",
     ).to(_DEVICE)
 
 

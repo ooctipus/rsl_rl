@@ -9,7 +9,21 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as functional
 from torch import nn
+
+
+class IdentityNormalization(nn.Module):
+    """Leave values unchanged and carry no temporal statistics."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return input values unchanged."""
+        return x
+
+    @torch.jit.unused
+    def update(self, x: torch.Tensor) -> None:
+        """Accept a statistics update without storing state."""
+        del x
 
 
 class EmpiricalNormalization(nn.Module):
@@ -69,6 +83,44 @@ class EmpiricalNormalization(nn.Module):
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """De-normalize values based on empirical values."""
         return y * (self._std + self.eps) + self._mean
+
+
+class ExponentialNormalization(nn.BatchNorm1d):
+    """Normalize feature-last values with exponential running moments.
+
+    Statistics change only through :meth:`update`; :meth:`forward` always
+    reads the stored moments. This keeps temporal state transitions explicit
+    even while the parent model remains in training mode.
+    """
+
+    def __init__(self, shape: int, eps: float = 1e-5, momentum: float = 0.1) -> None:
+        """Initialize exponential running moments for one feature vector."""
+        if not 0.0 < momentum <= 1.0:
+            raise ValueError("momentum must be in (0, 1].")
+        super().__init__(shape, eps=eps, momentum=momentum, affine=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize arbitrary leading dimensions without updating moments."""
+        shape = x.shape
+        flattened = x.reshape(-1, shape[-1])
+        normalized = functional.batch_norm(
+            flattened,
+            self.running_mean,
+            self.running_var,
+            training=False,
+            momentum=self.momentum,
+            eps=self.eps,
+        )
+        return normalized.reshape(shape)
+
+    @torch.jit.unused
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        """Update running moments from arbitrary feature-last batches."""
+        if not self.training:
+            return
+        flattened = x.reshape(-1, x.shape[-1])
+        super().forward(flattened)
 
 
 class EmpiricalDiscountedVariationNormalization(nn.Module):

@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from tensordict import TensorDict, TensorDictBase
+from typing import Literal
 
 import pytest
 
@@ -119,7 +120,7 @@ def _make_learner(
     *,
     include_auxiliary: bool = True,
     multi_gpu_cfg: dict | None = None,
-    normalization_momentum: float | None = None,
+    normalization_type: Literal["empirical", "exponential"] = "empirical",
 ) -> ForwardBackward:
     """Create a small deterministic learner with live replay and expert data."""
     torch.manual_seed(13)
@@ -177,9 +178,9 @@ def _make_learner(
         backward_hidden_dims=(16, 16),
         discriminator_hidden_dims=(16, 16),
         value_heads=tuple(value_heads),
-        observation_normalization=True,
-        normalization_eps=1e-5 if normalization_momentum is not None else 1e-2,
-        normalization_momentum=normalization_momentum,
+        normalization_type=normalization_type,
+        normalization_eps=1e-5 if normalization_type == "exponential" else 1e-2,
+        normalization_momentum=0.01,
     )
     transition_schema = ForwardBackwardTransitionSchema(
         observation_schema_hash=model.observation_schema.schema_hash,
@@ -512,7 +513,7 @@ def test_learner_checkpoint_reproduces_the_exact_next_update() -> None:
 
 def test_source_matched_normalizer_uses_two_ordered_updates_in_full_sequence() -> None:
     """The complete update should mutate EMA statistics in current-then-next order."""
-    learner = _make_learner(normalization_momentum=0.01)
+    learner = _make_learner(normalization_type="exponential")
     replay_rng = learner.replay.generator.get_state()
     batch = learner.replay.sample_random(learner.batch_size)
     learner.replay.generator.set_state(replay_rng)

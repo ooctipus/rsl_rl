@@ -72,7 +72,7 @@ def _model(
         forward_ensemble_size=2,
         discriminator_hidden_dims=(8, 8) if discriminator else None,
         value_heads=heads,
-        observation_normalization=False,
+        normalization_type="none",
     )
 
 

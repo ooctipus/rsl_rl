@@ -7,7 +7,52 @@
 
 import torch
 
-from rsl_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from rsl_rl.modules.normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    ExponentialNormalization,
+    IdentityNormalization,
+)
+
+
+class TestNormalizationContract:
+    """Tests for the shared explicit update and pure read contract."""
+
+    def test_identity_update_and_forward_are_stateless(self) -> None:
+        """Identity normalization should accept updates without owning state."""
+        norm = IdentityNormalization()
+        values = torch.randn(4, 3)
+
+        norm.update(values)
+
+        assert norm(values) is values
+        assert norm.state_dict() == {}
+
+    def test_exponential_forward_does_not_update_statistics(self) -> None:
+        """Exponential normalization should mutate only through update()."""
+        norm = ExponentialNormalization(3, eps=1e-5, momentum=0.01)
+        values = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+        norm.update(values)
+        batches_before = norm.num_batches_tracked.clone()
+        mean_before = norm.running_mean.clone()
+        variance_before = norm.running_var.clone()
+
+        normalized = norm(values)
+
+        assert torch.equal(norm.num_batches_tracked, batches_before)
+        assert torch.equal(norm.running_mean, mean_before)
+        assert torch.equal(norm.running_var, variance_before)
+        expected = (values - mean_before) / torch.sqrt(variance_before + norm.eps)
+        torch.testing.assert_close(normalized, expected)
+
+    def test_exponential_eval_mode_freezes_explicit_updates(self) -> None:
+        """Evaluation mode should make update() a no-op."""
+        norm = ExponentialNormalization(3)
+        norm.eval()
+
+        norm.update(torch.randn(8, 3))
+
+        assert norm.num_batches_tracked.item() == 0
 
 
 class TestEmpiricalNormalization:

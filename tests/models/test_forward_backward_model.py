@@ -11,6 +11,7 @@ import copy
 import inspect
 import torch
 from tensordict import TensorDict
+from typing import Literal
 
 import pytest
 
@@ -61,9 +62,9 @@ def _make_model(
     forward_ensemble_size: int = 2,
     discriminator_hidden_dims: tuple[int, ...] | None = None,
     value_heads: tuple[ForwardBackwardValueHeadCfg, ...] = (),
-    observation_normalization: bool = False,
+    normalization_type: Literal["none", "empirical", "exponential"] = "none",
     normalization_eps: float = 1e-2,
-    normalization_momentum: float | None = None,
+    normalization_momentum: float = 0.1,
     distribution_cfg: dict[str, object] | None = None,
 ) -> ForwardBackwardModel:
     return ForwardBackwardModel(
@@ -77,7 +78,7 @@ def _make_model(
         forward_ensemble_size=forward_ensemble_size,
         discriminator_hidden_dims=discriminator_hidden_dims,
         value_heads=value_heads,
-        observation_normalization=observation_normalization,
+        normalization_type=normalization_type,
         normalization_eps=normalization_eps,
         normalization_momentum=normalization_momentum,
         distribution_cfg=distribution_cfg,
@@ -340,7 +341,7 @@ def test_scaled_bfm_residual_model_uses_every_asymmetric_route() -> None:
 def test_field_normalizers_update_once_freeze_and_round_trip() -> None:
     """Shared fields should own one restorable statistic regardless of route reuse."""
     observations = _make_bfm_observations(batch_size=5)
-    model = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    model = _make_model(observations, BFM_ROUTES, normalization_type="empirical")
     model.update_normalization(observations)
 
     for name in BFM_FIELD_WIDTHS:
@@ -351,7 +352,7 @@ def test_field_normalizers_update_once_freeze_and_round_trip() -> None:
     for name in BFM_FIELD_WIDTHS:
         assert model.observation_normalizers[name].count.item() == 5
 
-    restored = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    restored = _make_model(observations, BFM_ROUTES, normalization_type="empirical")
     restored.load_state_dict(copy.deepcopy(model.state_dict()))
 
     probe = _make_bfm_observations(batch_size=3)
@@ -372,7 +373,7 @@ def test_exponential_field_normalizer_matches_released_two_batch_update() -> Non
     model = _make_model(
         observations,
         BFM_ROUTES,
-        observation_normalization=True,
+        normalization_type="exponential",
         normalization_eps=1e-5,
         normalization_momentum=0.01,
     )
@@ -392,10 +393,31 @@ def test_exponential_field_normalizer_matches_released_two_batch_update() -> Non
         torch.testing.assert_close(normalizer(next_observations[name]), expected)
 
 
+def test_exponential_normalizer_forward_does_not_update_statistics() -> None:
+    """Reading normalized observations should not advance temporal state."""
+    observations = _make_bfm_observations(batch_size=5)
+    model = _make_model(
+        observations,
+        BFM_ROUTES,
+        normalization_type="exponential",
+        normalization_eps=1e-5,
+        normalization_momentum=0.01,
+    )
+    model.update_normalization(observations)
+    batches_before = {
+        name: normalizer.num_batches_tracked.clone() for name, normalizer in model.observation_normalizers.items()
+    }
+
+    model.get_normalized_observations(observations, "forward")
+
+    for name, normalizer in model.observation_normalizers.items():
+        assert torch.equal(normalizer.num_batches_tracked, batches_before[name])
+
+
 def test_normalized_bfm_route_matches_independent_field_composition() -> None:
     """Field-level normalizers should compose in declared route order bit-for-bit."""
     observations = _make_bfm_observations(batch_size=5)
-    model = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    model = _make_model(observations, BFM_ROUTES, normalization_type="empirical")
     model.update_normalization(observations)
 
     actual = model.get_normalized_observations(observations, "forward")

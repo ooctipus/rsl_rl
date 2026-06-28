@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from tensordict import TensorDict
 from typing import Literal, cast
 
-from rsl_rl.modules import MLP, EmpiricalNormalization
+from rsl_rl.modules import MLP, EmpiricalNormalization, ExponentialNormalization, IdentityNormalization
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.modules.mlp import MLPBlock
 from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec, get_forward_backward_schema_hash
@@ -357,16 +357,6 @@ class ForwardBackwardModel(torch.nn.Module):
 
     is_recurrent: bool = False
 
-    class _ExponentialNormalizer(torch.nn.BatchNorm1d):
-        """Apply released BatchNorm statistics to feature-last observation tensors."""
-
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
-            """Normalize arbitrary leading batch dimensions."""
-            shape = value.shape
-            flattened = value.reshape(-1, shape[-1])
-            normalized = super().forward(flattened)
-            return normalized.reshape(shape)
-
     def __init__(
         self,
         observations: TensorDict,
@@ -382,9 +372,9 @@ class ForwardBackwardModel(torch.nn.Module):
         distribution_cfg: Mapping[str, object] | None = None,
         discriminator_hidden_dims: tuple[int, ...] | list[int] | None = None,
         value_heads: Sequence[ForwardBackwardValueHeadCfg] = (),
-        observation_normalization: bool = True,
+        normalization_type: Literal["none", "empirical", "exponential"] = "empirical",
         normalization_eps: float = 1e-2,
-        normalization_momentum: float | None = None,
+        normalization_momentum: float = 0.1,
         normalization_until: int | None = None,
         context_normalization: bool = True,
     ) -> None:
@@ -392,9 +382,6 @@ class ForwardBackwardModel(torch.nn.Module):
         super().__init__()
         if action_dim < 1 or context_dim < 1 or forward_ensemble_size < 1:
             raise ValueError("action_dim, context_dim, and forward_ensemble_size must be positive.")
-        if normalization_momentum is not None and not 0.0 < normalization_momentum <= 1.0:
-            raise ValueError("normalization_momentum must be in (0, 1].")
-
         self.observation_schema = ForwardBackwardObservationSchema.from_observations(observations, obs_groups)
         self.observation_schema.assert_valid(observations)
         for route in ("actor", "forward", "backward"):
@@ -405,20 +392,21 @@ class ForwardBackwardModel(torch.nn.Module):
         self.context_normalization = context_normalization
         self.value_specs = tuple(head.spec for head in value_heads)
 
-        self.observation_normalizers = torch.nn.ModuleDict({
-            name: (
-                torch.nn.Identity()
-                if not observation_normalization
-                else (
-                    EmpiricalNormalization(width, eps=normalization_eps, until=normalization_until)
-                    if normalization_momentum is None
-                    else self._ExponentialNormalizer(
-                        width, eps=normalization_eps, momentum=normalization_momentum, affine=False
-                    )
-                )
-            )
-            for name, width in self.observation_schema.field_widths
-        })
+        if normalization_type == "none":
+            normalizers = {name: IdentityNormalization() for name, _width in self.observation_schema.field_widths}
+        elif normalization_type == "empirical":
+            normalizers = {
+                name: EmpiricalNormalization(width, eps=normalization_eps, until=normalization_until)
+                for name, width in self.observation_schema.field_widths
+            }
+        elif normalization_type == "exponential":
+            normalizers = {
+                name: ExponentialNormalization(width, eps=normalization_eps, momentum=normalization_momentum)
+                for name, width in self.observation_schema.field_widths
+            }
+        else:
+            raise ValueError(f"Unknown normalization_type: {normalization_type!r}.")
+        self.observation_normalizers = torch.nn.ModuleDict(normalizers)
 
         options = dict(
             distribution_cfg
@@ -514,11 +502,7 @@ class ForwardBackwardModel(torch.nn.Module):
     def update_normalization(self, observations: TensorDict) -> None:
         """Update each field normalizer exactly once from raw observations."""
         for field_name, _width in self.observation_schema.field_widths:
-            normalizer = self.observation_normalizers[field_name]
-            if isinstance(normalizer, EmpiricalNormalization):
-                normalizer.update(observations[field_name])
-            elif isinstance(normalizer, torch.nn.BatchNorm1d):
-                normalizer(observations[field_name])
+            self.observation_normalizers[field_name].update(observations[field_name])
 
     def normalization_train(self, mode: bool = True) -> None:
         """Enable or freeze field-normalizer updates."""
