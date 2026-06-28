@@ -8,7 +8,14 @@
 import math
 import torch
 
-from rsl_rl.modules.distribution import BetaDistribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+import pytest
+
+from rsl_rl.modules.distribution import (
+    BetaDistribution,
+    ClippedGaussianDistribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+)
 
 
 class TestGaussianDistribution:
@@ -314,3 +321,51 @@ class TestBetaDistribution:
         dist.log_prob(samples).sum().backward()
         assert mlp_output.grad is not None
         assert not torch.all(mlp_output.grad == 0)
+
+
+class TestPathwiseDistributions:
+    """Tests for action-gradient sampling and explicit bounded semantics."""
+
+    def test_gaussian_rsample_preserves_mean_gradient(self) -> None:
+        """A pathwise Gaussian sample should differentiate through its mean."""
+        distribution = GaussianDistribution(output_dim=3, init_std=0.2, learn_std=False)
+        mean = torch.randn(5, 3, requires_grad=True)
+        distribution.update(mean)
+
+        distribution.rsample().sum().backward()
+
+        torch.testing.assert_close(mean.grad, torch.ones_like(mean))
+
+    def test_beta_rsample_preserves_network_gradient(self) -> None:
+        """The existing bounded Beta distribution should support pathwise actions."""
+        distribution = BetaDistribution(output_dim=2)
+        output = torch.randn(5, 2, 2, requires_grad=True)
+        distribution.update(output)
+
+        distribution.rsample().sum().backward()
+
+        assert output.grad is not None
+        assert torch.count_nonzero(output.grad).item() > 0
+
+    def test_clipped_gaussian_bounds_samples_and_preserves_gradient(self) -> None:
+        """Direct-Q actions should be bounded without cutting the actor graph."""
+        distribution = ClippedGaussianDistribution(output_dim=2, init_std=10.0)
+        output = torch.randn(64, 2, requires_grad=True)
+        distribution.update(output)
+        action = distribution.rsample()
+
+        assert torch.all(action > -1.0)
+        assert torch.all(action < 1.0)
+        action.sum().backward()
+        assert output.grad is not None
+        assert torch.count_nonzero(output.grad).item() > 0
+
+    def test_clipped_gaussian_refuses_inexact_ppo_density(self) -> None:
+        """Clipped exploration must never masquerade as an exact PPO density."""
+        distribution = ClippedGaussianDistribution(output_dim=2)
+        distribution.update(torch.zeros(3, 2))
+
+        with pytest.raises(NotImplementedError, match="exact bounded density"):
+            distribution.log_prob(torch.zeros(3, 2))
+        with pytest.raises(NotImplementedError, match="analytical entropy"):
+            _ = distribution.entropy

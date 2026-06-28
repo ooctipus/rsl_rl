@@ -7,13 +7,20 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import torch
 from tensordict import TensorDict
 
 import pytest
 
-from rsl_rl.models.forward_backward_model import ForwardBackwardModel, ForwardBackwardObservationSchema
+from rsl_rl.models.forward_backward_model import (
+    ForwardBackwardDualNetworkCfg,
+    ForwardBackwardModel,
+    ForwardBackwardObservationSchema,
+    ForwardBackwardValueHeadCfg,
+)
+from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec
 from tests.fixtures.forward_backward import BFM_FIELD_WIDTHS, BFM_ROUTES, META_FIELD_WIDTHS, META_ROUTES
 
 
@@ -28,6 +35,70 @@ def _make_bfm_observations(batch_size: int = 2) -> TensorDict:
             for index, (name, width) in enumerate(BFM_FIELD_WIDTHS.items())
         },
         batch_size=[batch_size],
+    )
+
+
+def _dual(
+    hidden_dim: int = 16,
+    hidden_layers: int = 2,
+    embedding_layers: int = 2,
+    residual: bool = False,
+) -> ForwardBackwardDualNetworkCfg:
+    return ForwardBackwardDualNetworkCfg(hidden_dim, hidden_layers, embedding_layers, residual)
+
+
+def _hidden_dims(hidden_dim: int = 8, hidden_layers: int = 2) -> tuple[int, ...]:
+    return (hidden_dim,) * hidden_layers
+
+
+def _make_model(
+    observations: TensorDict,
+    routes: dict[str, tuple[str, ...]],
+    *,
+    actor_cfg: ForwardBackwardDualNetworkCfg | None = None,
+    forward_cfg: ForwardBackwardDualNetworkCfg | None = None,
+    backward_hidden_dims: tuple[int, ...] | None = None,
+    forward_ensemble_size: int = 2,
+    discriminator_hidden_dims: tuple[int, ...] | None = None,
+    value_heads: tuple[ForwardBackwardValueHeadCfg, ...] = (),
+    observation_normalization: bool = False,
+    distribution_cfg: dict[str, object] | None = None,
+) -> ForwardBackwardModel:
+    return ForwardBackwardModel(
+        observations,
+        routes,
+        action_dim=2,
+        context_dim=4,
+        actor_cfg=actor_cfg or _dual(),
+        forward_cfg=forward_cfg or _dual(),
+        backward_hidden_dims=backward_hidden_dims or _hidden_dims(),
+        forward_ensemble_size=forward_ensemble_size,
+        discriminator_hidden_dims=discriminator_hidden_dims,
+        value_heads=value_heads,
+        observation_normalization=observation_normalization,
+        distribution_cfg=distribution_cfg,
+    )
+
+
+def _value_head(
+    name: str,
+    route: str,
+    *,
+    reward_channels: tuple[str, ...] = ("reward",),
+    ensemble_size: int = 2,
+    has_target: bool = True,
+    network: ForwardBackwardDualNetworkCfg | None = None,
+) -> ForwardBackwardValueHeadCfg:
+    return ForwardBackwardValueHeadCfg(
+        spec=ForwardBackwardValueSpec(
+            name=name,
+            kind="critic",
+            route=route,
+            reward_channels=reward_channels,
+            ensemble_size=ensemble_size,
+            has_target=has_target,
+        ),
+        network=network or _dual(),
     )
 
 
@@ -129,7 +200,7 @@ def test_schema_derives_widths_without_redundant_expected_values() -> None:
 def test_model_uses_tensordict_route_order_without_runtime_shape_checks() -> None:
     """Runtime tensors should be concatenated directly in configured order."""
     observations = _make_bfm_observations()
-    model = ForwardBackwardModel(observations, BFM_ROUTES)
+    model = _make_model(observations, BFM_ROUTES)
 
     actual = model.get_observations(observations, "forward")
     expected = torch.cat(
@@ -150,15 +221,15 @@ def test_model_uses_tensordict_route_order_without_runtime_shape_checks() -> Non
 def test_single_field_route_returns_tensordict_tensor_directly() -> None:
     """A one-field route should not allocate a redundant concatenation."""
     observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
-    model = ForwardBackwardModel(observations, META_ROUTES)
+    model = _make_model(observations, META_ROUTES)
 
     assert model.get_observations(observations, "actor") is observations["state"]
 
 
-def test_model_surface_stays_concrete_and_small() -> None:
-    """Phase 1A should not predict the eventual learner-facing network API."""
+def test_model_surface_exposes_phase_1c_component_methods() -> None:
+    """The learner should use public component methods instead of private reach-through."""
     assert not inspect.isabstract(ForwardBackwardModel)
-    assert set(ForwardBackwardModel.__dict__).isdisjoint({
+    assert {
         "action_sample",
         "actor_distribution",
         "backward_map",
@@ -166,9 +237,10 @@ def test_model_surface_stays_concrete_and_small() -> None:
         "context_random",
         "critic_values",
         "discriminator_logits",
-        "discriminator_reward",
         "forward_map",
-    })
+        "get_normalized_observations",
+        "update_normalization",
+    }.issubset(ForwardBackwardModel.__dict__)
 
 
 def test_unknown_route_and_field_fail_at_construction_boundary() -> None:
@@ -184,7 +256,7 @@ def test_nonflat_construction_observation_fails_once() -> None:
     observations = TensorDict({"state": torch.randn(2, 3, 4)}, batch_size=[2])
 
     with pytest.raises(ValueError, match="only support flat observations"):
-        ForwardBackwardModel(observations, {"actor": ("state",)})
+        _make_model(observations, {"actor": ("state",)})
 
 
 def test_debug_validator_checks_recorded_shape() -> None:
@@ -196,3 +268,206 @@ def test_debug_validator_checks_recorded_shape() -> None:
 
     with pytest.raises(ValueError, match="must have shape"):
         schema.assert_valid(TensorDict({"state": torch.randn(2, 357)}, batch_size=[2]))
+
+
+def test_composite_model_outputs_match_named_meta_routes() -> None:
+    """Meta-style components should expose the expected ensemble and batch axes."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    critic = _value_head("discriminator", "critic_discriminator")
+    model = _make_model(
+        observations,
+        META_ROUTES,
+        discriminator_hidden_dims=_hidden_dims(),
+        value_heads=(critic,),
+    )
+    context = model.context_random(3)
+    actions = model.action_sample(observations, context, deterministic=True)
+
+    assert actions.shape == (3, 2)
+    assert model.forward_map(observations, context, actions).shape == (2, 3, 4)
+    assert model.backward_map(observations).shape == (3, 4)
+    assert model.discriminator_logits(observations, context).shape == (3, 1)
+    assert model.critic_values("discriminator", observations, context, actions).shape == (2, 3, 1)
+
+
+def test_scaled_bfm_residual_model_uses_every_asymmetric_route() -> None:
+    """The BFM topology should support residual networks and a distinct auxiliary head."""
+    observations = _make_bfm_observations(batch_size=3)
+    residual = _dual(hidden_dim=16, hidden_layers=3, embedding_layers=2, residual=True)
+    discriminator_head = _value_head("discriminator", "critic_discriminator", network=residual)
+    auxiliary_head = _value_head(
+        "auxiliary",
+        "critic_auxiliary",
+        reward_channels=("tracking", "regularization"),
+        network=_dual(hidden_dim=24, hidden_layers=2, embedding_layers=3, residual=True),
+    )
+    model = _make_model(
+        observations,
+        BFM_ROUTES,
+        actor_cfg=residual,
+        forward_cfg=residual,
+        discriminator_hidden_dims=_hidden_dims(hidden_dim=12, hidden_layers=3),
+        value_heads=(discriminator_head, auxiliary_head),
+    )
+    context = model.context_random(3)
+    actions = model.action_sample(observations, context, pathwise=True)
+
+    assert model.forward_map(observations, context, actions).shape == (2, 3, 4)
+    assert model.critic_values("discriminator", observations, context, actions).shape == (2, 3, 1)
+    assert model.critic_values("auxiliary", observations, context, actions).shape == (2, 3, 2)
+
+    discriminator_parameters = sum(
+        parameter.numel() for parameter in model.value_networks["discriminator"].parameters()
+    )
+    auxiliary_parameters = sum(parameter.numel() for parameter in model.value_networks["auxiliary"].parameters())
+    assert discriminator_parameters != auxiliary_parameters
+
+
+def test_field_normalizers_update_once_freeze_and_round_trip() -> None:
+    """Shared fields should own one restorable statistic regardless of route reuse."""
+    observations = _make_bfm_observations(batch_size=5)
+    model = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    model.update_normalization(observations)
+
+    for name in BFM_FIELD_WIDTHS:
+        assert model.observation_normalizers[name].count.item() == 5
+
+    model.normalization_train(False)
+    model.update_normalization(_make_bfm_observations(batch_size=7))
+    for name in BFM_FIELD_WIDTHS:
+        assert model.observation_normalizers[name].count.item() == 5
+
+    restored = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    restored.load_state_dict(copy.deepcopy(model.state_dict()))
+
+    probe = _make_bfm_observations(batch_size=3)
+    context = model.context_random(3)
+    torch.testing.assert_close(
+        model.action_sample(probe, context, deterministic=True),
+        restored.action_sample(probe, context, deterministic=True),
+    )
+
+
+def test_normalized_bfm_route_matches_independent_field_composition() -> None:
+    """Field-level normalizers should compose in declared route order bit-for-bit."""
+    observations = _make_bfm_observations(batch_size=5)
+    model = _make_model(observations, BFM_ROUTES, observation_normalization=True)
+    model.update_normalization(observations)
+
+    actual = model.get_normalized_observations(observations, "forward")
+    expected = torch.cat(
+        [model.observation_normalizers[field](observations[field]) for field in BFM_ROUTES["forward"]],
+        dim=-1,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_optional_components_vanish_without_dummy_modules() -> None:
+    """The Meta FB subset should not allocate discriminator or critic placeholders."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    model = _make_model(observations, META_ROUTES)
+
+    assert model.discriminator_network is None
+    assert len(model.value_networks) == 0
+    assert len(model.value_target_networks) == 0
+    assert not hasattr(model, "actor_target_network")
+    with pytest.raises(RuntimeError, match="No discriminator"):
+        model.discriminator_logits(observations, model.context_random(3))
+
+
+def test_targets_exist_only_for_mathematically_targeted_components() -> None:
+    """F, B, and opted-in critics should own frozen target copies."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    with_target = _value_head("with_target", "critic_discriminator")
+    without_target = _value_head("without_target", "critic_discriminator", has_target=False)
+    model = _make_model(observations, META_ROUTES, value_heads=(with_target, without_target))
+
+    assert not any(parameter.requires_grad for parameter in model.forward_target_network.parameters())
+    assert not any(parameter.requires_grad for parameter in model.backward_target_network.parameters())
+    assert not any(parameter.requires_grad for parameter in model.value_target_networks["with_target"].parameters())
+    assert "without_target" not in model.value_target_networks
+    assert sum(parameter.numel() for parameter in model.forward_network.parameters()) == sum(
+        parameter.numel() for parameter in model.forward_target_network.parameters()
+    )
+
+
+def test_pathwise_actor_gradient_crosses_frozen_value_network() -> None:
+    """Frozen evaluators should preserve action gradients without parameter gradients."""
+    observations = TensorDict({"state": torch.randn(6, 358)}, batch_size=[6])
+    critic = _value_head("critic", "critic_discriminator")
+    model = _make_model(observations, META_ROUTES, value_heads=(critic,))
+    model.forward_network.requires_grad_(False)
+    model.value_networks["critic"].requires_grad_(False)
+    context = model.context_random(6).detach()
+
+    actions = model.action_sample(observations, context, pathwise=True)
+    forward_value = model.forward_map(observations, context, actions).sum(dim=-1)
+    critic_value = model.critic_values("critic", observations, context, actions)
+    loss = -forward_value.mean() - critic_value.mean()
+    loss.backward()
+
+    actor_gradients = [parameter.grad for parameter in model.actor_network.parameters()]
+    assert any(gradient is not None and torch.count_nonzero(gradient).item() > 0 for gradient in actor_gradients)
+    assert all(parameter.grad is None for parameter in model.forward_network.parameters())
+    assert all(parameter.grad is None for parameter in model.value_networks["critic"].parameters())
+
+
+def test_clipped_actor_config_is_owned_and_explicitly_not_ppo_compatible() -> None:
+    """The direct-Q default should be bounded and must reject an inexact PPO density."""
+    observations = TensorDict({"state": torch.randn(32, 358)}, batch_size=[32])
+    distribution_cfg: dict[str, object] = {
+        "class_name": "ClippedGaussianDistribution",
+        "init_std": 5.0,
+    }
+    expected = distribution_cfg.copy()
+    model = _make_model(observations, META_ROUTES, distribution_cfg=distribution_cfg)
+    context = model.context_random(32)
+    actions = model.action_sample(observations, context, pathwise=True)
+
+    assert distribution_cfg == expected
+    assert torch.all(actions > -1.0)
+    assert torch.all(actions < 1.0)
+    with pytest.raises(NotImplementedError, match="exact bounded density"):
+        model.action_distribution.log_prob(actions)
+
+
+def test_context_projection_uses_sqrt_dimension_radius() -> None:
+    """Context projection should match the FB sphere convention exactly."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    model = _make_model(observations, META_ROUTES)
+    context = model.context_project(torch.randn(7, 4))
+
+    torch.testing.assert_close(context.norm(dim=-1), torch.full((7,), 2.0))
+
+
+def _simple_dual_parameter_count(
+    left_input: int,
+    right_input: int,
+    output_dim: int,
+    hidden_dim: int,
+    hidden_layers: int,
+    embedding_layers: int,
+    ensemble_size: int,
+) -> int:
+    def embedding(input_dim: int) -> int:
+        count = input_dim * hidden_dim + hidden_dim + 2 * hidden_dim
+        count += (embedding_layers - 2) * (hidden_dim * hidden_dim + hidden_dim)
+        count += hidden_dim * (hidden_dim // 2) + hidden_dim // 2
+        return count
+
+    trunk = hidden_layers * (hidden_dim * hidden_dim + hidden_dim)
+    trunk += hidden_dim * output_dim + output_dim
+    return ensemble_size * (embedding(left_input) + embedding(right_input) + trunk)
+
+
+def test_simple_forward_parameter_count_matches_independent_formula() -> None:
+    """Ensemble parameter ownership should match the Meta-style architecture exactly."""
+    observations = TensorDict({"state": torch.randn(2, 358)}, batch_size=[2])
+    cfg = _dual(hidden_dim=16, hidden_layers=2, embedding_layers=3)
+    model = _make_model(observations, META_ROUTES, forward_cfg=cfg, forward_ensemble_size=3)
+
+    expected = _simple_dual_parameter_count(360, 362, 4, 16, 2, 3, 3)
+    actual = sum(parameter.numel() for parameter in model.forward_network.parameters())
+
+    assert actual == expected

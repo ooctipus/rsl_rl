@@ -47,6 +47,14 @@ class Distribution(nn.Module):
         """
         raise NotImplementedError
 
+    def rsample(self) -> torch.Tensor:
+        """Draw a pathwise sample from the distribution.
+
+        Returns:
+            Reparameterized sampled values.
+        """
+        raise NotImplementedError
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the deterministic (mean) output from the raw MLP output.
 
@@ -194,6 +202,10 @@ class GaussianDistribution(Distribution):
         """Sample from the Gaussian distribution."""
         return self._distribution.sample()  # type: ignore
 
+    def rsample(self) -> torch.Tensor:
+        """Draw a pathwise sample from the Gaussian distribution."""
+        return self._distribution.rsample()  # type: ignore
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output."""
         return mlp_output
@@ -236,6 +248,75 @@ class GaussianDistribution(Distribution):
         old_mean, old_std = old_params
         new_mean, new_std = new_params
         return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
+
+
+class ClippedGaussianDistribution(GaussianDistribution):
+    """Fixed-variance Gaussian for bounded direct-Q actions.
+
+    The network output is mapped through tanh to form the Gaussian mean. Samples
+    use a straight-through clamp so direct-Q gradients reach the actor while
+    environment actions remain bounded. Clipping creates boundary mass, so this
+    class deliberately does not expose a PPO log density or analytical entropy.
+    Use BetaDistribution for likelihood-ratio optimization.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_std: float = 0.2,
+        action_range: tuple[float, float] = (-1.0, 1.0),
+        eps: float = 1e-6,
+    ) -> None:
+        """Initialize a bounded direct-Q action distribution."""
+        if action_range[0] >= action_range[1]:
+            raise ValueError("action_range must be ordered from low to high.")
+        super().__init__(output_dim, init_std=init_std, learn_std=False)
+        self.action_range = action_range
+        self.eps = eps
+        self._center = 0.5 * (action_range[0] + action_range[1])
+        self._half_range = 0.5 * (action_range[1] - action_range[0])
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Map raw actor outputs to a bounded mean and update the Gaussian."""
+        mean = self._center + self._half_range * torch.tanh(mlp_output)
+        super().update(mean)
+
+    def _clip(self, action: torch.Tensor) -> torch.Tensor:
+        clipped = action.clamp(self.action_range[0] + self.eps, self.action_range[1] - self.eps)
+        return action - action.detach() + clipped.detach()
+
+    def sample(self) -> torch.Tensor:
+        """Draw a bounded non-pathwise sample."""
+        return self._clip(super().sample())
+
+    def rsample(self) -> torch.Tensor:
+        """Draw a bounded pathwise sample for direct-Q optimization."""
+        return self._clip(super().rsample())
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the bounded Gaussian mean."""
+        return self._center + self._half_range * torch.tanh(mlp_output)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an exportable bounded-mean transform."""
+        return _TanhRangeDeterministicOutput(self._center, self._half_range)
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Reject the entropy of a clipped distribution."""
+        raise NotImplementedError("ClippedGaussianDistribution has no exact analytical entropy.")
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Reject likelihood-ratio use with an inexact clipped density."""
+        raise NotImplementedError("Use a distribution with an exact bounded density for PPO.")
+
+    def kl_divergence(
+        self,
+        old_params: tuple[torch.Tensor, ...],
+        new_params: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Reject KL calculations for the clipped distribution."""
+        raise NotImplementedError("ClippedGaussianDistribution has no exact analytical KL divergence.")
 
 
 class HeteroscedasticGaussianDistribution(GaussianDistribution):
@@ -372,6 +453,10 @@ class BetaDistribution(Distribution):
         """Sample from the Beta distribution and rescale to ``action_range``."""
         return self._distribution.sample() * self._range_scale + self._range_offset  # type: ignore
 
+    def rsample(self) -> torch.Tensor:
+        """Draw a pathwise Beta sample and rescale it to the action range."""
+        return self._distribution.rsample() * self._range_scale + self._range_offset  # type: ignore
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output and rescale to ``action_range``."""
         alpha_raw, beta_raw = torch.unbind(mlp_output, dim=-2)
@@ -433,6 +518,18 @@ class BetaDistribution(Distribution):
         """Initialize the beta-parameter head weights to zero for a near-uniform initial distribution."""
         torch.nn.init.zeros_(mlp[-2].weight[self.output_dim :])  # type: ignore
         torch.nn.init.zeros_(mlp[-2].bias[self.output_dim :])  # type: ignore
+
+
+class _TanhRangeDeterministicOutput(nn.Module):
+    """Exportable tanh transform from raw network output to action range."""
+
+    def __init__(self, center: float, half_range: float) -> None:
+        super().__init__()
+        self.center = center
+        self.half_range = half_range
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return self.center + self.half_range * torch.tanh(mlp_output)
 
 
 class _IdentityDeterministicOutput(nn.Module):

@@ -229,3 +229,25 @@ class TestMLPModelExport:
             )
             loaded = onnx.load(f.name)
             onnx.checker.check_model(loaded)
+
+
+def test_distribution_config_is_not_mutated_by_model_construction() -> None:
+    """Model construction should leave caller-owned configuration reusable."""
+    observations = make_obs(NUM_ENVS, OBS_DIM)
+    distribution_cfg = {
+        "class_name": "GaussianDistribution",
+        "init_std": 0.5,
+        "std_type": "scalar",
+    }
+    expected = distribution_cfg.copy()
+
+    MLPModel(
+        observations,
+        OBS_GROUPS,
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=(16,),
+        distribution_cfg=distribution_cfg,
+    )
+
+    assert distribution_cfg == expected
