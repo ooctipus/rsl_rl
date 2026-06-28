@@ -269,7 +269,13 @@ class ForwardBackwardTransitionBatch:
 
 @dataclass(frozen=True, slots=True)
 class ForwardBackwardHistoryLayout:
-    """Versioned reconstruction of derived last-action and history fields."""
+    """Versioned reconstruction of derived last-action and history fields.
+
+    ``include_seed_observations`` controls whether observations introduced
+    without an applied transition, at stream initialization or an external
+    reset, become future observation-history sources. Reached observations
+    produced by applied transitions are always history sources.
+    """
 
     @dataclass(frozen=True, slots=True)
     class Source:
@@ -292,6 +298,7 @@ class ForwardBackwardHistoryLayout:
     history_length: int
     sources: tuple[Source, ...]
     last_action_field: str | None = None
+    include_seed_observations: bool = True
     version: int = 1
     schema_hash: str = field(init=False)
 
@@ -315,6 +322,7 @@ class ForwardBackwardHistoryLayout:
             get_forward_backward_schema_hash({
                 "history_field": self.history_field,
                 "history_length": self.history_length,
+                "include_seed_observations": self.include_seed_observations,
                 "last_action_field": self.last_action_field,
                 "sources": tuple((source.observation_name, source.start, source.stop) for source in sources),
                 "version": self.version,
@@ -364,6 +372,12 @@ class ForwardBackwardReplay:
     next call's ``observations``. Replay stores that shared node only once.
     """
 
+    class Sampling(str, Enum):
+        """Probability law used to choose one retained logical transition."""
+
+        TRANSITION_UNIFORM = "transition_uniform"
+        EPISODE_UNIFORM = "episode_uniform"
+
     def __init__(
         self,
         capacity_steps: int,
@@ -375,6 +389,7 @@ class ForwardBackwardReplay:
         device: str | torch.device,
         *,
         history_layout: ForwardBackwardHistoryLayout | None = None,
+        sampling: Sampling | str = Sampling.TRANSITION_UNIFORM,
         seed: int = 0,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -389,6 +404,12 @@ class ForwardBackwardReplay:
         self.transition_schema = transition_schema
         self.reward_schema = reward_schema
         self.history_layout = history_layout
+        self.sampling = self.Sampling(sampling)
+        if (
+            self.sampling is self.Sampling.EPISODE_UNIFORM
+            and transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP
+        ):
+            raise ValueError("Episode-uniform replay does not support reset-only next-step rows.")
         self.device = torch.device(device)
         self.dtype = dtype
         self._field_widths = dict(observation_schema.field_widths)
@@ -418,6 +439,11 @@ class ForwardBackwardReplay:
             (self.node_capacity_steps, num_envs), -1, device=self.device, dtype=torch.long
         )
         self.node_episode_steps = torch.full_like(self.node_episode_ids, -1)
+        self.node_history_valid = (
+            torch.zeros_like(self.node_episode_ids, dtype=torch.bool)
+            if history_layout is not None and not history_layout.include_seed_observations
+            else None
+        )
 
         edge_shape = (capacity_steps, num_envs)
         self.edge_flags = torch.zeros(edge_shape, device=self.device, dtype=torch.uint8)
@@ -461,6 +487,23 @@ class ForwardBackwardReplay:
             self._sample_valid_cdf = torch.empty(capacity_steps, device=self.device, dtype=torch.int32)
             self._sample_generator = torch.Generator(device=self.device)
             self._sample_generator.manual_seed(seed + 1)
+        if self.sampling is self.Sampling.EPISODE_UNIFORM:
+            slots = torch.arange(terminal_capacity, device=self.device, dtype=torch.long)
+            self._episode_slot_env_ids = torch.div(
+                slots,
+                terminal_capacity_per_env + 1,
+                rounding_mode="floor",
+            )
+            self._episode_slot_is_terminal = torch.remainder(slots, terminal_capacity_per_env + 1) < (
+                terminal_capacity_per_env
+            )
+            self._episode_segment_starts = torch.empty_like(slots)
+            self._episode_segment_lengths = torch.empty_like(slots)
+            self._episode_segment_valid = torch.empty(terminal_capacity, device=self.device, dtype=torch.bool)
+            self._episode_segment_cdf = torch.empty(terminal_capacity, device=self.device, dtype=torch.int32)
+            self._sample_indices = self._sample_episode_uniform_indices
+        else:
+            self._sample_indices = self._sample_transition_uniform_indices
 
     @property
     def total_steps(self) -> int:
@@ -508,6 +551,8 @@ class ForwardBackwardReplay:
             next_episode_steps = torch.where(done, 0, next_episode_steps)
         self.node_episode_ids[next_node_row].copy_(next_episode_ids)
         self.node_episode_steps[next_node_row].copy_(next_episode_steps)
+        if self.node_history_valid is not None:
+            self.node_history_valid[next_node_row].copy_(replay)
 
         self.actions[action_row].copy_(transition.actions)
         edge_flags = transition.terminated.squeeze(-1).to(torch.uint8) * _EDGE_TERMINATED
@@ -545,6 +590,68 @@ class ForwardBackwardReplay:
         self.episode_steps.copy_(torch.where(done, 0, torch.where(replay, self.episode_steps + 1, self.episode_steps)))
         self._total_steps += 1
         self._size_steps = min(self._size_steps + 1, self.capacity_steps)
+
+    def process_env_reset(self, observations: TensorDict, reset: torch.Tensor) -> None:
+        """Close the latest reached states and seed an externally reset stream.
+
+        This boundary is for resets performed between calls to ``env.step``,
+        such as an algorithm-controlled reset after an evaluation. Applied
+        latest rows become truncations whose exact final states are the reached
+        nodes already in replay. The supplied post-reset observations then
+        replace those nodes as the starts of new episodes.
+        """
+        if self.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP:
+            raise ValueError("Next-step autoreset represents external resets with reset-only rows.")
+        if tuple(observations.batch_size) != (self.num_envs,):
+            raise ValueError(f"Reset observations must have batch size ({self.num_envs},).")
+        self.observation_schema.assert_valid(observations)
+        if reset.shape not in ((self.num_envs,), (self.num_envs, 1)) or reset.dtype is not torch.bool:
+            raise ValueError(f"reset must be bool with shape ({self.num_envs},) or ({self.num_envs}, 1).")
+        if reset.device != self.device or any(observations[name].device != self.device for name in self._stored_fields):
+            raise ValueError("Reset observations and mask must be on the replay device.")
+        if self._total_steps == 0:
+            return
+
+        reset = reset.reshape(self.num_envs)
+        step = self._total_steps - 1
+        edge_row = step % self.capacity_steps
+        node_row = step % self.node_capacity_steps
+        reached_node_row = (step + 1) % self.node_capacity_steps
+        edge_flags = self.edge_flags[edge_row]
+        applied = (edge_flags & _EDGE_APPLIED) != 0
+        already_done = (edge_flags & (_EDGE_TERMINATED | _EDGE_TRUNCATED)) != 0
+        converted = reset & applied & ~already_done
+        self.contract_errors.logical_or_(reset & ~applied)
+
+        edge_episode_ids = self.node_episode_ids[node_row]
+        terminal_slots = self._terminal_bases + torch.remainder(
+            edge_episode_ids,
+            self.terminal_capacity_per_env,
+        )
+        previous_owner_steps = self.terminal_owner_steps[terminal_slots]
+        previous_owner_is_live = (previous_owner_steps >= 0) & (previous_owner_steps > step - self.capacity_steps)
+        self.terminal_overflow.logical_or_(converted & previous_owner_is_live)
+        terminal_slots = torch.where(converted, terminal_slots, self._terminal_scratch)
+        for name in self._stored_fields:
+            self.terminals[name].index_copy_(0, terminal_slots, self.nodes[name][reached_node_row])
+        self.terminal_owner_steps.index_fill_(0, terminal_slots, step)
+
+        edge_flags.bitwise_or_(converted.to(torch.uint8) * _EDGE_TRUNCATED)
+        edge_flags.bitwise_or_(converted.to(torch.uint8) * _EDGE_FINAL_OBSERVATION_VALID)
+        self.episode_ids.add_(converted.long())
+        self.episode_steps.copy_(torch.where(reset, 0, self.episode_steps))
+        reset_rows = reset.unsqueeze(-1)
+        for name in self._stored_fields:
+            reached = self.nodes[name][reached_node_row]
+            reached.copy_(torch.where(reset_rows, observations[name], reached))
+        self.node_episode_ids[reached_node_row].copy_(
+            torch.where(reset, self.episode_ids, self.node_episode_ids[reached_node_row])
+        )
+        self.node_episode_steps[reached_node_row].copy_(
+            torch.where(reset, self.episode_steps, self.node_episode_steps[reached_node_row])
+        )
+        if self.node_history_valid is not None:
+            self.node_history_valid[reached_node_row].logical_and_(~reset)
 
     def sample(self, step_ids: torch.Tensor, env_ids: torch.Tensor) -> ForwardBackwardReplayBatch:
         """Resolve logical steps through edge, node, and terminal generations."""
@@ -610,9 +717,14 @@ class ForwardBackwardReplay:
         )
 
     def sample_random(self, batch_size: int) -> ForwardBackwardReplayBatch:
-        """Sample retained physical positions with a replay-owned device RNG."""
+        """Sample logical transitions under the configured replay probability law."""
         if self._size_steps == 0:
             raise RuntimeError("Cannot sample an empty replay.")
+        step_ids, env_ids = self._sample_indices(batch_size)
+        return self.sample(step_ids, env_ids)
+
+    def _sample_transition_uniform_indices(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Choose retained applied positions uniformly."""
         oldest = self._total_steps - self._size_steps
         step_ids = torch.randint(oldest, self._total_steps, (batch_size,), device=self.device, generator=self.generator)
         env_ids = torch.randint(self.num_envs, (batch_size,), device=self.device, generator=self.generator)
@@ -649,7 +761,40 @@ class ForwardBackwardReplay:
                 valid_step_ids = self._total_steps - 1 - ages
             step_ids = torch.where(selected_valid, step_ids, valid_step_ids)
             env_ids = torch.where(selected_valid, env_ids, valid_env_ids)
-        return self.sample(step_ids, env_ids)
+        return step_ids, env_ids
+
+    def _sample_episode_uniform_indices(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Choose a retained episode segment, then one transition in that segment."""
+        oldest = self._total_steps - self._size_steps
+        owners = self.terminal_owner_steps
+        owner_rows = torch.remainder(owners, self.node_capacity_steps)
+        owner_episode_steps = self.node_episode_steps[owner_rows, self._episode_slot_env_ids]
+        starts = self._episode_segment_starts
+        starts.copy_(owners - owner_episode_steps)
+        starts.clamp_min_(oldest)
+        lengths = self._episode_segment_lengths
+        lengths.copy_(owners).sub_(starts).add_(1)
+        valid = self._episode_segment_valid
+        valid.copy_(self._episode_slot_is_terminal)
+        valid.logical_and_(owners >= oldest)
+        valid.logical_and_(owners < self._total_steps)
+        valid.logical_and_(owner_episode_steps >= 0)
+
+        current_starts = torch.clamp(self._total_steps - self.episode_steps, min=oldest)
+        starts.index_copy_(0, self._terminal_scratch, current_starts)
+        lengths.index_copy_(0, self._terminal_scratch, self._total_steps - current_starts)
+        valid.index_copy_(0, self._terminal_scratch, self.episode_steps > 0)
+        torch.cumsum(valid, dim=0, dtype=torch.int32, out=self._episode_segment_cdf)
+
+        segment_ranks = (
+            torch.rand(batch_size, device=self.device, generator=self.generator) * self._episode_segment_cdf[-1]
+        ).to(torch.int32)
+        segment_slots = torch.searchsorted(self._episode_segment_cdf, segment_ranks, right=True)
+        selected_lengths = lengths[segment_slots]
+        relative_steps = (torch.rand(batch_size, device=self.device, generator=self.generator) * selected_lengths).to(
+            torch.long
+        )
+        return starts[segment_slots] + relative_steps, self._episode_slot_env_ids[segment_slots]
 
     def assert_no_errors(self) -> None:
         """Reduce deferred collection and terminal errors at a control boundary."""
@@ -670,6 +815,7 @@ class ForwardBackwardReplay:
             "capacity_steps": self.capacity_steps,
             "num_envs": self.num_envs,
             "terminal_capacity_per_env": self.terminal_capacity_per_env,
+            "sampling": self.sampling.value,
             "dtype": str(self.dtype),
             "total_steps": self._total_steps,
             "size_steps": self._size_steps,
@@ -691,6 +837,8 @@ class ForwardBackwardReplay:
         }
         if self._sample_generator is not None:
             state["sample_generator_state"] = self._sample_generator.get_state()
+        if self.node_history_valid is not None:
+            state["node_history_valid"] = self.node_history_valid
         return state
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -701,6 +849,7 @@ class ForwardBackwardReplay:
             self.capacity_steps,
             self.num_envs,
             self.terminal_capacity_per_env,
+            self.sampling.value,
             str(self.dtype),
         )
         actual = (
@@ -709,6 +858,7 @@ class ForwardBackwardReplay:
             state["capacity_steps"],
             state["num_envs"],
             state["terminal_capacity_per_env"],
+            state.get("sampling", self.Sampling.TRANSITION_UNIFORM.value),
             state["dtype"],
         )
         if actual != expected:
@@ -717,6 +867,11 @@ class ForwardBackwardReplay:
         self._size_steps = int(state["size_steps"])
         _copy_tensor_dict(self.nodes, state["nodes"])
         _copy_tensor_dict(self.terminals, state["terminals"])
+        if self.node_history_valid is not None:
+            value = state["node_history_valid"]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("Replay state 'node_history_valid' must be a tensor.")
+            self.node_history_valid.copy_(value)
         for name in (
             "node_episode_ids",
             "node_episode_steps",
@@ -790,7 +945,9 @@ class ForwardBackwardReplay:
             source_steps = state_steps - 1
             rows = torch.remainder(source_steps, self.action_capacity_steps)
             node_rows = torch.remainder(source_steps, self.node_capacity_steps)
-            source_valid = self.node_episode_ids[node_rows, env_ids] == episode_ids
+            source_valid = (self.node_episode_ids[node_rows, env_ids] == episode_ids) & (
+                self.node_episode_steps[node_rows, env_ids] == episode_steps - 1
+            )
             required = episode_steps >= 1
             complete &= (~required | source_valid).unsqueeze(-1)
             values = self.actions[rows, env_ids]
@@ -807,13 +964,21 @@ class ForwardBackwardReplay:
                 if source.observation_name is None:
                     rows = torch.remainder(source_steps, self.action_capacity_steps)
                     node_rows = torch.remainder(source_steps, self.node_capacity_steps)
-                    source_valid = self.node_episode_ids[node_rows, env_ids] == episode_ids
+                    source_valid = (self.node_episode_ids[node_rows, env_ids] == episode_ids) & (
+                        self.node_episode_steps[node_rows, env_ids] == episode_steps - lag
+                    )
+                    source_complete = source_valid
                     values = self.actions[rows, env_ids, source.start : source.stop]
                 else:
                     rows = torch.remainder(source_steps, self.node_capacity_steps)
-                    source_valid = self.node_episode_ids[rows, env_ids] == episode_ids
+                    source_valid = (self.node_episode_ids[rows, env_ids] == episode_ids) & (
+                        self.node_episode_steps[rows, env_ids] == episode_steps - lag
+                    )
+                    source_complete = source_valid
+                    if self.node_history_valid is not None:
+                        source_valid = source_valid & self.node_history_valid[rows, env_ids]
                     values = self.nodes[source.observation_name][rows, env_ids, source.start : source.stop]
-                complete &= (~required | source_valid).unsqueeze(-1)
+                complete &= (~required | source_complete).unsqueeze(-1)
                 lag_parts.append(torch.where(source_valid.unsqueeze(-1), values, torch.zeros_like(values)))
             history_parts.append(torch.cat(lag_parts, dim=-1))
         derived[layout.history_field] = torch.cat(history_parts, dim=-1)
@@ -847,9 +1012,20 @@ class ForwardBackwardReplay:
             self.contract_errors,
             self.terminal_overflow,
         ])
+        if self.node_history_valid is not None:
+            tensors.append(self.node_history_valid)
         if self._sample_valid_counts is not None:
             tensors.append(self._sample_valid_counts)
             tensors.append(self._sample_valid_cdf)
+        if self.sampling is self.Sampling.EPISODE_UNIFORM:
+            tensors.extend([
+                self._episode_slot_env_ids,
+                self._episode_slot_is_terminal,
+                self._episode_segment_starts,
+                self._episode_segment_lengths,
+                self._episode_segment_valid,
+                self._episode_segment_cdf,
+            ])
         return tuple(tensors)
 
 

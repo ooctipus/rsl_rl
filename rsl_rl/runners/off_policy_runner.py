@@ -105,6 +105,7 @@ class OffPolicyRunner(OnPolicyRunner):
                 self.save(  # type: ignore[arg-type]
                     os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")
                 )
+                obs = self.env.get_observations().to(self.device)
                 last_saved_iteration = self.current_learning_iteration
 
         if self.logger.writer is not None:

@@ -117,6 +117,7 @@ def _make_replays(
     observation_schema: ForwardBackwardObservationSchema,
     transition_schema: ForwardBackwardTransitionSchema,
     history_layout: ForwardBackwardHistoryLayout | None = None,
+    sampling: str = "transition_uniform",
 ) -> tuple[ForwardBackwardReplayOracle, ForwardBackwardReplay]:
     reward_schema = make_reward_schema()
     oracle = ForwardBackwardReplayOracle(
@@ -131,6 +132,7 @@ def _make_replays(
         reward_schema,
         "cpu",
         history_layout=history_layout,
+        sampling=sampling,
         seed=7,
     )
     return oracle, replay
@@ -290,6 +292,78 @@ def test_next_step_valid_sampling_does_not_change_primary_rng_sequence() -> None
     torch.testing.assert_close(replay.generator.get_state(), expected_generator.get_state(), rtol=0.0, atol=0.0)
 
 
+def test_episode_uniform_sampling_weights_segments_before_transitions() -> None:
+    """Short and long retained episodes should receive equal segment mass."""
+    observation_schema, transition_schema = _contracts()
+    _oracle, replay = _make_replays(
+        10,
+        3,
+        observation_schema,
+        transition_schema,
+        sampling="episode_uniform",
+    )
+    for step in range(10):
+        replay.add(
+            _transition(
+                step,
+                transition_schema.autoreset_mode,
+                observation_schema,
+                transition_schema,
+                done_envs=(0, 1, 2) if step in (1, 9) else (),
+            )
+        )
+
+    batch = replay.sample_random(90_000)
+    sampled_steps = torch.div(batch.observations["state"][:, 0], 10, rounding_mode="floor")
+    short_episode_fraction = (sampled_steps < 2).float().mean()
+
+    assert torch.all(batch.valid)
+    torch.testing.assert_close(short_episode_fraction, torch.tensor(0.5), atol=0.02, rtol=0.0)
+
+
+def test_episode_uniform_sampling_rejects_reset_only_streams() -> None:
+    """A segment sampler should not silently cross next-step reset-only rows."""
+    observation_schema, transition_schema = _contracts(ForwardBackwardAutoresetMode.NEXT_STEP)
+
+    with pytest.raises(ValueError, match="reset-only"):
+        _make_replays(
+            4,
+            4,
+            observation_schema,
+            transition_schema,
+            sampling="episode_uniform",
+        )
+
+
+def test_episode_uniform_sampling_handles_ring_clipped_segments() -> None:
+    """A retained suffix of an older episode should remain one sampleable segment."""
+    observation_schema, transition_schema = _contracts()
+    _oracle, replay = _make_replays(
+        5,
+        3,
+        observation_schema,
+        transition_schema,
+        sampling="episode_uniform",
+    )
+    for step in range(7):
+        replay.add(
+            _transition(
+                step,
+                transition_schema.autoreset_mode,
+                observation_schema,
+                transition_schema,
+                done_envs=(0, 1, 2) if step in (4, 6) else (),
+            )
+        )
+
+    batch = replay.sample_random(90_000)
+    sampled_steps = torch.div(batch.observations["state"][:, 0], 10, rounding_mode="floor")
+    clipped_episode_fraction = (sampled_steps <= 4).float().mean()
+
+    assert torch.all(batch.valid)
+    torch.testing.assert_close(clipped_episode_fraction, torch.tensor(0.5), atol=0.02, rtol=0.0)
+
+
 def test_sparse_terminal_overflow_is_deferred_and_generation_safe() -> None:
     """Reusing a live per-environment terminal slot should fail at the control boundary."""
     observation_schema, transition_schema = _contracts()
@@ -329,6 +403,75 @@ def test_all_done_rows_remain_exact_at_terminal_capacity_bound() -> None:
     env_ids = torch.tensor([0, 2, 0, 1, 1, 2])
     _assert_batches_equal(oracle.sample(step_ids, env_ids), replay.sample(step_ids, env_ids))
     replay.assert_no_errors()
+
+
+@pytest.mark.parametrize("sampling", ["transition_uniform", "episode_uniform"])
+def test_external_reset_closes_latest_rows_and_rebases_current_nodes(sampling: str) -> None:
+    """An evaluation reset should preserve reached finals and seed the next episodes."""
+    observation_schema, transition_schema = _contracts()
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema, sampling=sampling)
+    current = {"state": _state(0, 3)}
+    reached = {"state": _state(1, 3)}
+    returned = {"state": reached["state"].clone()}
+    returned["state"][2] = _state(0, 3, offset=-100.0)[2]
+    replay.add(
+        _transition(
+            0,
+            transition_schema.autoreset_mode,
+            observation_schema,
+            transition_schema,
+            done_envs=(2,),
+            current=current,
+            reached=reached,
+            reset=returned,
+        )
+    )
+    reset_observations = {"state": reached["state"].clone()}
+    reset_observations["state"][1] = _state(0, 3, offset=100.0)[1]
+    reset_observations["state"][2] = _state(0, 3, offset=200.0)[2]
+    replay.process_env_reset(
+        TensorDict(reset_observations, batch_size=[3]),
+        torch.tensor([False, True, True]),
+    )
+
+    latest = replay.sample(torch.zeros(3, dtype=torch.long), torch.arange(3))
+    assert torch.all(latest.valid)
+    assert latest.truncated.squeeze(-1).tolist() == [False, True, False]
+    assert latest.terminated.squeeze(-1).tolist() == [False, False, True]
+    torch.testing.assert_close(latest.next_observations["state"], reached["state"])
+    assert replay.episode_ids.tolist() == [0, 1, 1]
+    assert replay.episode_steps.tolist() == [1, 0, 0]
+
+    next_reached = {"state": reset_observations["state"] + 10.0}
+    replay.add(
+        _transition(
+            1,
+            transition_schema.autoreset_mode,
+            observation_schema,
+            transition_schema,
+            current=reset_observations,
+            reached=next_reached,
+        )
+    )
+    after_reset = replay.sample(torch.ones(3, dtype=torch.long), torch.arange(3))
+    assert torch.all(after_reset.valid)
+    torch.testing.assert_close(after_reset.observations["state"], reset_observations["state"])
+    torch.testing.assert_close(after_reset.next_observations["state"], next_reached["state"])
+    assert replay.episode_steps.tolist() == [2, 1, 1]
+    assert torch.all(replay.sample_random(257).valid)
+    replay.assert_no_errors()
+
+
+def test_external_reset_rejects_next_step_streams() -> None:
+    """Next-step streams should encode resets as ordinary reset-only rows."""
+    observation_schema, transition_schema = _contracts(ForwardBackwardAutoresetMode.NEXT_STEP)
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema)
+
+    with pytest.raises(ValueError, match="reset-only"):
+        replay.process_env_reset(
+            TensorDict({"state": _state(0, 3)}, batch_size=[3]),
+            torch.ones(3, dtype=torch.bool),
+        )
 
 
 def _history_layout() -> ForwardBackwardHistoryLayout:
@@ -401,19 +544,57 @@ def test_versioned_history_reconstruction_matches_dense_emitted_noise_after_wrap
     assert replay.storage_bytes() < dense_replay.storage_bytes()
 
 
+def test_history_excludes_seeded_observations_but_keeps_applied_actions() -> None:
+    """A reset seed may be absent from observation history while its outgoing action is retained."""
+    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    observation_schema, transition_schema = _contracts(field_widths=fields)
+    layout = replace(_history_layout(), include_seed_observations=False)
+    oracle, replay = _make_replays(5, 3, observation_schema, transition_schema, layout)
+    generator = torch.Generator().manual_seed(29)
+    states = [torch.randn(3, 4, generator=generator) + step * 10 for step in range(5)]
+    actions = [torch.randn(3, 2, generator=generator) + step for step in range(4)]
+
+    def observation(step: int) -> dict[str, torch.Tensor]:
+        dense = _history_observation(step, states, actions, 0)
+        zeros_state = torch.zeros_like(states[0][:, 1:3])
+        state_history = [states[step - lag][:, 1:3] if step - lag >= 1 else zeros_state for lag in (1, 2)]
+        dense["history_actor"] = torch.cat((dense["history_actor"][:, :4], *state_history), dim=-1)
+        return dense
+
+    for step in range(4):
+        transition = replace(
+            _transition(
+                step,
+                transition_schema.autoreset_mode,
+                observation_schema,
+                transition_schema,
+                current=observation(step),
+                reached=observation(step + 1),
+            ),
+            actions=actions[step],
+        )
+        oracle.add(transition)
+        replay.add(transition)
+
+    step_ids = torch.arange(4).repeat_interleave(3)
+    env_ids = torch.arange(3).repeat(4)
+    _assert_batches_equal(oracle.sample(step_ids, env_ids), replay.sample(step_ids, env_ids))
+
+
 def _bfm_history_layout() -> ForwardBackwardHistoryLayout:
     source = ForwardBackwardHistoryLayout.Source
     return ForwardBackwardHistoryLayout(
         history_field="history_actor",
         history_length=4,
         sources=(
-            source(None, 0, 29),
+            source("last_action", 0, 29),
             source("state", 61, 64),
             source("state", 0, 29),
             source("state", 29, 58),
             source("state", 58, 61),
         ),
-        last_action_field="last_action",
+        last_action_field=None,
+        include_seed_observations=False,
     )
 
 
@@ -428,11 +609,15 @@ def _bfm_observation(
     for source in _bfm_history_layout().sources:
         for lag in range(1, 5):
             source_step = step - lag
-            if source_step < 0:
+            if source_step < 1:
                 width = source.stop - source.start
                 history_parts.append(torch.zeros(states[0].shape[0], width))
-            elif source.observation_name is None:
-                history_parts.append(actions[source_step][:, source.start : source.stop])
+            elif source.observation_name == "last_action":
+                action_step = source_step - 1
+                if action_step < 0:
+                    history_parts.append(torch.zeros(states[0].shape[0], source.stop - source.start))
+                else:
+                    history_parts.append(actions[action_step][:, source.start : source.stop])
             else:
                 history_parts.append(states[source_step][:, source.start : source.stop])
     return {
@@ -547,6 +732,60 @@ def test_history_and_last_action_zero_pad_after_reset_but_final_keeps_old_episod
     torch.testing.assert_close(reset_batch.observations["history_actor"], torch.zeros(1, 8))
 
 
+def test_external_reset_preserves_final_history_and_zero_pads_new_episode() -> None:
+    """A between-step reset should split derived history at the same exact boundary."""
+    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    observation_schema, transition_schema = _contracts(field_widths=fields)
+    layout = _history_layout()
+    _oracle, replay = _make_replays(6, 6, observation_schema, transition_schema, layout)
+    states = [_state(step, 3, 4) for step in range(5)]
+    actions = [_state(step, 3, 2, offset=0.5) for step in range(4)]
+    for step in range(2):
+        replay.add(
+            replace(
+                _transition(
+                    step,
+                    transition_schema.autoreset_mode,
+                    observation_schema,
+                    transition_schema,
+                    current=_history_observation(step, states, actions, 0),
+                    reached=_history_observation(step + 1, states, actions, 0),
+                ),
+                actions=actions[step],
+            )
+        )
+
+    reset_observations = _history_observation(3, states, actions, 3)
+    replay.process_env_reset(
+        TensorDict(reset_observations, batch_size=[3]),
+        torch.ones(3, dtype=torch.bool),
+    )
+    final_batch = replay.sample(torch.ones(3, dtype=torch.long), torch.arange(3))
+    expected_final = _history_observation(2, states, actions, 0)
+    for name in fields:
+        torch.testing.assert_close(final_batch.next_observations[name], expected_final[name])
+
+    reached_after_reset = _history_observation(4, states, actions, 3)
+    replay.add(
+        replace(
+            _transition(
+                2,
+                transition_schema.autoreset_mode,
+                observation_schema,
+                transition_schema,
+                current=reset_observations,
+                reached=reached_after_reset,
+            ),
+            actions=actions[3],
+        )
+    )
+    reset_batch = replay.sample(torch.full((3,), 2), torch.arange(3))
+    for name in fields:
+        torch.testing.assert_close(reset_batch.observations[name], reset_observations[name])
+        torch.testing.assert_close(reset_batch.next_observations[name], reached_after_reset[name])
+    replay.assert_no_errors()
+
+
 def test_replay_state_restores_exact_next_random_sample() -> None:
     """Storage generations and the device RNG should resume exactly."""
     observation_schema, transition_schema = _contracts()
@@ -560,6 +799,55 @@ def test_replay_state_restores_exact_next_random_sample() -> None:
 
     _assert_batches_equal(replay.sample_random(11), restored.sample_random(11))
     assert replay.storage_bytes() == restored.storage_bytes()
+
+
+def test_episode_uniform_replay_restores_exact_next_random_sample() -> None:
+    """Episode-segment sampling should resume without serializing derived scratch."""
+    observation_schema, transition_schema = _contracts()
+    _oracle, replay = _make_replays(
+        8,
+        4,
+        observation_schema,
+        transition_schema,
+        sampling="episode_uniform",
+    )
+    for step in range(8):
+        replay.add(
+            _transition(
+                step,
+                transition_schema.autoreset_mode,
+                observation_schema,
+                transition_schema,
+                done_envs=(0, 1, 2) if step in (1, 7) else (),
+            )
+        )
+    replay.sample_random(17)
+    state = replay.state_dict()
+    _other_oracle, restored = _make_replays(
+        8,
+        4,
+        observation_schema,
+        transition_schema,
+        sampling="episode_uniform",
+    )
+    restored.load_state_dict(state)
+
+    _assert_batches_equal(replay.sample_random(257), restored.sample_random(257))
+    assert replay.storage_bytes() == restored.storage_bytes()
+
+
+def test_transition_uniform_replay_loads_state_before_sampling_identity_was_stored() -> None:
+    """Adding an explicit default law should not invalidate ordinary replay checkpoints."""
+    observation_schema, transition_schema = _contracts()
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema)
+    replay.add(_transition(0, transition_schema.autoreset_mode, observation_schema, transition_schema))
+    state = replay.state_dict()
+    del state["sampling"]
+    _other_oracle, restored = _make_replays(4, 4, observation_schema, transition_schema)
+
+    restored.load_state_dict(state)
+
+    _assert_batches_equal(replay.sample_random(31), restored.sample_random(31))
 
 
 def test_next_step_replay_state_restores_valid_population_and_rng() -> None:

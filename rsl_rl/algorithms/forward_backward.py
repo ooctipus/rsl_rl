@@ -512,6 +512,21 @@ class ForwardBackward:
         self._collection_observations = None
         self._collection_actions = None
 
+    def process_env_reset(self, obs: TensorDict, reset: torch.Tensor) -> None:
+        """Record an algorithm-controlled reset performed between environment steps."""
+        if self._collection_observations is not None or self._collection_actions is not None:
+            raise RuntimeError("process_env_reset cannot interrupt a pending behavior action.")
+        reset = reset.to(self.device)
+        observations = obs.to(self.device)
+        self.replay.process_env_reset(observations, reset)
+        reset = reset.reshape(self.replay.num_envs)
+
+        tracking = self._rollout_tracking_mask
+        tracking.zero_()
+        tracking[self._rollout_tracking_env_ids] = True
+        env_ids = (reset & ~tracking).nonzero(as_tuple=False).squeeze(-1)
+        self.rollout_contexts[env_ids] = self._sample_rollout_contexts(env_ids.shape[0])
+
     def compute_returns(self, obs: TensorDict) -> None:
         """Do nothing because direct-Q learning has no rollout-return phase."""
         del obs

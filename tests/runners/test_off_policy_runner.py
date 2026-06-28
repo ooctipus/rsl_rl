@@ -287,6 +287,41 @@ def test_runner_counts_completed_iterations_and_saves_each_boundary_once() -> No
     assert saved[-1] == ("model_4.pt", 4)
 
 
+def test_checkpoint_hook_reset_refreshes_runner_and_replay_stream() -> None:
+    """A save hook may reset the environment without leaving stale runner observations."""
+    cfg = _make_cfg()
+    cfg["save_interval"] = 1
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir="/tmp/off_policy_runner", device="cpu")
+    runner.logger.writer = object()
+    runner.logger.init_logging_writer = lambda: None
+    runner.logger.process_env_step = lambda *args, **kwargs: None
+    runner.logger.log = lambda *args, **kwargs: None
+    runner.logger.stop_logging_writer = lambda: None
+    acted_observations: list[torch.Tensor] = []
+    act = runner.alg.act
+
+    def record_act(obs: TensorDict) -> torch.Tensor:
+        acted_observations.append(obs["state"].clone())
+        return act(obs)
+
+    def reset_on_save(_path: str, _infos: dict | None = None) -> None:
+        runner.env.state = torch.full((NUM_ENVS, STATE_DIM), 50.0)
+        runner.env.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.long)
+        runner.alg.process_env_reset(
+            runner.env.get_observations(),
+            torch.ones(NUM_ENVS, dtype=torch.bool),
+        )
+
+    runner.alg.act = record_act
+    runner.save = reset_on_save
+    runner.learn(2)
+
+    torch.testing.assert_close(acted_observations[2], torch.full((NUM_ENVS, STATE_DIM), 50.0))
+    boundary = runner.alg.replay.sample(torch.ones(NUM_ENVS, dtype=torch.long), torch.arange(NUM_ENVS))
+    assert torch.all(boundary.truncated)
+    torch.testing.assert_close(boundary.next_observations["state"], torch.full((NUM_ENVS, STATE_DIM), 2.0))
+
+
 def test_same_step_collection_uses_true_final_observation_when_available() -> None:
     """A done edge should reach the pre-reset final observation, never the reset observation."""
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
