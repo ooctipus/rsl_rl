@@ -453,6 +453,14 @@ class ForwardBackwardReplay:
         self._size_steps = 0
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
+        self._sample_valid_counts: torch.Tensor | None = None
+        self._sample_valid_cdf: torch.Tensor | None = None
+        self._sample_generator: torch.Generator | None = None
+        if transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP:
+            self._sample_valid_counts = torch.zeros(capacity_steps, device=self.device, dtype=torch.int32)
+            self._sample_valid_cdf = torch.empty(capacity_steps, device=self.device, dtype=torch.int32)
+            self._sample_generator = torch.Generator(device=self.device)
+            self._sample_generator.manual_seed(seed + 1)
 
     @property
     def total_steps(self) -> int:
@@ -510,6 +518,8 @@ class ForwardBackwardReplay:
         )
         edge_flags.bitwise_or_(replay.to(torch.uint8) * _EDGE_APPLIED)
         self.edge_flags[edge_row].copy_(edge_flags)
+        if self._sample_valid_counts is not None:
+            self._sample_valid_counts[edge_row].copy_(replay_int.sum(dtype=torch.int32))
         self.behavior_context[edge_row].copy_(transition.behavior_context)
         self.environment_reward[edge_row].copy_(transition.environment_reward)
         self.auxiliary_reward_evidence[edge_row].copy_(transition.auxiliary_reward_evidence)
@@ -606,6 +616,39 @@ class ForwardBackwardReplay:
         oldest = self._total_steps - self._size_steps
         step_ids = torch.randint(oldest, self._total_steps, (batch_size,), device=self.device, generator=self.generator)
         env_ids = torch.randint(self.num_envs, (batch_size,), device=self.device, generator=self.generator)
+        if self._sample_valid_counts is not None:
+            edge_rows = torch.remainder(step_ids, self.capacity_steps)
+            selected_valid = (self.edge_flags[edge_rows, env_ids] & _EDGE_APPLIED) != 0
+            valid_cdf = self._sample_valid_cdf[: self._size_steps]
+            torch.cumsum(
+                self._sample_valid_counts[: self._size_steps],
+                dim=0,
+                dtype=torch.int32,
+                out=valid_cdf,
+            )
+            valid_positions = (
+                torch.rand(batch_size, device=self.device, generator=self._sample_generator) * valid_cdf[-1]
+            ).to(torch.int32)
+            valid_rows = torch.searchsorted(valid_cdf, valid_positions, right=True)
+            valid_rows.clamp_max_(self._size_steps - 1)
+            previous_rows = torch.clamp(valid_rows - 1, min=0)
+            previous_counts = torch.where(
+                valid_rows > 0,
+                valid_cdf[previous_rows],
+                torch.zeros_like(valid_positions),
+            )
+            valid_ranks = valid_positions - previous_counts
+            valid_flags = (self.edge_flags[valid_rows] & _EDGE_APPLIED) != 0
+            valid_prefix = torch.cumsum(valid_flags, dim=1, dtype=torch.int32)
+            valid_env_ids = torch.argmax((valid_prefix > valid_ranks.unsqueeze(-1)).to(torch.uint8), dim=1)
+            if self._size_steps < self.capacity_steps:
+                valid_step_ids = valid_rows
+            else:
+                newest_row = (self._total_steps - 1) % self.capacity_steps
+                ages = torch.remainder(newest_row - valid_rows, self.capacity_steps)
+                valid_step_ids = self._total_steps - 1 - ages
+            step_ids = torch.where(selected_valid, step_ids, valid_step_ids)
+            env_ids = torch.where(selected_valid, env_ids, valid_env_ids)
         return self.sample(step_ids, env_ids)
 
     def assert_no_errors(self) -> None:
@@ -621,7 +664,7 @@ class ForwardBackwardReplay:
 
     def state_dict(self) -> dict[str, object]:
         """Capture exact replay, sparse-terminal, and sampling state."""
-        return {
+        state: dict[str, object] = {
             "transition_schema_hash": self.transition_schema.schema_hash,
             "history_schema_hash": self.history_layout.schema_hash if self.history_layout is not None else None,
             "capacity_steps": self.capacity_steps,
@@ -646,6 +689,9 @@ class ForwardBackwardReplay:
             "terminal_overflow": self.terminal_overflow,
             "generator_state": self.generator.get_state(),
         }
+        if self._sample_generator is not None:
+            state["sample_generator_state"] = self._sample_generator.get_state()
+        return state
 
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore an exact replay state with strict static compatibility."""
@@ -693,6 +739,12 @@ class ForwardBackwardReplay:
         if not isinstance(generator_state, torch.Tensor):
             raise TypeError("Replay generator_state must be a tensor.")
         self.generator.set_state(generator_state)
+        if self._sample_generator is not None:
+            sample_generator_state = state["sample_generator_state"]
+            if not isinstance(sample_generator_state, torch.Tensor):
+                raise TypeError("Replay sample_generator_state must be a tensor.")
+            self._sample_generator.set_state(sample_generator_state)
+            self._sample_valid_counts.copy_(((self.edge_flags & _EDGE_APPLIED) != 0).sum(dim=1, dtype=torch.int32))
 
     def _validate_history_layout(self) -> None:
         layout = self.history_layout
@@ -795,6 +847,9 @@ class ForwardBackwardReplay:
             self.contract_errors,
             self.terminal_overflow,
         ])
+        if self._sample_valid_counts is not None:
+            tensors.append(self._sample_valid_counts)
+            tensors.append(self._sample_valid_cdf)
         return tuple(tensors)
 
 

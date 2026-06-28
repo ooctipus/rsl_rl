@@ -239,6 +239,57 @@ def test_next_step_reset_only_rows_seed_nodes_but_never_enter_replay() -> None:
     assert replay.sample(torch.tensor([1]), torch.tensor([1])).valid.item()
 
 
+def test_next_step_random_sampling_is_uniform_over_only_applied_edges() -> None:
+    """Reset-only positions should be absent rather than rejected after sampling."""
+    mode = ForwardBackwardAutoresetMode.NEXT_STEP
+    observation_schema, transition_schema = _contracts(mode)
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema)
+    reset_envs = (None, 0, 1, 2, None, 1, 2, 0)
+    expected_rewards = []
+    for step, reset_env in enumerate(reset_envs):
+        if step == replay.capacity_steps:
+            expected_rewards.clear()
+        applied = torch.ones(3, 1, dtype=torch.bool)
+        if reset_env is not None:
+            applied[reset_env] = False
+        replay.add(
+            _transition(
+                step,
+                mode,
+                observation_schema,
+                transition_schema,
+                action_applied=applied,
+            )
+        )
+        expected_rewards.extend(env + step / 10 for env in range(3) if env != reset_env)
+
+    batch = replay.sample_random(90_000)
+    rewards, counts = torch.unique(batch.environment_reward.squeeze(-1), return_counts=True)
+    expected_count = batch.environment_reward.shape[0] / len(expected_rewards)
+
+    assert torch.all(batch.valid)
+    torch.testing.assert_close(rewards, torch.tensor(sorted(expected_rewards)))
+    assert torch.all(torch.abs(counts - expected_count) < expected_count * 0.04)
+
+
+def test_next_step_valid_sampling_does_not_change_primary_rng_sequence() -> None:
+    """All-applied next-step streams should retain the ordinary sampler sequence."""
+    mode = ForwardBackwardAutoresetMode.NEXT_STEP
+    observation_schema, transition_schema = _contracts(mode)
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema)
+    for step in range(4):
+        replay.add(_transition(step, mode, observation_schema, transition_schema))
+    expected_generator = torch.Generator().manual_seed(7)
+    step_ids = torch.randint(0, 4, (128,), generator=expected_generator)
+    env_ids = torch.randint(3, (128,), generator=expected_generator)
+
+    expected = replay.sample(step_ids, env_ids)
+    actual = replay.sample_random(128)
+
+    _assert_batches_equal(expected, actual)
+    torch.testing.assert_close(replay.generator.get_state(), expected_generator.get_state(), rtol=0.0, atol=0.0)
+
+
 def test_sparse_terminal_overflow_is_deferred_and_generation_safe() -> None:
     """Reusing a live per-environment terminal slot should fail at the control boundary."""
     observation_schema, transition_schema = _contracts()
@@ -509,6 +560,28 @@ def test_replay_state_restores_exact_next_random_sample() -> None:
 
     _assert_batches_equal(replay.sample_random(11), restored.sample_random(11))
     assert replay.storage_bytes() == restored.storage_bytes()
+
+
+def test_next_step_replay_state_restores_valid_population_and_rng() -> None:
+    """A resumed sampler should reconstruct holes and continue its correction RNG exactly."""
+    mode = ForwardBackwardAutoresetMode.NEXT_STEP
+    observation_schema, transition_schema = _contracts(mode)
+    _oracle, replay = _make_replays(4, 4, observation_schema, transition_schema)
+    for step, reset_env in enumerate((None, 0, 1, 2)):
+        applied = torch.ones(3, 1, dtype=torch.bool)
+        if reset_env is not None:
+            applied[reset_env] = False
+        replay.add(_transition(step, mode, observation_schema, transition_schema, action_applied=applied))
+    replay.sample_random(17)
+    state = replay.state_dict()
+    _other_oracle, restored = _make_replays(4, 4, observation_schema, transition_schema)
+    restored.load_state_dict(state)
+
+    expected = replay.sample_random(257)
+    actual = restored.sample_random(257)
+
+    _assert_batches_equal(expected, actual)
+    assert torch.all(actual.valid)
 
 
 def test_replay_state_rejects_history_layout_mismatch() -> None:
