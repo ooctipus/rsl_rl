@@ -15,11 +15,7 @@ from dataclasses import dataclass
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.models.forward_backward_model import (
-    ForwardBackwardDualNetworkCfg,
-    ForwardBackwardModel,
-    ForwardBackwardValueHeadCfg,
-)
+from rsl_rl.models.forward_backward_model import ForwardBackwardModel
 from rsl_rl.modules.forward_backward import (
     actor_direct_loss,
     backward_implied_reward,
@@ -31,6 +27,7 @@ from rsl_rl.modules.forward_backward import (
     reward_value_td_loss,
     soft_update,
     trajectory_context,
+    trajectory_context_sequence,
 )
 from rsl_rl.modules.reward_channels import (
     ForwardBackwardRewardChannel,
@@ -519,11 +516,13 @@ class ForwardBackward:
         backward = self.model.backward_map(observations).reshape(
             self._rollout_tracking_count, window_length, self.model.context_dim
         )
-        prefix = torch.cat((torch.zeros_like(backward[:, :1]), backward.cumsum(dim=1)), dim=1)
-        contexts = (
-            prefix[:, self.rollout_expert_context_steps :] - prefix[:, : -self.rollout_expert_context_steps]
-        ) / self.rollout_expert_context_steps
-        return env_ids, self.model.context_project(contexts)
+        contexts = trajectory_context_sequence(
+            backward,
+            self.rollout_expert_context_steps,
+            include_partial=False,
+            radius=self.model.context_dim**0.5 if self.model.context_normalization else None,
+        )
+        return env_ids, contexts
 
     @torch.no_grad()
     def _advance_rollout_contexts(self, action_applied: torch.Tensor) -> torch.Tensor:
@@ -1044,22 +1043,15 @@ class ForwardBackward:
 
 def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
     """Construct one forward-backward learner from ordinary RSL-RL sections."""
-    model_cfg = dict(cfg["model"])
-    model_class = resolve_callable(model_cfg.pop("class_name"))
-    actor_cfg = ForwardBackwardDualNetworkCfg(**dict(model_cfg.pop("actor_cfg")))
-    forward_cfg = ForwardBackwardDualNetworkCfg(**dict(model_cfg.pop("forward_cfg")))
-    value_heads = tuple(_make_value_head(value) for value in model_cfg.pop("value_heads", ()))
-    model = model_class(
+    model_class = resolve_callable(cfg["model"]["class_name"])
+    if not isinstance(model_class, type) or not issubclass(model_class, ForwardBackwardModel):
+        raise TypeError("The configured model class must derive from ForwardBackwardModel.")
+    model = model_class.from_config(
         obs.to(device),
         cfg["obs_groups"],
         env.num_actions,
-        actor_cfg=actor_cfg,
-        forward_cfg=forward_cfg,
-        value_heads=value_heads,
-        **model_cfg,
+        cfg["model"],
     )
-    if not isinstance(model, ForwardBackwardModel):
-        raise TypeError("The configured model must be a ForwardBackwardModel.")
 
     replay_cfg = dict(cfg["replay"])
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
@@ -1128,16 +1120,6 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         raise TypeError("The configured algorithm must be ForwardBackward.")
     algorithm.compile(cfg.get("torch_compile_mode"))
     return algorithm
-
-
-def _make_value_head(value: Mapping[str, object]) -> ForwardBackwardValueHeadCfg:
-    """Build one named value head from its strict spec and network sections."""
-    options = dict(value)
-    spec = ForwardBackwardValueSpec(**dict(options.pop("spec")))
-    network = ForwardBackwardDualNetworkCfg(**dict(options.pop("network")))
-    if options:
-        raise ValueError(f"Unknown value-head configuration: {tuple(options)}.")
-    return ForwardBackwardValueHeadCfg(spec, network)
 
 
 def _make_history_layout(value: object) -> ForwardBackwardHistoryLayout | None:

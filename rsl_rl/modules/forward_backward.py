@@ -320,6 +320,52 @@ def trajectory_context(
     return context
 
 
+def trajectory_context_sequence(
+    backward_features: torch.Tensor,
+    window_length: int,
+    *,
+    include_partial: bool,
+    radius: float | None,
+) -> torch.Tensor:
+    """Construct every detached rolling context from one feature sequence.
+
+    Args:
+        backward_features: Backward features, shape [..., sequence_length, latent].
+        window_length: Number of future features in each context mean.
+        include_partial: Whether to retain shorter windows at the sequence tail.
+        radius: Projected context norm. ``None`` leaves means unprojected.
+
+    Returns:
+        Contexts with the sequence axis retained. Without partial tails its
+        length is ``sequence_length - window_length + 1``.
+    """
+    if backward_features.ndim < 2:
+        raise ValueError("backward_features must have shape [..., sequence_length, latent].")
+    sequence_length = backward_features.shape[-2]
+    if backward_features.numel() == 0 or sequence_length < 1 or backward_features.shape[-1] < 1:
+        raise ValueError("backward_features must contain a non-empty sequence and latent dimension.")
+    if not isinstance(window_length, int) or isinstance(window_length, bool) or window_length < 1:
+        raise ValueError("window_length must be a positive integer.")
+    if not include_partial and window_length > sequence_length:
+        raise ValueError("window_length must not exceed the sequence length without partial tails.")
+    if radius is not None:
+        _validate_finite_scalar(radius, "radius", minimum=0.0)
+
+    features = backward_features.detach()
+    prefix = torch.cat((torch.zeros_like(features[..., :1, :]), features.cumsum(dim=-2)), dim=-2)
+    if include_partial:
+        starts = torch.arange(sequence_length, device=features.device)
+        ends = torch.clamp(starts + window_length, max=sequence_length)
+    else:
+        starts = torch.arange(sequence_length - window_length + 1, device=features.device)
+        ends = starts + window_length
+    widths = (ends - starts).to(features.dtype)
+    contexts = (prefix.index_select(-2, ends) - prefix.index_select(-2, starts)) / widths[:, None]
+    if radius is not None:
+        contexts = radius * F.normalize(contexts, dim=-1)
+    return contexts
+
+
 def actor_direct_loss(
     fb_values: torch.Tensor,
     value_channels: torch.Tensor,

@@ -507,6 +507,28 @@ def test_context_projection_uses_sqrt_dimension_radius() -> None:
     torch.testing.assert_close(context.norm(dim=-1), torch.full((7,), 2.0))
 
 
+def test_model_from_config_is_shared_by_training_and_inference() -> None:
+    """The ordinary model config should construct the same inference topology without a learner."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    config = {
+        "class_name": "rsl_rl.models.forward_backward_model:ForwardBackwardModel",
+        "context_dim": 4,
+        "actor_cfg": {"hidden_dim": 16, "hidden_layers": 2, "embedding_layers": 2},
+        "forward_cfg": {"hidden_dim": 16, "hidden_layers": 2, "embedding_layers": 2},
+        "backward_hidden_dims": [8, 8],
+        "normalization_type": "exponential",
+        "normalization_eps": 1e-5,
+        "normalization_momentum": 0.01,
+    }
+
+    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config)
+
+    assert model.observation_schema.route_width("actor") == 358
+    assert model.action_dim == 2
+    assert model.context_dim == 4
+    assert model.observation_normalizers["state"].momentum == 0.01
+
+
 def _simple_dual_parameter_count(
     left_input: int,
     right_input: int,

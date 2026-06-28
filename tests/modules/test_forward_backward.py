@@ -24,6 +24,7 @@ from rsl_rl.modules.forward_backward import (
     reward_value_td_loss,
     soft_update,
     trajectory_context,
+    trajectory_context_sequence,
 )
 
 _VALUE_RTOL = 1.0e-10
@@ -643,6 +644,26 @@ def test_trajectory_context_matches_sliding_window_loop() -> None:
 
     torch.testing.assert_close(actual, expected, rtol=_VALUE_RTOL, atol=_VALUE_ATOL)
     torch.testing.assert_close(trajectory_context(windows, radius=None), windows.mean(dim=1))
+
+
+def test_trajectory_context_sequence_matches_full_and_partial_window_loops() -> None:
+    """One prefix-sum operator should serve rollout and evaluator context sequences."""
+    features = (torch.arange(30, dtype=torch.float64).reshape(2, 5, 3) - 8.0) / 7.0
+    full = trajectory_context_sequence(features, 3, include_partial=False, radius=None)
+    partial = trajectory_context_sequence(features, 3, include_partial=True, radius=math.sqrt(3.0))
+
+    expected_full = torch.stack([
+        torch.stack([row[start : start + 3].mean(dim=0) for start in range(3)]) for row in features
+    ])
+    expected_partial = torch.stack([
+        torch.stack([
+            math.sqrt(3.0) * F.normalize(row[start : min(start + 3, 5)].mean(dim=0), dim=-1) for start in range(5)
+        ])
+        for row in features
+    ])
+
+    torch.testing.assert_close(full, expected_full, rtol=_VALUE_RTOL, atol=_VALUE_ATOL)
+    torch.testing.assert_close(partial, expected_partial, rtol=_VALUE_RTOL, atol=_VALUE_ATOL)
 
 
 def test_trajectory_context_rejects_empty_shapes_and_invalid_radius() -> None:

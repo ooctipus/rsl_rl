@@ -357,6 +357,39 @@ class ForwardBackwardModel(torch.nn.Module):
 
     is_recurrent: bool = False
 
+    @classmethod
+    def from_config(
+        cls,
+        observations: TensorDict,
+        obs_groups: Mapping[str, Sequence[str]],
+        action_dim: int,
+        config: Mapping[str, object],
+    ) -> ForwardBackwardModel:
+        """Build a training or inference model from one ordinary config section."""
+        options = dict(config)
+        configured_class = resolve_callable(options.pop("class_name", cls))
+        if configured_class is not cls:
+            raise TypeError(f"Configured model class must be {cls.__name__}, got {configured_class!r}.")
+        actor_cfg = ForwardBackwardDualNetworkCfg(**dict(options.pop("actor_cfg")))
+        forward_cfg = ForwardBackwardDualNetworkCfg(**dict(options.pop("forward_cfg")))
+        value_heads = []
+        for value in options.pop("value_heads", ()):
+            value_options = dict(value)
+            spec = ForwardBackwardValueSpec(**dict(value_options.pop("spec")))
+            network = ForwardBackwardDualNetworkCfg(**dict(value_options.pop("network")))
+            if value_options:
+                raise ValueError(f"Unknown value-head configuration: {tuple(value_options)}.")
+            value_heads.append(ForwardBackwardValueHeadCfg(spec, network))
+        return cls(
+            observations,
+            obs_groups,
+            action_dim,
+            actor_cfg=actor_cfg,
+            forward_cfg=forward_cfg,
+            value_heads=tuple(value_heads),
+            **options,
+        )
+
     def __init__(
         self,
         observations: TensorDict,
