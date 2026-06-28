@@ -34,6 +34,7 @@ def test_metamotivo_preset_freezes_humenv_reference_choices() -> None:
         "hidden_layers": 2,
         "embedding_layers": 2,
     }
+    assert cfg["model"]["initialization_type"] == "orthogonal"
     assert cfg["model"]["normalization_type"] == "exponential"
     assert cfg["model"]["normalization_eps"] == 1e-5
     assert cfg["model"]["normalization_momentum"] == 0.01
@@ -55,6 +56,7 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
         "embedding_layers": 6,
         "residual": True,
     }
+    assert cfg["model"]["initialization_type"] == "orthogonal"
     assert cfg["model"]["normalization_type"] == "exponential"
     assert cfg["model"]["normalization_eps"] == 1e-5
     assert cfg["model"]["normalization_momentum"] == 0.01

@@ -18,7 +18,7 @@ from typing import Literal, cast
 
 from rsl_rl.modules import MLP, EmpiricalNormalization, ExponentialNormalization, IdentityNormalization
 from rsl_rl.modules.distribution import Distribution
-from rsl_rl.modules.mlp import MLPBlock
+from rsl_rl.modules.mlp import MLPBlock, MLPEnsembleLinear
 from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec, get_forward_backward_schema_hash
 from rsl_rl.utils import resolve_callable
 
@@ -405,6 +405,7 @@ class ForwardBackwardModel(torch.nn.Module):
         distribution_cfg: Mapping[str, object] | None = None,
         discriminator_hidden_dims: tuple[int, ...] | list[int] | None = None,
         value_heads: Sequence[ForwardBackwardValueHeadCfg] = (),
+        initialization_type: Literal["default", "orthogonal"] = "default",
         normalization_type: Literal["none", "empirical", "exponential"] = "empirical",
         normalization_eps: float = 1e-2,
         normalization_momentum: float = 0.1,
@@ -415,6 +416,8 @@ class ForwardBackwardModel(torch.nn.Module):
         super().__init__()
         if action_dim < 1 or context_dim < 1 or forward_ensemble_size < 1:
             raise ValueError("action_dim, context_dim, and forward_ensemble_size must be positive.")
+        if initialization_type not in ("default", "orthogonal"):
+            raise ValueError(f"Unknown initialization_type: {initialization_type!r}.")
         self.observation_schema = ForwardBackwardObservationSchema.from_observations(observations, obs_groups)
         self.observation_schema.assert_valid(observations)
         for route in ("actor", "forward", "backward"):
@@ -477,9 +480,6 @@ class ForwardBackwardModel(torch.nn.Module):
             backward_normalization,
         )
 
-        self.forward_target_network = self._make_target(self.forward_network)
-        self.backward_target_network = self._make_target(self.backward_network)
-
         if discriminator_hidden_dims is None:
             self.discriminator_network: torch.nn.Module | None = None
         else:
@@ -494,7 +494,6 @@ class ForwardBackwardModel(torch.nn.Module):
         if len(names) != len(set(names)):
             raise ValueError("Value-head names must be unique.")
         self.value_networks = torch.nn.ModuleDict()
-        self.value_target_networks = torch.nn.ModuleDict()
         self._value_specs_by_name = {head.spec.name: head.spec for head in value_heads}
         for head in value_heads:
             route = cast(ForwardBackwardRouteName, head.spec.route)
@@ -507,8 +506,31 @@ class ForwardBackwardModel(torch.nn.Module):
                 head.spec.ensemble_size,
             )
             self.value_networks[head.spec.name] = network
-            if head.spec.has_target:
-                self.value_target_networks[head.spec.name] = self._make_target(network)
+
+        self._initialize_parameters(initialization_type)
+        self.forward_target_network = self._make_target(self.forward_network)
+        self.backward_target_network = self._make_target(self.backward_network)
+        self.value_target_networks = torch.nn.ModuleDict({
+            head.spec.name: self._make_target(self.value_networks[head.spec.name])
+            for head in value_heads
+            if head.spec.has_target
+        })
+
+    def _initialize_parameters(self, initialization_type: Literal["default", "orthogonal"]) -> None:
+        """Initialize every live network before target networks are copied."""
+        if initialization_type == "default":
+            return
+        ensemble_gain = torch.nn.init.calculate_gain("relu")
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.orthogonal_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, MLPEnsembleLinear):
+                for weight in module.weight:
+                    torch.nn.init.orthogonal_(weight, gain=ensemble_gain)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
     @staticmethod
     def _make_target(module: torch.nn.Module) -> torch.nn.Module:

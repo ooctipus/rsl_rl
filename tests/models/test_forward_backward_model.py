@@ -21,6 +21,7 @@ from rsl_rl.models.forward_backward_model import (
     ForwardBackwardObservationSchema,
     ForwardBackwardValueHeadCfg,
 )
+from rsl_rl.modules.mlp import MLPEnsembleLinear
 from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec
 from tests.fixtures.forward_backward import BFM_FIELD_WIDTHS, BFM_ROUTES, META_FIELD_WIDTHS, META_ROUTES
 
@@ -66,6 +67,7 @@ def _make_model(
     normalization_eps: float = 1e-2,
     normalization_momentum: float = 0.1,
     distribution_cfg: dict[str, object] | None = None,
+    initialization_type: Literal["default", "orthogonal"] = "default",
 ) -> ForwardBackwardModel:
     return ForwardBackwardModel(
         observations,
@@ -82,6 +84,7 @@ def _make_model(
         normalization_eps=normalization_eps,
         normalization_momentum=normalization_momentum,
         distribution_cfg=distribution_cfg,
+        initialization_type=initialization_type,
     )
 
 
@@ -303,6 +306,45 @@ def test_composite_model_outputs_match_named_meta_routes() -> None:
     assert model.backward_map(observations).shape == (3, 4)
     assert model.discriminator_logits(observations, context).shape == (3, 1)
     assert model.critic_values("discriminator", observations, context, actions).shape == (2, 3, 1)
+
+
+def test_orthogonal_initialization_precedes_exact_target_copies() -> None:
+    """From-scratch FB models should expose one initialization law for every live owner."""
+    observations = TensorDict({"state": torch.randn(3, 12)}, batch_size=[3])
+    routes = {name: ("state",) for name in META_ROUTES}
+    value_head = _value_head("discriminator", "critic_discriminator")
+    model = _make_model(
+        observations,
+        routes,
+        discriminator_hidden_dims=_hidden_dims(),
+        value_heads=(value_head,),
+        initialization_type="orthogonal",
+    )
+
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear):
+            weights = (module.weight,)
+            gain = 1.0
+        elif isinstance(module, MLPEnsembleLinear):
+            weights = tuple(module.weight)
+            gain = torch.nn.init.calculate_gain("relu")
+        else:
+            continue
+        if module.bias is not None:
+            torch.testing.assert_close(module.bias, torch.zeros_like(module.bias))
+        for weight in weights:
+            rows, columns = weight.shape
+            gram = weight @ weight.mT if rows <= columns else weight.mT @ weight
+            expected = gain**2 * torch.eye(min(rows, columns), dtype=weight.dtype)
+            torch.testing.assert_close(gram, expected, rtol=1e-5, atol=1e-5)
+
+    for live, target in (
+        (model.forward_network, model.forward_target_network),
+        (model.backward_network, model.backward_target_network),
+        (model.value_networks["discriminator"], model.value_target_networks["discriminator"]),
+    ):
+        for live_value, target_value in zip(live.state_dict().values(), target.state_dict().values(), strict=True):
+            torch.testing.assert_close(live_value, target_value, rtol=0.0, atol=0.0)
 
 
 def test_scaled_bfm_residual_model_uses_every_asymmetric_route() -> None:
