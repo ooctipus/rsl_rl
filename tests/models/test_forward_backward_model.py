@@ -62,6 +62,8 @@ def _make_model(
     discriminator_hidden_dims: tuple[int, ...] | None = None,
     value_heads: tuple[ForwardBackwardValueHeadCfg, ...] = (),
     observation_normalization: bool = False,
+    normalization_eps: float = 1e-2,
+    normalization_momentum: float | None = None,
     distribution_cfg: dict[str, object] | None = None,
 ) -> ForwardBackwardModel:
     return ForwardBackwardModel(
@@ -76,6 +78,8 @@ def _make_model(
         discriminator_hidden_dims=discriminator_hidden_dims,
         value_heads=value_heads,
         observation_normalization=observation_normalization,
+        normalization_eps=normalization_eps,
+        normalization_momentum=normalization_momentum,
         distribution_cfg=distribution_cfg,
     )
 
@@ -356,6 +360,36 @@ def test_field_normalizers_update_once_freeze_and_round_trip() -> None:
         model.action_sample(probe, context, deterministic=True),
         restored.action_sample(probe, context, deterministic=True),
     )
+
+
+def test_exponential_field_normalizer_matches_released_two_batch_update() -> None:
+    """Meta/BFM mode should reproduce two ordered BatchNorm statistic updates."""
+    observations = _make_bfm_observations(batch_size=5)
+    next_observations = TensorDict(
+        {name: value + torch.arange(5, dtype=value.dtype).unsqueeze(-1) for name, value in observations.items()},
+        batch_size=[5],
+    )
+    model = _make_model(
+        observations,
+        BFM_ROUTES,
+        observation_normalization=True,
+        normalization_eps=1e-5,
+        normalization_momentum=0.01,
+    )
+    model.update_normalization(observations)
+    model.update_normalization(next_observations)
+    model.normalization_train(False)
+
+    for name in BFM_FIELD_WIDTHS:
+        normalizer = model.observation_normalizers[name]
+        expected_mean = 0.99 * (0.01 * observations[name].mean(dim=0)) + 0.01 * next_observations[name].mean(dim=0)
+        expected_var = 0.99 * (0.99 * torch.ones_like(expected_mean) + 0.01 * observations[name].var(dim=0))
+        expected_var += 0.01 * next_observations[name].var(dim=0)
+        torch.testing.assert_close(normalizer.running_mean, expected_mean)
+        torch.testing.assert_close(normalizer.running_var, expected_var)
+        assert normalizer.num_batches_tracked.item() == 2
+        expected = (next_observations[name] - expected_mean) / torch.sqrt(expected_var + 1e-5)
+        torch.testing.assert_close(normalizer(next_observations[name]), expected)
 
 
 def test_normalized_bfm_route_matches_independent_field_composition() -> None:

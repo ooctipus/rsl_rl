@@ -49,8 +49,11 @@ class MLPEnsembleLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply all ensemble members."""
         if x.ndim == 2:
-            x = x.unsqueeze(0)
-        return torch.matmul(x, self.weight.transpose(-1, -2)) + (self.bias if self.bias is not None else 0.0)
+            x = x.unsqueeze(0).expand(self.ensemble_size, -1, -1)
+        weight = self.weight.transpose(-1, -2)
+        if self.bias is None:
+            return torch.bmm(x, weight)
+        return torch.baddbmm(self.bias, x, weight)
 
     def extra_repr(self) -> str:
         """Return constructor dimensions for module summaries."""

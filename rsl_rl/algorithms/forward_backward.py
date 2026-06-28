@@ -576,9 +576,9 @@ class ForwardBackward:
                 self.expert_sequence_length,
             )
 
-            normalization_observations = torch.cat((batch.observations, batch.next_observations), dim=0)
             self.model.normalization_train(True)
-            self.model.update_normalization(normalization_observations)
+            self.model.update_normalization(batch.observations)
+            self.model.update_normalization(batch.next_observations)
             self.model.normalization_train(False)
 
             expert_observations = self._make_expert_observations(expert_batch.frames)

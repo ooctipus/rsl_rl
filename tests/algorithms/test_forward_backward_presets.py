@@ -34,6 +34,8 @@ def test_metamotivo_preset_freezes_humenv_reference_choices() -> None:
         "hidden_layers": 2,
         "embedding_layers": 2,
     }
+    assert cfg["model"]["normalization_eps"] == 1e-5
+    assert cfg["model"]["normalization_momentum"] == 0.01
     assert cfg["algorithm"]["batch_size"] == 1024
     assert cfg["algorithm"]["expert_sequence_length"] == 8
     assert cfg["algorithm"]["context_goal_fraction"] == 0.2
@@ -52,6 +54,8 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
         "embedding_layers": 6,
         "residual": True,
     }
+    assert cfg["model"]["normalization_eps"] == 1e-5
+    assert cfg["model"]["normalization_momentum"] == 0.01
     assert cfg["replay"]["capacity_steps"] == 5_000
     assert cfg["replay"]["history_layout"]["history_length"] == 4
     assert cfg["algorithm"]["rollout_expert_fraction"] == 0.5

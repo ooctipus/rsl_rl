@@ -24,6 +24,8 @@ from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec
 
 _META_ROOT = os.getenv("METAMOTIVO_ORACLE_DIR")
 _BFM_ROOT = os.getenv("BFM_ZERO_ORACLE_DIR")
+_META_REPO = os.getenv("METAMOTIVO_REPO", _META_ROOT)
+_BFM_REPO = os.getenv("BFM_ZERO_REPO", _BFM_ROOT)
 
 
 def _count(module: torch.nn.Module) -> int:
@@ -78,7 +80,7 @@ def _model(
 @pytest.mark.parametrize("residual", (False, True))
 def test_meta_forward_parameter_count_matches_reference(residual: bool) -> None:
     """Simple and residual forward maps should own the same parameters as MetaMotivo."""
-    sys.path.insert(0, str(Path(_META_ROOT)))
+    sys.path.insert(0, str(Path(_META_REPO)))
     from metamotivo.nn_models import ForwardMap, ResidualForwardMap
 
     cfg = ForwardBackwardDualNetworkCfg(16, 3, 2, residual)
@@ -92,7 +94,7 @@ def test_meta_forward_parameter_count_matches_reference(residual: bool) -> None:
 @pytest.mark.skipif(_META_ROOT is None, reason="METAMOTIVO_ORACLE_DIR is not set")
 def test_meta_actor_backward_discriminator_and_critic_counts_match_reference() -> None:
     """Every non-forward MetaMotivo component should preserve architecture ownership."""
-    sys.path.insert(0, str(Path(_META_ROOT)))
+    sys.path.insert(0, str(Path(_META_REPO)))
     from metamotivo.nn_models import Actor, BackwardMap, Discriminator, ForwardMap
 
     cfg = ForwardBackwardDualNetworkCfg(16, 3, 2)
@@ -107,7 +109,7 @@ def test_meta_actor_backward_discriminator_and_critic_counts_match_reference() -
 @pytest.mark.skipif(_BFM_ROOT is None, reason="BFM_ZERO_ORACLE_DIR is not set")
 def test_bfm_residual_topology_is_reproduced_with_explicit_embedding_depth() -> None:
     """The successful BFM topology should be explicit instead of preserving its ignored config field."""
-    sys.path.insert(0, str(Path(_BFM_ROOT)))
+    sys.path.insert(0, str(Path(_BFM_REPO)))
     import gymnasium
     from humanoidverse.agents.nn_models import ForwardArchiConfig
 

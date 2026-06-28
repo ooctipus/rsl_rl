@@ -33,6 +33,8 @@ def metamotivo_config(expert_provider: Callable) -> dict:
             "backward_hidden_dims": [256],
             "discriminator_hidden_dims": [1024, 1024, 1024],
             "distribution_cfg": {"class_name": "ClippedGaussianDistribution", "init_std": 0.2},
+            "normalization_eps": 1e-5,
+            "normalization_momentum": 0.01,
             "value_heads": [
                 {
                     "spec": {
@@ -160,6 +162,8 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "backward_hidden_dims": [256],
             "discriminator_hidden_dims": [1024, 1024, 1024],
             "distribution_cfg": {"class_name": "ClippedGaussianDistribution", "init_std": 0.05},
+            "normalization_eps": 1e-5,
+            "normalization_momentum": 0.01,
             "value_heads": [
                 {
                     "spec": {

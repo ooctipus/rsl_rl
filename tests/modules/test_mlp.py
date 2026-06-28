@@ -38,6 +38,18 @@ def test_ensemble_linear_matches_independent_linear_heads() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_ensemble_linear_without_bias_matches_batched_matrix_multiply() -> None:
+    """The fused source-compatible path should preserve the optional no-bias contract."""
+    torch.manual_seed(4)
+    layer = MLPEnsembleLinear(5, 4, ensemble_size=3, bias=False)
+    inputs = torch.randn(3, 7, 5)
+
+    actual = layer(inputs)
+    expected = torch.bmm(inputs, layer.weight.transpose(-1, -2))
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_ensemble_mlp_accepts_shared_or_member_specific_inputs() -> None:
     """The first layer should broadcast shared rows and preserve ensemble rows."""
     model = MLP(

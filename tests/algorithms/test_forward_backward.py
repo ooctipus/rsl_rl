@@ -10,11 +10,12 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import numpy as np
 import torch
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 
 import pytest
 
@@ -118,6 +119,7 @@ def _make_learner(
     *,
     include_auxiliary: bool = True,
     multi_gpu_cfg: dict | None = None,
+    normalization_momentum: float | None = None,
 ) -> ForwardBackward:
     """Create a small deterministic learner with live replay and expert data."""
     torch.manual_seed(13)
@@ -176,6 +178,8 @@ def _make_learner(
         discriminator_hidden_dims=(16, 16),
         value_heads=tuple(value_heads),
         observation_normalization=True,
+        normalization_eps=1e-5 if normalization_momentum is not None else 1e-2,
+        normalization_momentum=normalization_momentum,
     )
     transition_schema = ForwardBackwardTransitionSchema(
         observation_schema_hash=model.observation_schema.schema_hash,
@@ -325,6 +329,62 @@ def _parameters_changed(before: tuple[torch.Tensor, ...], module: torch.nn.Modul
     return any(not torch.equal(previous, current) for previous, current in zip(before, module.parameters()))
 
 
+def test_complete_update_sequence_matches_reference_dependency_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D, representations, values, actor, and targets should mutate in source order."""
+    learner = _make_learner()
+    events: list[str] = []
+
+    original_normalization = learner.model.update_normalization
+
+    def update_normalization(observations: TensorDict) -> None:
+        events.append("normalization")
+        original_normalization(observations)
+
+    monkeypatch.setattr(learner.model, "update_normalization", update_normalization)
+
+    def record(method_name: str) -> None:
+        original: Callable[..., object] = getattr(learner, method_name)
+
+        def wrapped(*args: object, **kwargs: object) -> object:
+            if method_name == "_update_value":
+                events.append(f"value/{args[0]}")
+            else:
+                events.append(method_name.removeprefix("_"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(learner, method_name, wrapped)
+
+    for method_name in (
+        "_update_discriminator",
+        "_sample_mixed_contexts",
+        "_append_contexts",
+        "_update_forward_backward",
+        "_materialize_rewards",
+        "_update_value",
+        "_update_actor",
+        "_update_targets",
+        "_commit_versions",
+    ):
+        record(method_name)
+
+    learner.update()
+
+    assert events == [
+        "normalization",
+        "normalization",
+        "update_discriminator",
+        "sample_mixed_contexts",
+        "append_contexts",
+        "update_forward_backward",
+        "materialize_rewards",
+        "value/discriminator",
+        "value/auxiliary",
+        "update_actor",
+        "update_targets",
+        "commit_versions",
+    ]
+
+
 def test_one_update_mutates_every_declared_owner_and_no_actor_evaluator_grads() -> None:
     """The ordered update should step live owners, EMA targets, and only actor gradients last."""
     learner = _make_learner()
@@ -391,6 +451,33 @@ def test_meta_and_bfm_component_sets_use_the_same_update_class() -> None:
     assert "auxiliary" in bfm.value_optimizers
 
 
+def _assert_nested_equal(actual: object, expected: object) -> None:
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    elif isinstance(expected, TensorDictBase):
+        assert isinstance(actual, TensorDictBase)
+        assert actual.batch_size == expected.batch_size
+        assert actual.keys() == expected.keys()
+        for key in expected.keys():  # noqa: SIM118
+            _assert_nested_equal(actual[key], expected[key])
+    elif isinstance(expected, np.ndarray):
+        assert isinstance(actual, np.ndarray)
+        np.testing.assert_array_equal(actual, expected)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_equal(actual[key], expected[key])
+    elif isinstance(expected, (tuple, list)):
+        assert isinstance(actual, type(expected))
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected, strict=True):
+            _assert_nested_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
 def test_learner_checkpoint_reproduces_the_exact_next_update() -> None:
     """Model, optimizers, samplers, contexts, and RNG should resume one update exactly."""
     expected = _make_learner()
@@ -407,6 +494,40 @@ def test_learner_checkpoint_reproduces_the_exact_next_update() -> None:
     torch.testing.assert_close(restored.context_buffer, expected.context_buffer, rtol=0.0, atol=0.0)
     for name, value in expected.model.state_dict().items():
         torch.testing.assert_close(restored.model.state_dict()[name], value, rtol=0.0, atol=0.0)
+    expected_state = expected.save()
+    restored_state = restored.save()
+    for name in (
+        "optimizer_state_dicts",
+        "reward_normalizer_state_dict",
+        "replay_state_dict",
+        "expert_state_dict",
+        "context_buffer_cursor",
+        "context_buffer_size",
+        "update_step",
+        "versions",
+        "rng_state",
+    ):
+        _assert_nested_equal(restored_state[name], expected_state[name])
+
+
+def test_source_matched_normalizer_uses_two_ordered_updates_in_full_sequence() -> None:
+    """The complete update should mutate EMA statistics in current-then-next order."""
+    learner = _make_learner(normalization_momentum=0.01)
+    replay_rng = learner.replay.generator.get_state()
+    batch = learner.replay.sample_random(learner.batch_size)
+    learner.replay.generator.set_state(replay_rng)
+    mean = torch.zeros(6)
+    variance = torch.ones(6)
+    for observations in (batch.observations["state"], batch.next_observations["state"]):
+        mean = 0.99 * mean + 0.01 * observations.mean(dim=0)
+        variance = 0.99 * variance + 0.01 * observations.var(dim=0)
+
+    learner.update()
+
+    normalizer = learner.model.observation_normalizers["state"]
+    torch.testing.assert_close(normalizer.running_mean, mean)
+    torch.testing.assert_close(normalizer.running_var, variance)
+    assert normalizer.num_batches_tracked.item() == 2
 
 
 def test_checkpoint_header_has_one_compatibility_fingerprint() -> None:
