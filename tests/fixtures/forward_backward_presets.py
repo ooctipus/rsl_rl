@@ -186,6 +186,7 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
                         "kind": "critic",
                         "route": "critic_auxiliary",
                         "reward_channels": list(evidence),
+                        "reward_composition": "scalar",
                         "ensemble_size": 2,
                         "has_target": True,
                     },
@@ -231,6 +232,7 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "context_buffer_capacity": 8_192,
             "rollout_context_refresh_steps": 100,
             "rollout_expert_fraction": 0.5,
+            "random_action_range": (-5.0, 5.0),
             "rollout_expert_steps": 250,
             "rollout_expert_context_steps": 8,
             "value_cfg": {

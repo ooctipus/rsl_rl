@@ -501,7 +501,7 @@ class ForwardBackwardModel(torch.nn.Module):
             network = _ForwardBackwardDualNetwork(
                 self.observation_schema.route_width(route) + action_dim,
                 self.observation_schema.route_width(route) + context_dim,
-                len(head.spec.reward_channels),
+                head.spec.output_width,
                 head.network,
                 head.spec.ensemble_size,
             )

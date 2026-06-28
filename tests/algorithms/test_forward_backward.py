@@ -121,6 +121,8 @@ def _make_learner(
     include_auxiliary: bool = True,
     multi_gpu_cfg: dict | None = None,
     normalization_type: Literal["empirical", "exponential"] = "empirical",
+    auxiliary_composition: Literal["vector", "scalar"] = "vector",
+    random_action_range: tuple[float, float] | None = None,
 ) -> ForwardBackward:
     """Create a small deterministic learner with live replay and expert data."""
     torch.manual_seed(13)
@@ -163,6 +165,7 @@ def _make_learner(
                     route="critic_auxiliary",
                     reward_channels=("action_rate", "slip"),
                     ensemble_size=2,
+                    reward_composition=auxiliary_composition,
                     has_target=True,
                 ),
                 network,
@@ -272,6 +275,7 @@ def _make_learner(
         implied_reward_ridge=0.1,
         discriminator_gradient_penalty_coefficient=0.1,
         seed=47,
+        random_action_range=random_action_range,
         multi_gpu_cfg=multi_gpu_cfg,
     )
 
@@ -320,6 +324,32 @@ def test_phase_1f_collection_retains_one_immutable_pending_action() -> None:
     assert actions.shape == (4, 2)
     with pytest.raises(RuntimeError, match="unresolved environment transition"):
         algorithm.save()
+
+
+def test_random_behavior_uses_independent_explicit_action_bounds() -> None:
+    """Warm-up support should match the environment without widening learned actor actions."""
+    algorithm = _make_learner(random_action_range=(-5.0, 5.0))
+    observations = TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4])
+
+    actions = algorithm.act_random(observations)
+
+    assert torch.all(actions >= -5.0)
+    assert torch.all(actions <= 5.0)
+    assert torch.any(actions.abs() > 1.0)
+    assert algorithm.model.action_distribution.action_range == (-1.0, 1.0)
+
+
+def test_scalar_auxiliary_composes_channels_before_value_propagation() -> None:
+    """Released BFM-style helpers should predict one weighted reward return."""
+    learner = _make_learner(auxiliary_composition="scalar")
+    observations = TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4])
+    actions = torch.zeros(4, 2)
+
+    values = learner.model.critic_values("auxiliary", observations, learner.rollout_contexts, actions)
+
+    assert values.shape == (2, 4, 1)
+    torch.testing.assert_close(learner._value_actor_coefficients["auxiliary"], torch.ones(1))
+    assert torch.isfinite(torch.tensor(learner.update()["value/auxiliary/loss"]))
 
 
 def _parameter_snapshot(module: torch.nn.Module) -> tuple[torch.Tensor, ...]:

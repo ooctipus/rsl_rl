@@ -65,6 +65,8 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
     assert cfg["algorithm"]["rollout_expert_fraction"] == 0.5
     assert cfg["algorithm"]["rollout_expert_steps"] == 250
     assert cfg["algorithm"]["rollout_expert_context_steps"] == 8
+    assert cfg["algorithm"]["random_action_range"] == (-5.0, 5.0)
+    assert cfg["model"]["value_heads"][1]["spec"]["reward_composition"] == "scalar"
     assert cfg["algorithm"]["value_cfg"]["auxiliary"]["reward_coefficients"] == (
         0.0,
         0.1,

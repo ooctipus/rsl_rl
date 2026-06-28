@@ -139,6 +139,7 @@ def test_value_spec_describes_one_reward_subset() -> None:
 
     spec.validate_reward_schema(schema)
     assert spec.reward_channels == ("environment", "energy_penalty")
+    assert spec.output_width == 2
     assert spec.ensemble_size == 2
     assert spec.has_target
 
@@ -158,12 +159,21 @@ def test_value_source_rejects_unknown_reward_channel() -> None:
         ("reward_channels", (), "At least one reward channel"),
         ("reward_channels", ("environment", "environment"), "must be unique"),
         ("ensemble_size", 0, "must be positive"),
+        ("reward_composition", "matrix", "Unsupported reward composition"),
     ),
 )
 def test_invalid_value_semantics_fail(field: str, value: object, message: str) -> None:
     """Ambiguous value-source descriptions should fail at construction."""
     with pytest.raises(ValueError, match=message):
         replace(_make_value_spec(), **{field: value})
+
+
+def test_scalar_reward_composition_predicts_one_value() -> None:
+    """A scalar helper should combine its declared channels before TD propagation."""
+    spec = replace(_make_value_spec(), reward_composition="scalar")
+
+    assert spec.reward_channels == ("environment", "energy_penalty")
+    assert spec.output_width == 1
 
 
 def test_schema_hash_is_mapping_order_independent_but_sequence_sensitive() -> None:

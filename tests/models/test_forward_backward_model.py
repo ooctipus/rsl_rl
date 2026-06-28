@@ -93,6 +93,7 @@ def _value_head(
     route: str,
     *,
     reward_channels: tuple[str, ...] = ("reward",),
+    reward_composition: Literal["vector", "scalar"] = "vector",
     ensemble_size: int = 2,
     has_target: bool = True,
     network: ForwardBackwardDualNetworkCfg | None = None,
@@ -103,6 +104,7 @@ def _value_head(
             kind="critic",
             route=route,
             reward_channels=reward_channels,
+            reward_composition=reward_composition,
             ensemble_size=ensemble_size,
             has_target=has_target,
         ),
@@ -601,3 +603,19 @@ def test_simple_forward_parameter_count_matches_independent_formula() -> None:
     actual = sum(parameter.numel() for parameter in model.forward_network.parameters())
 
     assert actual == expected
+
+
+def test_scalar_composed_value_head_has_one_output() -> None:
+    """A scalar helper should compose several reward channels into one propagated value."""
+    observations = _make_bfm_observations(batch_size=3)
+    head = _value_head(
+        "auxiliary",
+        "critic_auxiliary",
+        reward_channels=("action_rate", "slippage"),
+        reward_composition="scalar",
+    )
+    model = _make_model(observations, BFM_ROUTES, value_heads=(head,))
+    context = model.context_random(3)
+    actions = torch.zeros(3, 2)
+
+    assert model.critic_values("auxiliary", observations, context, actions).shape == (2, 3, 1)

@@ -16,6 +16,7 @@ from typing import Literal
 ForwardBackwardRewardTiming = Literal["state", "next_state", "transition"]
 ForwardBackwardRewardSource = Literal["environment", "stored_evidence", "recomputed"]
 ForwardBackwardValueKind = Literal["forward_readout", "critic"]
+ForwardBackwardRewardComposition = Literal["vector", "scalar"]
 
 
 def get_forward_backward_schema_hash(value: object) -> str:
@@ -120,6 +121,7 @@ class ForwardBackwardValueSpec:
     reward_channels: tuple[str, ...]
     ensemble_size: int
     has_target: bool
+    reward_composition: ForwardBackwardRewardComposition = "vector"
 
     def __post_init__(self) -> None:
         """Normalize channel names and reject ambiguous value semantics."""
@@ -136,7 +138,14 @@ class ForwardBackwardValueSpec:
             raise ValueError("Value-source reward channels must be unique.")
         if self.ensemble_size < 1:
             raise ValueError("ensemble_size must be positive.")
+        if self.reward_composition not in ("vector", "scalar"):
+            raise ValueError(f"Unsupported reward composition: {self.reward_composition!r}.")
         object.__setattr__(self, "reward_channels", reward_channels)
+
+    @property
+    def output_width(self) -> int:
+        """Number of values predicted by this head."""
+        return len(self.reward_channels) if self.reward_composition == "vector" else 1
 
     def validate_reward_schema(self, reward_schema: ForwardBackwardRewardSchema) -> None:
         """Reject references to channels outside the reward schema."""

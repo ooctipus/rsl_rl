@@ -48,7 +48,7 @@ from rsl_rl.storage.forward_backward_replay import (
 from rsl_rl.utils import resolve_callable, resolve_optimizer
 
 FORWARD_BACKWARD_CHECKPOINT_FORMAT = "rsl_rl.forward_backward"
-FORWARD_BACKWARD_CHECKPOINT_VERSION = 1
+FORWARD_BACKWARD_CHECKPOINT_VERSION = 2
 FORWARD_BACKWARD_CHECKPOINT_HEADER = "forward_backward_header"
 _CHECKPOINT_MANIFEST_KEYS = frozenset({
     "config",
@@ -199,6 +199,7 @@ class ForwardBackward:
         fb_target_tau: float = 0.01,
         scale_actor_helpers: bool = True,
         max_grad_norm: float | None = None,
+        random_action_range: tuple[float, float] | None = None,
         seed: int = 0,
         rollout_context_refresh_steps: int = 100,
         rollout_expert_fraction: float = 0.0,
@@ -230,6 +231,13 @@ class ForwardBackward:
             raise ValueError("Rollout context periods must be positive.")
         if not 0.0 <= rollout_expert_fraction <= 1.0:
             raise ValueError("rollout_expert_fraction must be in [0, 1].")
+        if random_action_range is None:
+            random_action_range = getattr(model.action_distribution, "action_range", None)
+        if random_action_range is not None:
+            random_action_range = tuple(float(bound) for bound in random_action_range)
+            if len(random_action_range) != 2 or random_action_range[0] >= random_action_range[1]:
+                raise ValueError("random_action_range must contain ordered lower and upper bounds.")
+        self.random_action_range = random_action_range
 
         requested_device = torch.device(device)
         self.model = model.to(requested_device)
@@ -291,6 +299,10 @@ class ForwardBackward:
         self._value_coefficients = {
             name: torch.tensor(config.reward_coefficients, device=self.device, dtype=replay.dtype)
             for name, config in configs.items()
+        }
+        self._value_actor_coefficients = {
+            name: coefficients if specs[name].reward_composition == "vector" else coefficients.new_ones(1)
+            for name, coefficients in self._value_coefficients.items()
         }
 
         optimizer_class = resolve_optimizer(optimizer)
@@ -417,11 +429,10 @@ class ForwardBackward:
         """Sample uniform bounded behavior actions without advancing learner RNG."""
         if self._collection_observations is not None:
             raise RuntimeError("The previous behavior action has not been processed.")
+        if self.random_action_range is None:
+            raise TypeError("Random behavior requires explicit or distribution-owned action bounds.")
         observations = obs.to(self.device)
-        try:
-            lower, upper = self.model.action_distribution.action_range
-        except AttributeError as error:
-            raise TypeError("Random behavior requires an action distribution with action_range.") from error
+        lower, upper = self.random_action_range
         actions = torch.empty(
             self.replay.num_envs,
             self.model.action_dim,
@@ -829,6 +840,8 @@ class ForwardBackward:
             normalizer = self.reward_normalizers[name]
             normalizer.update(rewards)
             rewards = normalizer(rewards)
+        if self._value_specs[name].reward_composition == "scalar":
+            rewards = rewards @ self._value_coefficients[name].unsqueeze(-1)
         continuation = self.gamma * batch.bootstrap_mask().to(dtype=batch.actions.dtype)
         values = self.model.critic_values(name, batch.observations, contexts, batch.actions)
         with torch.no_grad():
@@ -875,7 +888,7 @@ class ForwardBackward:
                     self.value_cfg[name].pessimism,
                 )
                 value_channels.append(pessimistic_values)
-                coefficients.append(self.value_cfg[name].actor_coefficient * self._value_coefficients[name])
+                coefficients.append(self.value_cfg[name].actor_coefficient * self._value_actor_coefficients[name])
             if value_channels:
                 helper_values = torch.cat(value_channels, dim=-1)
                 helper_coefficients = torch.cat(coefficients)
@@ -1168,6 +1181,7 @@ def _value_spec_data(spec: ForwardBackwardValueSpec) -> dict[str, object]:
         "kind": spec.kind,
         "name": spec.name,
         "reward_channels": spec.reward_channels,
+        "reward_composition": spec.reward_composition,
         "route": spec.route,
     }
 
