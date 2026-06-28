@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+import random
 import torch
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,7 +16,22 @@ from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models.forward_backward_model import ForwardBackwardModel
-from rsl_rl.modules.reward_channels import get_forward_backward_schema_hash
+from rsl_rl.modules.forward_backward import (
+    actor_direct_loss,
+    backward_implied_reward,
+    backward_orthogonality_loss,
+    discriminator_gradient_penalty,
+    discriminator_logistic_loss,
+    ensemble_pessimistic,
+    forward_backward_loss,
+    reward_value_td_loss,
+    soft_update,
+    trajectory_context,
+)
+from rsl_rl.modules.reward_channels import ForwardBackwardRewardNormalizer, get_forward_backward_schema_hash
+from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer
+from rsl_rl.storage.forward_backward_replay import ForwardBackwardReplay, ForwardBackwardReplayBatch
+from rsl_rl.utils import resolve_optimizer
 
 FORWARD_BACKWARD_CHECKPOINT_FORMAT = "rsl_rl.forward_backward"
 FORWARD_BACKWARD_CHECKPOINT_VERSION = 1
@@ -115,34 +132,215 @@ class ForwardBackwardCheckpointHeader:
 
 
 class ForwardBackward:
-    """Forward-backward algorithm shell using the ordinary RSL-RL protocol.
+    """Unified off-policy MetaMotivo/BFM-Zero learner."""
 
-    Phase 1A defines only the runner-facing method signatures. Later phases
-    add concrete models, storage, equations, and update behavior directly to
-    this class. Constructor fields remain explicit so misspelled algorithm
-    configuration cannot disappear into ``**kwargs``.
-    """
+    @dataclass(frozen=True, slots=True)
+    class ValueCfg:
+        """Optimization and actor composition for one named reward-value head."""
+
+        learning_rate: float = 1e-4
+        pessimism: float = 0.5
+        actor_coefficient: float = 0.0
+        reward_coefficients: tuple[float, ...] = (1.0,)
+        normalize_rewards: bool = False
+        reward_normalization_decay: float = 0.99
+        reward_normalization_epsilon: float = 1e-8
+        target_tau: float = 0.005
+
+        def __post_init__(self) -> None:
+            """Reject value settings that cannot define one stable TD update."""
+            object.__setattr__(self, "reward_coefficients", tuple(self.reward_coefficients))
+            if not self.reward_coefficients:
+                raise ValueError("Value reward_coefficients must not be empty.")
 
     model: ForwardBackwardModel
 
-    def __init__(self, *, multi_gpu_cfg: dict | None = None) -> None:
-        """Create the Phase 1A shell and reject unsupported distributed training."""
+    def __init__(
+        self,
+        model: ForwardBackwardModel,
+        replay: ForwardBackwardReplay,
+        expert: ForwardBackwardExpertBuffer,
+        checkpoint_header: ForwardBackwardCheckpointHeader,
+        *,
+        batch_size: int = 1024,
+        expert_sequence_length: int = 8,
+        gamma: float = 0.98,
+        learning_rate: float = 1e-4,
+        backward_learning_rate: float = 1e-5,
+        discriminator_learning_rate: float = 1e-5,
+        value_cfg: Mapping[str, ValueCfg] | None = None,
+        optimizer: str = "adam",
+        weight_decay: float = 0.0,
+        discriminator_weight_decay: float = 0.0,
+        fb_pessimism: float = 0.5,
+        actor_pessimism: float = 0.5,
+        orthogonality_coefficient: float = 1.0,
+        implied_value_coefficient: float = 0.0,
+        implied_reward_ridge: float = 0.0,
+        discriminator_gradient_penalty_coefficient: float = 10.0,
+        context_goal_fraction: float = 0.2,
+        context_expert_fraction: float = 0.6,
+        relabel_fraction: float = 0.8,
+        context_buffer_capacity: int = 10_000,
+        fb_target_tau: float = 0.01,
+        scale_actor_helpers: bool = True,
+        max_grad_norm: float | None = None,
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+        multi_gpu_cfg: dict | None = None,
+    ) -> None:
+        """Create the learner and assign every trainable module to one optimizer."""
         if multi_gpu_cfg is not None:
             raise NotImplementedError("Forward-backward multi-GPU synchronization is not implemented.")
+        if batch_size < 2 or expert_sequence_length < 1 or batch_size % expert_sequence_length:
+            raise ValueError("batch_size must be at least two and divisible by expert_sequence_length.")
+        if expert_sequence_length not in expert.schema.window_lengths:
+            raise ValueError("expert_sequence_length is not available from the expert corpus.")
+        if (
+            min(
+                context_goal_fraction,
+                context_expert_fraction,
+                1.0 - context_goal_fraction - context_expert_fraction,
+            )
+            < 0.0
+            or not 0.0 <= relabel_fraction <= 1.0
+        ):
+            raise ValueError("Context mixture and relabel fractions must define probabilities.")
+        if context_buffer_capacity < batch_size:
+            raise ValueError("context_buffer_capacity must hold at least one update batch.")
+
+        requested_device = torch.device(device)
+        self.model = model.to(requested_device)
+        self.device = next(self.model.parameters()).device
+        self._raw_model = self.model
+        self.replay = replay
+        self.expert = expert
+        self.checkpoint_header = checkpoint_header
+        if replay.device != self.device or expert.device != self.device:
+            raise ValueError("Model, replay, and expert corpus must share the learner device.")
+        if model.observation_schema.schema_hash != replay.observation_schema.schema_hash:
+            raise ValueError("Model and replay observation schemas do not match.")
+
+        self.batch_size = batch_size
+        self.expert_sequence_length = expert_sequence_length
+        self.gamma = gamma
+        self.fb_pessimism = fb_pessimism
+        self.actor_pessimism = actor_pessimism
+        self.orthogonality_coefficient = orthogonality_coefficient
+        self.implied_value_coefficient = implied_value_coefficient
+        self.implied_reward_ridge = implied_reward_ridge
+        self.discriminator_gradient_penalty_coefficient = discriminator_gradient_penalty_coefficient
+        self.relabel_fraction = relabel_fraction
+        self.fb_target_tau = fb_target_tau
+        self.scale_actor_helpers = scale_actor_helpers
+        self.max_grad_norm = max_grad_norm
+
+        backward_fields = model.observation_schema.route("backward")
+        if (
+            model.discriminator_network is not None
+            and model.observation_schema.route("discriminator") != backward_fields
+        ):
+            raise ValueError("Phase 1 expert frames require matching backward and discriminator routes.")
+        field_widths = dict(model.observation_schema.field_widths)
+        if sum(field_widths[name] for name in backward_fields) != expert.schema.expert_feature_width:
+            raise ValueError("Expert feature width does not match the backward observation route.")
+        self._expert_fields = backward_fields
+        self._expert_field_widths = tuple(field_widths[name] for name in backward_fields)
+
+        specs = {spec.name: spec for spec in model.value_specs}
+        configs = dict(value_cfg or {})
+        if set(configs) != set(specs):
+            raise ValueError("value_cfg keys must match the model's named value heads.")
+        for name, spec in specs.items():
+            spec.validate_reward_schema(replay.reward_schema)
+            if not spec.has_target:
+                raise ValueError(f"Off-policy value head {name!r} requires a target network.")
+            if len(configs[name].reward_coefficients) != len(spec.reward_channels):
+                raise ValueError(f"Value head {name!r} needs one coefficient per reward channel.")
+        self.value_cfg = configs
+        self._value_specs = specs
+        reward_indices = {name: index for index, name in enumerate(replay.reward_schema.channel_names)}
+        self._value_reward_indices = {
+            name: tuple(reward_indices[channel] for channel in spec.reward_channels) for name, spec in specs.items()
+        }
+        self._value_coefficients = {
+            name: torch.tensor(config.reward_coefficients, device=self.device, dtype=replay.dtype)
+            for name, config in configs.items()
+        }
+
+        optimizer_class = resolve_optimizer(optimizer)
+        actor_parameters = tuple(model.actor_network.parameters()) + tuple(model.action_distribution.parameters())
+        self.actor_optimizer = optimizer_class(actor_parameters, lr=learning_rate, weight_decay=weight_decay)
+        self.forward_optimizer = optimizer_class(
+            model.forward_network.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+        self.backward_optimizer = optimizer_class(
+            model.backward_network.parameters(), lr=backward_learning_rate, weight_decay=weight_decay
+        )
+        self.discriminator_optimizer: torch.optim.Optimizer | None = None
+        if model.discriminator_network is not None:
+            self.discriminator_optimizer = optimizer_class(
+                model.discriminator_network.parameters(),
+                lr=discriminator_learning_rate,
+                weight_decay=discriminator_weight_decay,
+            )
+        self.value_optimizers = {
+            name: optimizer_class(
+                model.value_networks[name].parameters(), lr=config.learning_rate, weight_decay=weight_decay
+            )
+            for name, config in configs.items()
+        }
+        self.reward_normalizers = torch.nn.ModuleDict({
+            name: ForwardBackwardRewardNormalizer(
+                config.reward_coefficients,
+                decay=config.reward_normalization_decay,
+                epsilon=config.reward_normalization_epsilon,
+            )
+            for name, config in configs.items()
+            if config.normalize_rewards
+        }).to(self.device)
+
+        for channel in replay.reward_schema.channels:
+            if channel.source == "recomputed" and channel.provider_name != "discriminator":
+                raise ValueError(f"Unsupported recomputed reward provider: {channel.provider_name!r}.")
+            if channel.provider_name == "discriminator" and model.discriminator_network is None:
+                raise ValueError("A discriminator reward channel requires a discriminator network.")
+            if channel.provider_name == "discriminator" and channel.timing == "transition":
+                raise ValueError("Discriminator reward timing must be state or next_state.")
+
+        self._context_mix_probabilities = torch.tensor(
+            (context_goal_fraction, context_expert_fraction, 1.0 - context_goal_fraction - context_expert_fraction),
+            device=self.device,
+        )
+        self.context_buffer = torch.zeros(
+            context_buffer_capacity, model.context_dim, device=self.device, dtype=replay.dtype
+        )
+        self.context_buffer_cursor = 0
+        self.context_buffer_size = 0
+        self.generator = torch.Generator(device=self.device)
+        self.generator.manual_seed(seed)
+        self.update_step = 0
+        self.versions = {
+            "actor": 0,
+            "context": 0,
+            "discriminator": 0,
+            "normalizer": 0,
+            "representation": 0,
+            "target": 0,
+            **{f"value/{name}": 0 for name in specs},
+            **{f"reward_normalizer/{name}": 0 for name in self.reward_normalizers},
+        }
+        self._update_in_progress = False
+        self.train_mode()
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
-        """Construct the learner through the standard RSL-RL factory signature.
-
-        Concrete construction will copy the component sections it mutates,
-        resolve their ``class_name`` entries, and pass the remaining fields to
-        explicit constructors. Runner-owned fields may remain in ``cfg``.
-        """
-        raise NotImplementedError("Forward-backward construction is implemented in Phase 1E.")
+        """Construct through the ordinary runner factory in Phase 1F."""
+        raise NotImplementedError("Forward-backward environment and expert construction is implemented in Phase 1F.")
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Sample actions and record behavior data for the pending transition."""
-        raise NotImplementedError
+        """Collect actions after Phase 1F binds the rollout context schedule."""
+        raise NotImplementedError("Forward-backward collection is implemented in Phase 1F.")
 
     def process_env_step(
         self,
@@ -151,37 +349,475 @@ class ForwardBackward:
         dones: torch.Tensor,
         extras: dict[str, torch.Tensor],
     ) -> None:
-        """Consume one vector-environment step using the standard runner call."""
-        raise NotImplementedError
+        """Normalize environment transitions through the Phase 1F adapter."""
+        raise NotImplementedError("Forward-backward collection is implemented in Phase 1F.")
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """Prepare return-like state required by the configured actor update."""
-        raise NotImplementedError
+        """Do nothing because direct-Q learning has no rollout-return phase."""
+        del obs
 
     def update(self) -> dict[str, float]:
-        """Run one learner update and return scalar diagnostics."""
-        raise NotImplementedError
+        """Run one visible off-policy mutation sequence."""
+        if self._update_in_progress:
+            raise RuntimeError("A forward-backward update is already in progress.")
+        self._update_in_progress = True
+        try:
+            batch = self.replay.sample_random(self.batch_size)
+            if not torch.all(batch.valid):
+                raise RuntimeError("Replay sampled reset-only or otherwise invalid rows.")
+            expert_batch = self.expert.sample(
+                self.batch_size // self.expert_sequence_length,
+                self.expert_sequence_length,
+            )
+
+            normalization_observations = torch.cat((batch.observations, batch.next_observations), dim=0)
+            self.model.normalization_train(True)
+            self.model.update_normalization(normalization_observations)
+            self.model.normalization_train(False)
+
+            expert_observations = self._make_expert_observations(expert_batch.frames)
+            with torch.no_grad():
+                expert_contexts = trajectory_context(
+                    self.model.backward_map(expert_observations),
+                    radius=self.model.context_dim**0.5 if self.model.context_normalization else None,
+                )
+                expert_row_contexts = expert_contexts.repeat_interleave(self.expert_sequence_length, dim=0)
+
+            metrics: dict[str, torch.Tensor] = {}
+            if self.model.discriminator_network is not None:
+                metrics.update(self._update_discriminator(expert_observations.reshape(-1), expert_row_contexts, batch))
+
+            learner_contexts = self._sample_mixed_contexts(batch.next_observations, expert_row_contexts)
+            self._append_contexts(learner_contexts)
+            relabel = (
+                torch.rand(
+                    self.batch_size,
+                    1,
+                    device=self.device,
+                    generator=self.generator,
+                )
+                < self.relabel_fraction
+            )
+            learner_contexts = torch.where(relabel, learner_contexts, batch.behavior_context)
+
+            with torch.no_grad():
+                next_actions = self.model.action_sample(batch.next_observations, learner_contexts)
+            metrics.update(self._update_forward_backward(batch, learner_contexts, next_actions))
+
+            raw_rewards = self._materialize_rewards(batch, learner_contexts)
+            for name in self._value_specs:
+                metrics.update(self._update_value(name, batch, learner_contexts, next_actions, raw_rewards))
+
+            metrics.update(self._update_actor(batch.observations, learner_contexts))
+            self._update_targets()
+            self._commit_versions()
+        finally:
+            self._update_in_progress = False
+
+        metric_names = tuple(metrics)
+        metric_values = torch.stack(tuple(metrics[name].detach() for name in metric_names)).tolist()
+        return dict(zip(metric_names, metric_values))
+
+    def _make_expert_observations(self, frames: torch.Tensor) -> TensorDict:
+        chunks = torch.split(frames, self._expert_field_widths, dim=-1)
+        return TensorDict(
+            dict(zip(self._expert_fields, chunks)),
+            batch_size=list(frames.shape[:-1]),
+            device=self.device,
+        )
+
+    def _update_discriminator(
+        self,
+        expert_observations: TensorDict,
+        expert_contexts: torch.Tensor,
+        batch: ForwardBackwardReplayBatch,
+    ) -> dict[str, torch.Tensor]:
+        discriminator = self.model.discriminator_network
+        optimizer = self.discriminator_optimizer
+        assert discriminator is not None and optimizer is not None
+        expert_logits = self.model.discriminator_logits(expert_observations, expert_contexts)
+        replay_logits = self.model.discriminator_logits(batch.observations, batch.behavior_context)
+        logistic = discriminator_logistic_loss(expert_logits, replay_logits)
+        gradient_penalty = torch.zeros((), device=self.device)
+        if self.discriminator_gradient_penalty_coefficient > 0.0:
+            expert_route = self.model.get_normalized_observations(expert_observations, "discriminator")
+            replay_route = self.model.get_normalized_observations(batch.observations, "discriminator")
+            alpha = torch.rand(self.batch_size, 1, device=self.device, generator=self.generator)
+            interpolated_route = (alpha * expert_route + (1.0 - alpha) * replay_route).requires_grad_(True)
+            interpolated_context = (alpha * expert_contexts + (1.0 - alpha) * batch.behavior_context).requires_grad_(
+                True
+            )
+            interpolated_logits = discriminator(interpolated_route, interpolated_context)
+            gradient_penalty = discriminator_gradient_penalty(
+                interpolated_logits,
+                (interpolated_route, interpolated_context),
+            )
+        loss = logistic + self.discriminator_gradient_penalty_coefficient * gradient_penalty
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        return {
+            "discriminator/loss": loss.detach(),
+            "discriminator/logistic": logistic.detach(),
+            "discriminator/gradient_penalty": gradient_penalty.detach(),
+        }
+
+    @torch.no_grad()
+    def _sample_mixed_contexts(
+        self,
+        goals: TensorDict,
+        expert_contexts: torch.Tensor,
+    ) -> torch.Tensor:
+        goal_contexts = self.model.context_project(self.model.backward_map(goals))
+        random_contexts = self.model.context_random(
+            self.batch_size,
+            device=self.device,
+            dtype=goal_contexts.dtype,
+            generator=self.generator,
+        )
+        mixture = torch.multinomial(
+            self._context_mix_probabilities,
+            self.batch_size,
+            replacement=True,
+            generator=self.generator,
+        )
+        goal_contexts = goal_contexts[torch.randperm(self.batch_size, device=self.device, generator=self.generator)]
+        expert_contexts = expert_contexts[torch.randperm(self.batch_size, device=self.device, generator=self.generator)]
+        contexts = torch.where(mixture.eq(0).unsqueeze(-1), goal_contexts, random_contexts)
+        return torch.where(mixture.eq(1).unsqueeze(-1), expert_contexts, contexts)
+
+    @torch.no_grad()
+    def _append_contexts(self, contexts: torch.Tensor) -> None:
+        first_count = min(self.batch_size, self.context_buffer.shape[0] - self.context_buffer_cursor)
+        self.context_buffer[self.context_buffer_cursor : self.context_buffer_cursor + first_count].copy_(
+            contexts[:first_count]
+        )
+        remaining = self.batch_size - first_count
+        if remaining:
+            self.context_buffer[:remaining].copy_(contexts[first_count:])
+        self.context_buffer_cursor = (self.context_buffer_cursor + self.batch_size) % self.context_buffer.shape[0]
+        self.context_buffer_size = min(self.context_buffer_size + self.batch_size, self.context_buffer.shape[0])
+
+    def _update_forward_backward(
+        self,
+        batch: ForwardBackwardReplayBatch,
+        contexts: torch.Tensor,
+        next_actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        continuation = self.gamma * batch.bootstrap_mask().to(dtype=batch.actions.dtype)
+        current_forward = self.model.forward_map(batch.observations, contexts, batch.actions)
+        current_backward = self.model.backward_map(batch.next_observations)
+        with torch.no_grad():
+            target_forward = self.model.forward_map(
+                batch.next_observations,
+                contexts,
+                next_actions,
+                target=True,
+            )
+            target_backward = self.model.backward_map(batch.next_observations, target=True)
+        fb_loss, fb_off_diagonal, fb_diagonal = forward_backward_loss(
+            current_forward,
+            current_backward,
+            target_forward,
+            target_backward,
+            continuation,
+            self.fb_pessimism,
+        )
+        orthogonality, orthogonality_off_diagonal, orthogonality_diagonal = backward_orthogonality_loss(
+            current_backward
+        )
+        total_loss = fb_loss + self.orthogonality_coefficient * orthogonality
+        implied_value_loss = torch.zeros((), device=self.device)
+        if self.implied_value_coefficient > 0.0:
+            detached_backward = current_backward.detach()
+            covariance = detached_backward.mT @ detached_backward / detached_backward.shape[0]
+            implied_reward = backward_implied_reward(
+                detached_backward,
+                contexts,
+                covariance,
+                self.implied_reward_ridge,
+            )
+            implied_value_loss, _target = reward_value_td_loss(
+                (current_forward * contexts).sum(dim=-1).unsqueeze(-1),
+                (target_forward * contexts).sum(dim=-1).unsqueeze(-1),
+                implied_reward.unsqueeze(-1),
+                continuation,
+                self.fb_pessimism,
+            )
+            total_loss = total_loss + self.implied_value_coefficient * implied_value_loss
+
+        self.forward_optimizer.zero_grad(set_to_none=True)
+        self.backward_optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.forward_network.parameters(), self.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.model.backward_network.parameters(), self.max_grad_norm)
+        self.forward_optimizer.step()
+        self.backward_optimizer.step()
+        return {
+            "fb/loss": total_loss.detach(),
+            "fb/measure": fb_loss.detach(),
+            "fb/off_diagonal": fb_off_diagonal.detach(),
+            "fb/diagonal": fb_diagonal.detach(),
+            "fb/orthogonality": orthogonality.detach(),
+            "fb/orthogonality_off_diagonal": orthogonality_off_diagonal.detach(),
+            "fb/orthogonality_diagonal": orthogonality_diagonal.detach(),
+            "fb/implied_value": implied_value_loss.detach(),
+        }
+
+    @torch.no_grad()
+    def _materialize_rewards(
+        self,
+        batch: ForwardBackwardReplayBatch,
+        contexts: torch.Tensor,
+    ) -> torch.Tensor:
+        evidence_indices = {
+            name: index for index, name in enumerate(self.replay.transition_schema.auxiliary_evidence_names)
+        }
+        values = []
+        discriminator_rewards: dict[str, torch.Tensor] = {}
+        for channel in self.replay.reward_schema.channels:
+            if channel.source == "environment":
+                if channel.name != self.replay.transition_schema.environment_reward_name:
+                    raise RuntimeError("Replay contains one declared environment reward channel.")
+                value = batch.environment_reward
+            elif channel.source == "stored_evidence":
+                value = batch.auxiliary_reward_evidence[
+                    :, evidence_indices[channel.name] : evidence_indices[channel.name] + 1
+                ]
+            else:
+                try:
+                    value = discriminator_rewards[channel.timing]
+                except KeyError:
+                    observations = batch.observations if channel.timing == "state" else batch.next_observations
+                    value = self.model.discriminator_logits(observations, contexts).detach()
+                    discriminator_rewards[channel.timing] = value
+            values.append(channel.sign * value)
+        return torch.cat(values, dim=-1)
+
+    def _update_value(
+        self,
+        name: str,
+        batch: ForwardBackwardReplayBatch,
+        contexts: torch.Tensor,
+        next_actions: torch.Tensor,
+        raw_rewards: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        config = self.value_cfg[name]
+        rewards = raw_rewards[:, self._value_reward_indices[name]]
+        if name in self.reward_normalizers:
+            normalizer = self.reward_normalizers[name]
+            normalizer.update(rewards)
+            rewards = normalizer(rewards)
+        continuation = self.gamma * batch.bootstrap_mask().to(dtype=batch.actions.dtype)
+        values = self.model.critic_values(name, batch.observations, contexts, batch.actions)
+        with torch.no_grad():
+            target_values = self.model.critic_values(
+                name,
+                batch.next_observations,
+                contexts,
+                next_actions,
+                target=True,
+            )
+        loss, target = reward_value_td_loss(values, target_values, rewards, continuation, config.pessimism)
+        optimizer = self.value_optimizers[name]
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.value_networks[name].parameters(), self.max_grad_norm)
+        optimizer.step()
+        return {
+            f"value/{name}/loss": loss.detach(),
+            f"value/{name}/reward": rewards.mean().detach(),
+            f"value/{name}/target": target.mean().detach(),
+        }
+
+    def _update_actor(
+        self,
+        observations: TensorDict,
+        contexts: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        active_value_names = tuple(name for name, config in self.value_cfg.items() if config.actor_coefficient > 0.0)
+        evaluators = (self.model.forward_network, *(self.model.value_networks[name] for name in active_value_names))
+        for evaluator in evaluators:
+            evaluator.zero_grad(set_to_none=True)
+            evaluator.requires_grad_(False)
+        try:
+            actions = self.model.action_sample(observations, contexts, pathwise=True)
+            forward_values = (self.model.forward_map(observations, contexts, actions) * contexts).sum(dim=-1)
+            _mean, _disagreement, fb_values = ensemble_pessimistic(forward_values, self.actor_pessimism)
+            value_channels = []
+            coefficients = []
+            for name in active_value_names:
+                values = self.model.critic_values(name, observations, contexts, actions)
+                _mean, _disagreement, pessimistic_values = ensemble_pessimistic(
+                    values,
+                    self.value_cfg[name].pessimism,
+                )
+                value_channels.append(pessimistic_values)
+                coefficients.append(self.value_cfg[name].actor_coefficient * self._value_coefficients[name])
+            if value_channels:
+                helper_values = torch.cat(value_channels, dim=-1)
+                helper_coefficients = torch.cat(coefficients)
+            else:
+                helper_values = fb_values.new_empty(self.batch_size, 0)
+                helper_coefficients = fb_values.new_empty(0)
+            loss = actor_direct_loss(
+                fb_values,
+                helper_values,
+                helper_coefficients,
+                scale_channels=self.scale_actor_helpers,
+            )
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+        finally:
+            for evaluator in evaluators:
+                evaluator.requires_grad_(True)
+        if self.max_grad_norm is not None:
+            parameters = tuple(self.model.actor_network.parameters()) + tuple(
+                self.model.action_distribution.parameters()
+            )
+            torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+        self.actor_optimizer.step()
+        return {
+            "actor/loss": loss.detach(),
+            "actor/fb_value": fb_values.mean().detach(),
+            "actor/helper_value": (
+                (helper_values * helper_coefficients).sum(dim=-1).mean().detach()
+                if value_channels
+                else torch.zeros((), device=self.device)
+            ),
+        }
+
+    @torch.no_grad()
+    def _update_targets(self) -> None:
+        soft_update(
+            tuple(self.model.forward_network.parameters()),
+            tuple(self.model.forward_target_network.parameters()),
+            self.fb_target_tau,
+        )
+        soft_update(
+            tuple(self.model.backward_network.parameters()),
+            tuple(self.model.backward_target_network.parameters()),
+            self.fb_target_tau,
+        )
+        for name, config in self.value_cfg.items():
+            soft_update(
+                tuple(self.model.value_networks[name].parameters()),
+                tuple(self.model.value_target_networks[name].parameters()),
+                config.target_tau,
+            )
+
+    def _commit_versions(self) -> None:
+        self.update_step += 1
+        for name in ("actor", "context", "normalizer", "representation", "target"):
+            self.versions[name] += 1
+        if self.model.discriminator_network is not None:
+            self.versions["discriminator"] += 1
+        for name in self._value_specs:
+            self.versions[f"value/{name}"] += 1
+        for name in self.reward_normalizers:
+            self.versions[f"reward_normalizer/{name}"] += 1
 
     def train_mode(self) -> None:
-        """Put learnable modules in training mode."""
-        raise NotImplementedError
+        """Train live modules while keeping targets and normalizers frozen."""
+        self.model.train()
+        self.model.normalization_train(False)
+        self.model.forward_target_network.eval()
+        self.model.backward_target_network.eval()
+        self.model.value_target_networks.eval()
 
     def eval_mode(self) -> None:
-        """Put learnable modules in evaluation mode."""
-        raise NotImplementedError
+        """Put every model component in evaluation mode."""
+        self.model.eval()
 
     def save(self) -> dict[str, object]:
-        """Return model and optimizer state for an RSL-RL runner checkpoint."""
-        raise NotImplementedError
+        """Return learner-exact state at a canonical update boundary."""
+        if self._update_in_progress:
+            raise RuntimeError("Cannot checkpoint during a forward-backward update.")
+        optimizers: dict[str, object] = {
+            "actor": self.actor_optimizer.state_dict(),
+            "forward": self.forward_optimizer.state_dict(),
+            "backward": self.backward_optimizer.state_dict(),
+            "values": {name: optimizer.state_dict() for name, optimizer in self.value_optimizers.items()},
+        }
+        if self.discriminator_optimizer is not None:
+            optimizers["discriminator"] = self.discriminator_optimizer.state_dict()
+        rng: dict[str, object] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "learner": self.generator.get_state(),
+        }
+        if torch.cuda.is_available():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
+        return {
+            FORWARD_BACKWARD_CHECKPOINT_HEADER: self.checkpoint_header.to_dict(),
+            "model_state_dict": self._raw_model.state_dict(),
+            "optimizer_state_dicts": optimizers,
+            "reward_normalizer_state_dict": self.reward_normalizers.state_dict(),
+            "replay_state_dict": self.replay.state_dict(),
+            "expert_state_dict": self.expert.state_dict(),
+            "context_buffer": self.context_buffer,
+            "context_buffer_cursor": self.context_buffer_cursor,
+            "context_buffer_size": self.context_buffer_size,
+            "update_step": self.update_step,
+            "versions": dict(self.versions),
+            "rng_state": rng,
+        }
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Restore selected state and report whether the runner iteration should load."""
-        raise NotImplementedError
+        """Restore selected learner state and report iteration ownership."""
+        if self._update_in_progress:
+            raise RuntimeError("Cannot restore during a forward-backward update.")
+        self.checkpoint_header.validate_checkpoint(loaded_dict)
+        if load_cfg is None:
+            load_cfg = {
+                "model": True,
+                "optimizer": True,
+                "storage": True,
+                "context": True,
+                "rng": True,
+                "iteration": True,
+            }
+        if load_cfg.get("model"):
+            self._raw_model.load_state_dict(loaded_dict["model_state_dict"], strict=strict)
+            self.reward_normalizers.load_state_dict(loaded_dict["reward_normalizer_state_dict"], strict=strict)
+        if load_cfg.get("optimizer"):
+            optimizers = loaded_dict["optimizer_state_dicts"]
+            self.actor_optimizer.load_state_dict(optimizers["actor"])
+            self.forward_optimizer.load_state_dict(optimizers["forward"])
+            self.backward_optimizer.load_state_dict(optimizers["backward"])
+            for name, optimizer in self.value_optimizers.items():
+                optimizer.load_state_dict(optimizers["values"][name])
+            if self.discriminator_optimizer is not None:
+                self.discriminator_optimizer.load_state_dict(optimizers["discriminator"])
+        if load_cfg.get("storage"):
+            self.replay.load_state_dict(loaded_dict["replay_state_dict"])
+            self.expert.load_state_dict(loaded_dict["expert_state_dict"])
+        if load_cfg.get("context"):
+            self.context_buffer.copy_(loaded_dict["context_buffer"])
+            self.context_buffer_cursor = int(loaded_dict["context_buffer_cursor"])
+            self.context_buffer_size = int(loaded_dict["context_buffer_size"])
+            self.update_step = int(loaded_dict["update_step"])
+            self.versions = dict(loaded_dict["versions"])
+        if load_cfg.get("rng"):
+            rng = loaded_dict["rng_state"]
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+            torch.set_rng_state(rng["torch"])
+            self.generator.set_state(rng["learner"])
+            if "cuda" in rng:
+                torch.cuda.set_rng_state_all(rng["cuda"])
+        return bool(load_cfg.get("iteration", False))
 
     def get_policy(self) -> ForwardBackwardModel:
-        """Return the uncompiled policy model used for inference and export."""
-        raise NotImplementedError
+        """Return the uncompiled composite policy model."""
+        return self._raw_model
 
     def compile(self, mode: str | None = None) -> None:
-        """Compile eligible models using the requested ``torch.compile`` mode."""
-        raise NotImplementedError
+        """Compile the FB and actor mutation blocks without wrapping model state."""
+        if mode is None:
+            return
+        self._update_forward_backward = torch.compile(self._update_forward_backward, mode=mode)
+        self._update_actor = torch.compile(self._update_actor, mode=mode)

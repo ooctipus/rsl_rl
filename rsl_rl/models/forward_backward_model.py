@@ -515,6 +515,7 @@ class ForwardBackwardModel(torch.nn.Module):
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Sample random projected context vectors."""
         if batch_size < 1:
@@ -525,6 +526,7 @@ class ForwardBackwardModel(torch.nn.Module):
             self.context_dim,
             device=parameter.device if device is None else device,
             dtype=parameter.dtype if dtype is None else dtype,
+            generator=generator,
         )
         return self.context_project(context)
 

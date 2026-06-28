@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import torch
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -142,3 +143,67 @@ class ForwardBackwardValueSpec:
         unknown = set(self.reward_channels).difference(reward_schema.channel_names)
         if unknown:
             raise ValueError(f"Value source uses unknown reward channels: {tuple(sorted(unknown))}.")
+
+
+class ForwardBackwardRewardNormalizer(torch.nn.Module):
+    """Bias-corrected EMA scale shared by one reward-value vector.
+
+    Statistics are estimated from a fixed linear composition, while the same
+    scalar standard deviation is applied to every channel. This preserves exact
+    linear reward composition and matches BFM-Zero's scale-only normalization.
+    Updating and applying are separate operations so one learner update uses one
+    immutable scale.
+    """
+
+    def __init__(
+        self,
+        coefficients: tuple[float, ...] | list[float],
+        decay: float = 0.99,
+        epsilon: float = 1e-8,
+    ) -> None:
+        """Initialize one scalar running scale for a reward vector.
+
+        Args:
+            coefficients: Fixed channel composition used to estimate scale.
+            decay: Exponential moving-average decay in ``[0, 1)``.
+            epsilon: Minimum variance before taking the square root.
+        """
+        super().__init__()
+        coefficients = tuple(coefficients)
+        if not coefficients:
+            raise ValueError("Reward-normalizer coefficients must not be empty.")
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("Reward-normalizer decay must be in [0, 1).")
+        if epsilon <= 0.0:
+            raise ValueError("Reward-normalizer epsilon must be positive.")
+        self.decay = decay
+        self.epsilon = epsilon
+        self.register_buffer("coefficients", torch.tensor(coefficients, dtype=torch.float32))
+        self.register_buffer("mean", torch.zeros(1))
+        self.register_buffer("mean_square", torch.zeros(1))
+        self.register_buffer("count", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, rewards: torch.Tensor) -> None:
+        """Update running moments from one raw reward-vector batch."""
+        if rewards.ndim != 2 or rewards.shape[1] != self.coefficients.shape[0]:
+            raise ValueError("rewards must have shape [batch, channel_count].")
+        composed = rewards @ self.coefficients.to(dtype=rewards.dtype)
+        self.mean.mul_(self.decay).add_(composed.mean(), alpha=1.0 - self.decay)
+        self.mean_square.mul_(self.decay).add_(composed.square().mean(), alpha=1.0 - self.decay)
+        self.count.add_(1)
+
+    @property
+    def scale(self) -> torch.Tensor:
+        """Return the bias-corrected scalar standard deviation."""
+        correction = 1.0 - self.decay ** self.count.clamp_min(1)
+        mean = self.mean / correction
+        mean_square = self.mean_square / correction
+        scale = torch.sqrt(torch.clamp(mean_square - mean.square(), min=self.epsilon))
+        return torch.where(self.count == 0, torch.ones_like(scale), scale)
+
+    def forward(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Apply the frozen scalar scale without updating statistics."""
+        if rewards.ndim != 2 or rewards.shape[1] != self.coefficients.shape[0]:
+            raise ValueError("rewards must have shape [batch, channel_count].")
+        return rewards / self.scale

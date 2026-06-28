@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import torch
 from dataclasses import replace
 
 import pytest
 
 from rsl_rl.modules.reward_channels import (
     ForwardBackwardRewardChannel,
+    ForwardBackwardRewardNormalizer,
     ForwardBackwardRewardSchema,
     ForwardBackwardValueSpec,
     get_forward_backward_schema_hash,
@@ -172,3 +174,48 @@ def test_schema_hash_is_mapping_order_independent_but_sequence_sensitive() -> No
 
     assert left == right
     assert reordered != left
+
+
+def test_reward_normalizer_separates_update_from_apply_and_preserves_composition() -> None:
+    """One shared scale should commute with fixed linear reward composition."""
+    normalizer = ForwardBackwardRewardNormalizer((0.5, 2.0), decay=0.5, epsilon=1e-12)
+    rewards = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    before = normalizer(rewards)
+    normalizer.update(rewards)
+    after = normalizer(rewards)
+    composed_after = after @ normalizer.coefficients
+    direct_after = (rewards @ normalizer.coefficients) / normalizer.scale
+
+    torch.testing.assert_close(before, rewards)
+    torch.testing.assert_close(composed_after, direct_after)
+    assert normalizer.count.item() == 1
+    normalizer(rewards)
+    assert normalizer.count.item() == 1
+
+
+def test_reward_normalizer_matches_bias_corrected_ema_reference() -> None:
+    """Running mean-square variance should match the released BFM formula."""
+    normalizer = ForwardBackwardRewardNormalizer((1.0, -0.5), decay=0.75, epsilon=1e-8)
+    batches = (
+        torch.tensor([[2.0, 0.0], [4.0, 2.0]]),
+        torch.tensor([[1.0, 2.0], [5.0, 0.0]]),
+    )
+    mean = torch.zeros(1)
+    mean_square = torch.zeros(1)
+    for count, rewards in enumerate(batches, start=1):
+        composed = rewards @ normalizer.coefficients
+        mean = 0.75 * mean + 0.25 * composed.mean()
+        mean_square = 0.75 * mean_square + 0.25 * composed.square().mean()
+        correction = 1.0 - 0.75**count
+        expected = torch.sqrt(torch.clamp(mean_square / correction - (mean / correction).square(), min=1e-8))
+        normalizer.update(rewards)
+        torch.testing.assert_close(normalizer.scale, expected)
+
+
+def test_reward_normalizer_rejects_wrong_channel_width() -> None:
+    """A value head must not silently normalize another reward schema."""
+    normalizer = ForwardBackwardRewardNormalizer((1.0, 2.0))
+
+    with pytest.raises(ValueError, match="channel_count"):
+        normalizer.update(torch.ones(3, 1))

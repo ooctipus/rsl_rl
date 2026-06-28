@@ -387,6 +387,7 @@ class ForwardBackwardReplay:
         self.terminal_capacity_per_env = terminal_capacity_per_env
         self.observation_schema = observation_schema
         self.transition_schema = transition_schema
+        self.reward_schema = reward_schema
         self.history_layout = history_layout
         self.device = torch.device(device)
         self.dtype = dtype
@@ -412,6 +413,7 @@ class ForwardBackwardReplay:
             dtype,
             self._stored_fields,
         )
+        self.device = next(iter(self.nodes.values())).device
         self.node_episode_ids = torch.full(
             (self.node_capacity_steps, num_envs), -1, device=self.device, dtype=torch.long
         )

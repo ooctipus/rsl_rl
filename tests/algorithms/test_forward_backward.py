@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
+import torch
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from tensordict import TensorDict
 
 import pytest
 
@@ -26,10 +30,20 @@ from rsl_rl.algorithms.forward_backward import (
     ForwardBackwardCheckpointHeader,
 )
 from rsl_rl.algorithms.ppo import PPO
-from rsl_rl.models.forward_backward_model import ForwardBackwardObservationSchema
+from rsl_rl.models.forward_backward_model import (
+    ForwardBackwardDualNetworkCfg,
+    ForwardBackwardModel,
+    ForwardBackwardObservationSchema,
+    ForwardBackwardValueHeadCfg,
+)
 from rsl_rl.modules.reward_channels import ForwardBackwardRewardSchema, ForwardBackwardValueSpec
-from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertSchema
-from rsl_rl.storage.forward_backward_replay import ForwardBackwardAutoresetMode, ForwardBackwardTransitionSchema
+from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
+from rsl_rl.storage.forward_backward_replay import (
+    ForwardBackwardAutoresetMode,
+    ForwardBackwardReplay,
+    ForwardBackwardTransitionBatch,
+    ForwardBackwardTransitionSchema,
+)
 from tests.fixtures.forward_backward import META_ROUTES, make_meta_schema, make_reward_schema
 
 
@@ -99,6 +113,163 @@ def _make_header() -> ForwardBackwardCheckpointHeader:
     return ForwardBackwardCheckpointHeader.from_manifest(_make_manifest())
 
 
+def _make_learner(
+    *,
+    include_auxiliary: bool = True,
+    multi_gpu_cfg: dict | None = None,
+) -> ForwardBackward:
+    """Create a small deterministic learner with live replay and expert data."""
+    torch.manual_seed(13)
+    generator = torch.Generator().manual_seed(29)
+    num_envs = 4
+    action_width = 2
+    context_width = 4
+    state_width = 6
+    routes = {
+        "actor": ("state",),
+        "forward": ("state",),
+        "backward": ("state",),
+        "discriminator": ("state",),
+        "critic_discriminator": ("state",),
+        "critic_auxiliary": ("state",),
+    }
+    reward_schema = make_reward_schema()
+    states = [torch.randn(num_envs, state_width, generator=generator) + step for step in range(6)]
+    observations = TensorDict({"state": states[0]}, batch_size=[num_envs])
+    network = ForwardBackwardDualNetworkCfg(hidden_dim=16, hidden_layers=1, embedding_layers=2)
+    value_heads = [
+        ForwardBackwardValueHeadCfg(
+            ForwardBackwardValueSpec(
+                name="discriminator",
+                kind="critic",
+                route="critic_discriminator",
+                reward_channels=("discriminator",),
+                ensemble_size=2,
+                has_target=True,
+            ),
+            network,
+        )
+    ]
+    if include_auxiliary:
+        value_heads.append(
+            ForwardBackwardValueHeadCfg(
+                ForwardBackwardValueSpec(
+                    name="auxiliary",
+                    kind="critic",
+                    route="critic_auxiliary",
+                    reward_channels=("action_rate", "slip"),
+                    ensemble_size=2,
+                    has_target=True,
+                ),
+                network,
+            )
+        )
+    model = ForwardBackwardModel(
+        observations,
+        routes,
+        action_dim=action_width,
+        context_dim=context_width,
+        actor_cfg=network,
+        forward_cfg=network,
+        backward_hidden_dims=(16, 16),
+        discriminator_hidden_dims=(16, 16),
+        value_heads=tuple(value_heads),
+        observation_normalization=True,
+    )
+    transition_schema = ForwardBackwardTransitionSchema(
+        observation_schema_hash=model.observation_schema.schema_hash,
+        reward_schema_hash=reward_schema.schema_hash,
+        action_width=action_width,
+        context_width=context_width,
+        environment_reward_name="environment",
+        auxiliary_evidence_names=("action_rate", "slip"),
+        autoreset_mode=ForwardBackwardAutoresetMode.SAME_STEP,
+    )
+    replay = ForwardBackwardReplay(
+        5,
+        num_envs,
+        5,
+        model.observation_schema,
+        transition_schema,
+        reward_schema,
+        "cpu",
+        seed=41,
+    )
+    false = torch.zeros(num_envs, 1, dtype=torch.bool)
+    for step in range(5):
+        replay.add(
+            ForwardBackwardTransitionBatch(
+                observations=TensorDict({"state": states[step]}, batch_size=[num_envs]),
+                next_observations=TensorDict({"state": states[step + 1]}, batch_size=[num_envs]),
+                final_observations=TensorDict(
+                    {"state": torch.full_like(states[step], float("nan"))}, batch_size=[num_envs]
+                ),
+                actions=torch.randn(num_envs, action_width, generator=generator),
+                behavior_context=model.context_project(torch.randn(num_envs, context_width, generator=generator)),
+                environment_reward=torch.randn(num_envs, 1, generator=generator),
+                auxiliary_reward_evidence=torch.rand(num_envs, 2, generator=generator),
+                terminated=false,
+                truncated=false,
+                context_changed=false,
+                action_applied=torch.ones_like(false),
+                final_observation_valid=false,
+            )
+        )
+
+    expert_schema = ForwardBackwardExpertSchema(
+        dataset_id="small-motion-corpus",
+        data_hash="small-data",
+        feature_schema_hash=model.observation_schema.schema_hash,
+        clip_offsets_hash="two-equal-clips",
+        expert_feature_width=state_width,
+        num_frames=16,
+        num_clips=2,
+        window_lengths=(2,),
+    )
+    expert = ForwardBackwardExpertBuffer(
+        torch.randn(16, state_width, generator=generator),
+        torch.tensor([0, 8, 16]),
+        torch.ones(2),
+        expert_schema,
+        seed=43,
+    )
+    manifest = {
+        "config": {"algorithm": {"gamma": 0.98}, "model": {"context_width": context_width}},
+        "observation_schema_hash": model.observation_schema.schema_hash,
+        "transition_schema_hash": transition_schema.schema_hash,
+        "reward_schema_hash": reward_schema.schema_hash,
+        "expert_schema_hash": expert_schema.schema_hash,
+        "value_specs": tuple(_value_spec_data(spec) for spec in model.value_specs),
+    }
+    value_cfg = {
+        "discriminator": ForwardBackward.ValueCfg(
+            actor_coefficient=0.05,
+            reward_coefficients=(1.0,),
+        )
+    }
+    if include_auxiliary:
+        value_cfg["auxiliary"] = ForwardBackward.ValueCfg(
+            actor_coefficient=0.02,
+            reward_coefficients=(0.1, 0.4),
+            normalize_rewards=True,
+        )
+    return ForwardBackward(
+        model,
+        replay,
+        expert,
+        ForwardBackwardCheckpointHeader.from_manifest(manifest),
+        batch_size=8,
+        expert_sequence_length=2,
+        value_cfg=value_cfg,
+        context_buffer_capacity=16,
+        implied_value_coefficient=0.1,
+        implied_reward_ridge=0.1,
+        discriminator_gradient_penalty_coefficient=0.1,
+        seed=47,
+        multi_gpu_cfg=multi_gpu_cfg,
+    )
+
+
 def test_algorithm_constructor_rejects_unknown_config_fields() -> None:
     """An algorithm typo should fail through Python's explicit constructor semantics."""
     with pytest.raises(TypeError, match="learnig_rate"):
@@ -108,7 +279,7 @@ def test_algorithm_constructor_rejects_unknown_config_fields() -> None:
 def test_multi_gpu_fails_until_synchronization_is_implemented() -> None:
     """The shell should not silently run unsynchronized distributed training."""
     with pytest.raises(NotImplementedError, match="multi-GPU"):
-        ForwardBackward(multi_gpu_cfg={"world_size": 2})
+        _make_learner(multi_gpu_cfg={"world_size": 2})
 
 
 @pytest.mark.parametrize(
@@ -135,17 +306,152 @@ def test_algorithm_methods_follow_the_rsl_protocol(method_name: str) -> None:
     assert forward_backward_parameters == ppo_parameters
 
 
-def test_phase_1a_shell_does_not_pretend_to_implement_learning() -> None:
-    """The non-abstract shell should remain direct while concrete work is deferred."""
-    algorithm = ForwardBackward()
-
+def test_phase_1e_learner_is_concrete_but_collection_remains_phase_1f() -> None:
+    """The learner update is concrete while environment adaptation stays gated."""
+    algorithm = _make_learner()
     assert not inspect.isabstract(ForwardBackward)
     with pytest.raises(NotImplementedError):
-        algorithm.update()
+        algorithm.act(TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]))
+
+
+def _parameter_snapshot(module: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+    return tuple(parameter.detach().clone() for parameter in module.parameters())
+
+
+def _parameters_changed(before: tuple[torch.Tensor, ...], module: torch.nn.Module) -> bool:
+    return any(not torch.equal(previous, current) for previous, current in zip(before, module.parameters()))
+
+
+def test_one_update_mutates_every_declared_owner_and_no_actor_evaluator_grads() -> None:
+    """The ordered update should step live owners, EMA targets, and only actor gradients last."""
+    learner = _make_learner()
+    model = learner.model
+    live_before = {
+        "actor": _parameter_snapshot(model.actor_network),
+        "forward": _parameter_snapshot(model.forward_network),
+        "backward": _parameter_snapshot(model.backward_network),
+        "discriminator": _parameter_snapshot(model.discriminator_network),  # type: ignore[arg-type]
+        "value_discriminator": _parameter_snapshot(model.value_networks["discriminator"]),
+        "value_auxiliary": _parameter_snapshot(model.value_networks["auxiliary"]),
+    }
+    target_before = {
+        "forward": _parameter_snapshot(model.forward_target_network),
+        "backward": _parameter_snapshot(model.backward_target_network),
+        "discriminator": _parameter_snapshot(model.value_target_networks["discriminator"]),
+        "auxiliary": _parameter_snapshot(model.value_target_networks["auxiliary"]),
+    }
+
+    metrics = learner.update()
+
+    assert {
+        "discriminator/loss",
+        "fb/loss",
+        "fb/implied_value",
+        "value/discriminator/loss",
+        "value/auxiliary/loss",
+        "actor/loss",
+    }.issubset(metrics)
+    assert _parameters_changed(live_before["actor"], model.actor_network)
+    assert _parameters_changed(live_before["forward"], model.forward_network)
+    assert _parameters_changed(live_before["backward"], model.backward_network)
+    assert _parameters_changed(live_before["discriminator"], model.discriminator_network)  # type: ignore[arg-type]
+    assert _parameters_changed(live_before["value_discriminator"], model.value_networks["discriminator"])
+    assert _parameters_changed(live_before["value_auxiliary"], model.value_networks["auxiliary"])
+    assert _parameters_changed(target_before["forward"], model.forward_target_network)
+    assert _parameters_changed(target_before["backward"], model.backward_target_network)
+    assert _parameters_changed(target_before["discriminator"], model.value_target_networks["discriminator"])
+    assert _parameters_changed(target_before["auxiliary"], model.value_target_networks["auxiliary"])
+    assert all(parameter.grad is None for parameter in model.forward_network.parameters())
+    assert all(
+        parameter.grad is None for network in model.value_networks.values() for parameter in network.parameters()
+    )
+    assert any(parameter.grad is not None for parameter in model.actor_network.parameters())
+    assert learner.update_step == 1
+    assert learner.context_buffer_size == learner.batch_size
+    assert learner.versions["actor"] == 1
+    assert model.observation_normalizers["state"].count.item() == 2 * learner.batch_size
+    assert learner.reward_normalizers["auxiliary"].count.item() == 1
+
+
+def test_meta_and_bfm_component_sets_use_the_same_update_class() -> None:
+    """Optional auxiliary values should disappear without a learner subclass or dummy loss."""
+    meta = _make_learner(include_auxiliary=False)
+    bfm = _make_learner(include_auxiliary=True)
+
+    meta_metrics = meta.update()
+    bfm_metrics = bfm.update()
+
+    assert type(meta) is type(bfm) is ForwardBackward
+    assert "value/auxiliary/loss" not in meta_metrics
+    assert "value/auxiliary/loss" in bfm_metrics
+    assert "auxiliary" not in meta.value_optimizers
+    assert "auxiliary" in bfm.value_optimizers
+
+
+def test_learner_checkpoint_reproduces_the_exact_next_update() -> None:
+    """Model, optimizers, samplers, contexts, and RNG should resume one update exactly."""
+    expected = _make_learner()
+    restored = _make_learner()
+    state = copy.deepcopy(expected.save())
+
+    expected_metrics = expected.update()
+    restored.load(state, load_cfg=None, strict=True)
+    restored_metrics = restored.update()
+
+    assert restored_metrics == expected_metrics
+    assert restored.update_step == expected.update_step
+    assert restored.versions == expected.versions
+    torch.testing.assert_close(restored.context_buffer, expected.context_buffer, rtol=0.0, atol=0.0)
+    for name, value in expected.model.state_dict().items():
+        torch.testing.assert_close(restored.model.state_dict()[name], value, rtol=0.0, atol=0.0)
 
 
 def test_checkpoint_header_has_one_compatibility_fingerprint() -> None:
     """Checkpoint identity should stay small until concrete learner state exists."""
+
+
+def test_discriminator_negative_uses_behavior_context_but_reward_uses_learner_context() -> None:
+    """Relabeling must happen after the discriminator negative pair is consumed."""
+    learner = _make_learner()
+    learner.relabel_fraction = 1.0
+    replay_rng = learner.replay.generator.get_state()
+    expected_behavior = learner.replay.sample_random(learner.batch_size).behavior_context.clone()
+    learner.replay.generator.set_state(replay_rng)
+    captured_contexts = []
+
+    def capture_context(_module: torch.nn.Module, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+        captured_contexts.append(inputs[1].detach().clone())
+
+    assert learner.model.discriminator_network is not None
+    handle = learner.model.discriminator_network.register_forward_pre_hook(capture_context)
+    try:
+        learner.update()
+    finally:
+        handle.remove()
+
+    torch.testing.assert_close(captured_contexts[1], expected_behavior)
+    assert not torch.equal(captured_contexts[-1], expected_behavior)
+
+
+def test_compile_wraps_mutation_blocks_without_replacing_model_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compilation should target update blocks rather than wrap the state-owning model."""
+    learner = _make_learner()
+    model = learner.model
+    compiled = []
+
+    def fake_compile(function: Callable[..., object], *, mode: str) -> Callable[..., object]:
+        compiled.append((function.__name__, mode))
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    learner.compile("reduce-overhead")
+
+    assert compiled == [
+        ("_update_forward_backward", "reduce-overhead"),
+        ("_update_actor", "reduce-overhead"),
+    ]
+    assert learner.get_policy() is model
+
     header = _make_header()
 
     assert header.format_name == FORWARD_BACKWARD_CHECKPOINT_FORMAT

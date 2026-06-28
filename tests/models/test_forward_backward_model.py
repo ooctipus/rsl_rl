@@ -259,6 +259,16 @@ def test_nonflat_construction_observation_fails_once() -> None:
         _make_model(observations, {"actor": ("state",)})
 
 
+def test_random_context_accepts_a_learner_owned_generator() -> None:
+    """Context sampling should resume independently from the global Torch RNG."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    model = _make_model(observations, META_ROUTES)
+    first = torch.Generator().manual_seed(17)
+    second = torch.Generator().manual_seed(17)
+
+    torch.testing.assert_close(model.context_random(5, generator=first), model.context_random(5, generator=second))
+
+
 def test_debug_validator_checks_recorded_shape() -> None:
     """Cold debug validation should catch a malformed runtime batch."""
     schema = _make_schema(META_FIELD_WIDTHS, META_ROUTES)
