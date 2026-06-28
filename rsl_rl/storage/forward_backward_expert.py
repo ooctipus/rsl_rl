@@ -70,7 +70,7 @@ class ForwardBackwardExpertBatch:
 
 
 class ForwardBackwardExpertBuffer:
-    """Immutable ragged expert corpus with a replay-owned device generator."""
+    """Immutable ragged expert frames with mutable sampling weights and a device generator."""
 
     def __init__(
         self,
@@ -96,6 +96,8 @@ class ForwardBackwardExpertBuffer:
         clip_lengths = clip_offsets[1:] - clip_offsets[:-1]
         if torch.any(clip_lengths <= 0):
             raise ValueError("Every expert clip must contain at least one frame.")
+        if not torch.all(torch.isfinite(priorities)):
+            raise ValueError("Expert priorities must be finite.")
         if torch.any(priorities < 0) or not torch.any(priorities > 0):
             raise ValueError("Expert priorities must be non-negative with positive total mass.")
 
@@ -116,6 +118,28 @@ class ForwardBackwardExpertBuffer:
             raise ValueError("Every configured window length needs a positive-priority eligible clip.")
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
+
+    def set_priorities(self, priorities: torch.Tensor) -> None:
+        """Replace clip-sampling weights at one declared external priority event."""
+        if priorities.shape != self.priorities.shape or not priorities.is_floating_point():
+            raise ValueError("priorities must be floating point with one entry per clip.")
+        if priorities.device != self.device:
+            raise ValueError("Expert priorities must remain on the corpus device.")
+        if priorities.requires_grad:
+            raise ValueError("Expert priorities must be detached.")
+        if not torch.all(torch.isfinite(priorities)):
+            raise ValueError("Expert priorities must be finite.")
+        if torch.any(priorities < 0) or not torch.any(priorities > 0):
+            raise ValueError("Expert priorities must be non-negative with positive total mass.")
+        eligible_priorities = {
+            length: torch.where(self.clip_lengths >= length, priorities, torch.zeros_like(priorities))
+            for length in self.schema.window_lengths
+        }
+        if any(not torch.any(value > 0) for value in eligible_priorities.values()):
+            raise ValueError("Every configured window length needs a positive-priority eligible clip.")
+        self.priorities.copy_(priorities)
+        for length, values in eligible_priorities.items():
+            self._eligible_priorities[length].copy_(values)
 
     def sample(self, batch_size: int, sequence_length: int) -> ForwardBackwardExpertBatch:
         """Sample clips by priority and starts uniformly within each selected clip."""
@@ -148,6 +172,7 @@ class ForwardBackwardExpertBuffer:
         """Capture only mutable sampling state; corpus tensors are immutable inputs."""
         return {
             "schema_hash": self.schema.schema_hash,
+            "priorities": self.priorities.clone(),
             "generator_state": self.generator.get_state(),
         }
 
@@ -155,6 +180,10 @@ class ForwardBackwardExpertBuffer:
         """Restore the exact next sample under the same corpus identity."""
         if state["schema_hash"] != self.schema.schema_hash:
             raise ValueError("Expert sampler state does not match the corpus schema.")
+        priorities = state["priorities"]
+        if not isinstance(priorities, torch.Tensor):
+            raise TypeError("Expert priorities state must be a tensor.")
+        self.set_priorities(priorities)
         generator_state = state["generator_state"]
         if not isinstance(generator_state, torch.Tensor):
             raise TypeError("Expert generator_state must be a tensor.")

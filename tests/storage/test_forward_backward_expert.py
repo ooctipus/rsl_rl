@@ -124,6 +124,7 @@ def test_expert_windows_are_contiguous_and_never_cross_clips() -> None:
 def test_expert_sampler_resumes_exactly() -> None:
     """The dedicated device generator should produce the same next windows after restore."""
     buffer = _make_buffer()
+    buffer.set_priorities(torch.tensor([0.0, 3.0, 1.0]))
     buffer.sample(7, 3)
     state = buffer.state_dict()
     restored = _make_buffer(seed=999)
@@ -134,6 +135,44 @@ def test_expert_sampler_resumes_exactly() -> None:
     torch.testing.assert_close(actual.frames, expected.frames)
     torch.testing.assert_close(actual.clip_ids, expected.clip_ids)
     torch.testing.assert_close(actual.frame_indices, expected.frame_indices)
+
+
+def test_expert_priority_event_updates_all_windows_and_checkpoint_state() -> None:
+    """External weights should immediately govern every window and survive restore."""
+    buffer = _make_buffer()
+    buffer.set_priorities(torch.tensor([0.0, 1.0, 0.0]))
+
+    assert torch.all(buffer.sample(128, 1).clip_ids == 1)
+    assert torch.all(buffer.sample(128, 3).clip_ids == 1)
+    assert torch.all(buffer.sample(128, 5).clip_ids == 1)
+
+    state = buffer.state_dict()
+    buffer.set_priorities(torch.tensor([0.0, 0.0, 1.0]))
+    restored = _make_buffer(seed=999)
+    restored.load_state_dict(state)
+
+    torch.testing.assert_close(restored.priorities, torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.all(restored.sample(128, 5).clip_ids == 1)
+
+
+@pytest.mark.parametrize(
+    "priorities",
+    (
+        torch.tensor([0.0, 0.0, 0.0]),
+        torch.tensor([1.0, -1.0, 1.0]),
+        torch.tensor([1.0, float("nan"), 1.0]),
+        torch.tensor([1.0, 0.0]),
+    ),
+)
+def test_expert_priority_event_rejects_invalid_weights(priorities: torch.Tensor) -> None:
+    """Invalid external weights should fail before mutating sampler state."""
+    buffer = _make_buffer()
+    original = buffer.priorities.clone()
+
+    with pytest.raises(ValueError, match="priorities"):
+        buffer.set_priorities(priorities)
+
+    torch.testing.assert_close(buffer.priorities, original)
 
 
 def test_expert_sampler_state_rejects_another_corpus() -> None:
