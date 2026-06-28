@@ -53,6 +53,7 @@ class ForwardBackwardDummyEnv(VecEnv):
         extras: dict = {
             "time_outs": dones.clone(),
             "auxiliary_reward_evidence": reached[:, :1].square(),
+            "episode_steps": self.episode_length_buf,
         }
         if self.provide_final:
             extras["final_obs"] = TensorDict({"state": reached}, batch_size=[NUM_ENVS])
@@ -306,6 +307,25 @@ def test_same_step_collection_falls_back_to_pre_step_when_final_is_unavailable()
 
     torch.testing.assert_close(batch.next_observations["state"], torch.full((NUM_ENVS, STATE_DIM), 2.0))
     assert torch.all(batch.successor_uses_current)
+
+
+def test_rollout_refresh_samples_the_learned_context_mixture_per_episode() -> None:
+    """Reached episode steps should refresh behavior from contexts produced by updates."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    learner = runner.alg
+    learned_contexts = torch.arange(learner.context_buffer.shape[1], dtype=learner.context_buffer.dtype).repeat(
+        NUM_ENVS, 1
+    )
+    learner.context_buffer[:NUM_ENVS].copy_(learned_contexts)
+    learner.context_buffer_size = NUM_ENVS
+
+    _collect(runner, 2)
+
+    assert all(
+        any(torch.equal(context, learned) for learned in learned_contexts) for context in learner.rollout_contexts
+    )
+    batch = learner.replay.sample(torch.ones(NUM_ENVS, dtype=torch.long), torch.arange(NUM_ENVS))
+    assert torch.all(batch.context_changed)
 
 
 def test_rolling_expert_schedule_changes_only_assigned_context_segments() -> None:

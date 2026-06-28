@@ -480,7 +480,8 @@ class ForwardBackward:
             final_observation_valid = valid_value.to(self.device).bool().reshape(num_envs, 1) & done
 
         behavior_context = self.rollout_contexts
-        context_changed = self._advance_rollout_contexts(action_applied)
+        episode_steps = extras["episode_steps"].to(self.device).reshape(num_envs)
+        context_changed = self._advance_rollout_contexts(action_applied, episode_steps)
         self.replay.add(
             ForwardBackwardTransitionBatch(
                 observations=current_observations,
@@ -524,9 +525,23 @@ class ForwardBackward:
         )
         return env_ids, contexts
 
+    def _sample_rollout_contexts(self, count: int) -> torch.Tensor:
+        """Sample the learned update mixture, or the prior before its first update."""
+        if count == 0:
+            return self.context_buffer[:0]
+        if self.context_buffer_size == 0:
+            return self.model.context_random(count, generator=self.generator)
+        indices = torch.randint(
+            self.context_buffer_size,
+            (count,),
+            device=self.device,
+            generator=self.generator,
+        )
+        return self.context_buffer[indices]
+
     @torch.no_grad()
-    def _advance_rollout_contexts(self, action_applied: torch.Tensor) -> torch.Tensor:
-        """Advance random and rolling-expert contexts after one vector step."""
+    def _advance_rollout_contexts(self, action_applied: torch.Tensor, episode_steps: torch.Tensor) -> torch.Tensor:
+        """Advance learned-mixture and rolling-expert contexts for the reached states."""
         next_step = self.rollout_schedule_step + 1
         next_contexts = self._rollout_next_contexts
         next_contexts.copy_(self.rollout_contexts)
@@ -536,11 +551,10 @@ class ForwardBackward:
         tracking.zero_()
         tracking[self._rollout_tracking_env_ids] = True
 
-        if next_step % self.rollout_context_refresh_steps == 0:
-            env_ids = (~tracking).nonzero(as_tuple=False).squeeze(-1)
-            if env_ids.numel():
-                next_contexts[env_ids] = self.model.context_random(env_ids.shape[0], generator=self.generator)
-                changed[env_ids] = True
+        refresh = episode_steps.remainder(self.rollout_context_refresh_steps) == 0
+        env_ids = (refresh & ~tracking).nonzero(as_tuple=False).squeeze(-1)
+        next_contexts[env_ids] = self._sample_rollout_contexts(env_ids.shape[0])
+        changed[env_ids] = True
 
         if self._rollout_tracking_count:
             position = next_step % self.rollout_expert_steps
