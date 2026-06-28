@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import torch
+from pathlib import Path
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -254,6 +255,35 @@ def test_runner_uses_random_seed_phase_and_delays_updates_one_iteration() -> Non
     assert random_calls == 2
     assert runner.collected_transitions == 6 * NUM_ENVS
     assert runner.alg.update_step == 1
+
+
+def test_runner_counts_completed_iterations_and_saves_each_boundary_once() -> None:
+    """Checkpoint names and resume state should count completed iterations."""
+    cfg = _make_cfg()
+    cfg["save_interval"] = 2
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir="/tmp/off_policy_runner", device="cpu")
+    saved: list[tuple[str, int]] = []
+
+    runner.logger.writer = object()
+    runner.logger.init_logging_writer = lambda: None
+    runner.logger.process_env_step = lambda *args, **kwargs: None
+    runner.logger.log = lambda *args, **kwargs: None
+    runner.logger.stop_logging_writer = lambda: None
+
+    def record_save(path: str, infos: dict | None = None) -> None:
+        del infos
+        saved.append((Path(path).name, runner.current_learning_iteration))
+
+    runner.save = record_save
+    runner.learn(3)
+
+    assert runner.current_learning_iteration == 3
+    assert saved == [("model_2.pt", 2), ("model_3.pt", 3)]
+
+    runner.learn(1)
+
+    assert runner.current_learning_iteration == 4
+    assert saved[-1] == ("model_4.pt", 4)
 
 
 def test_same_step_collection_uses_true_final_observation_when_available() -> None:

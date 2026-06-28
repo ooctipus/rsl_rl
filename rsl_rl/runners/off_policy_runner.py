@@ -60,6 +60,7 @@ class OffPolicyRunner(OnPolicyRunner):
 
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        last_saved_iteration: int | None = None
         for it in range(start_it, total_it):
             iteration_start_transitions = self.collected_transitions
             start = time.time()
@@ -86,7 +87,7 @@ class OffPolicyRunner(OnPolicyRunner):
                 metrics = [self.alg.update() for _ in range(self.num_updates_per_iteration)]
             loss_dict = self._mean_metrics(metrics)
             learn_time = time.time() - start
-            self.current_learning_iteration = it
+            self.current_learning_iteration = it + 1
 
             self.logger.log(
                 it=it,
@@ -100,11 +101,15 @@ class OffPolicyRunner(OnPolicyRunner):
                 rnd_weight=None,
             )
 
-            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+            if self.logger.writer is not None and self.current_learning_iteration % self.cfg["save_interval"] == 0:
+                self.save(  # type: ignore[arg-type]
+                    os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")
+                )
+                last_saved_iteration = self.current_learning_iteration
 
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore[arg-type]
+            if self.current_learning_iteration != last_saved_iteration:
+                self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore[arg-type]
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
