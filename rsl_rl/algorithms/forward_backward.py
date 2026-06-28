@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.models.forward_backward_model import ForwardBackwardModel
+from rsl_rl.models.forward_backward_model import (
+    ForwardBackwardDualNetworkCfg,
+    ForwardBackwardModel,
+    ForwardBackwardValueHeadCfg,
+)
 from rsl_rl.modules.forward_backward import (
     actor_direct_loss,
     backward_implied_reward,
@@ -28,10 +32,23 @@ from rsl_rl.modules.forward_backward import (
     soft_update,
     trajectory_context,
 )
-from rsl_rl.modules.reward_channels import ForwardBackwardRewardNormalizer, get_forward_backward_schema_hash
+from rsl_rl.modules.reward_channels import (
+    ForwardBackwardRewardChannel,
+    ForwardBackwardRewardNormalizer,
+    ForwardBackwardRewardSchema,
+    ForwardBackwardValueSpec,
+    get_forward_backward_schema_hash,
+)
 from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer
-from rsl_rl.storage.forward_backward_replay import ForwardBackwardReplay, ForwardBackwardReplayBatch
-from rsl_rl.utils import resolve_optimizer
+from rsl_rl.storage.forward_backward_replay import (
+    ForwardBackwardAutoresetMode,
+    ForwardBackwardHistoryLayout,
+    ForwardBackwardReplay,
+    ForwardBackwardReplayBatch,
+    ForwardBackwardTransitionBatch,
+    ForwardBackwardTransitionSchema,
+)
+from rsl_rl.utils import resolve_callable, resolve_optimizer
 
 FORWARD_BACKWARD_CHECKPOINT_FORMAT = "rsl_rl.forward_backward"
 FORWARD_BACKWARD_CHECKPOINT_VERSION = 1
@@ -186,6 +203,10 @@ class ForwardBackward:
         scale_actor_helpers: bool = True,
         max_grad_norm: float | None = None,
         seed: int = 0,
+        rollout_context_refresh_steps: int = 100,
+        rollout_expert_fraction: float = 0.0,
+        rollout_expert_steps: int = 250,
+        rollout_expert_context_steps: int = 8,
         device: str | torch.device = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -208,6 +229,10 @@ class ForwardBackward:
             raise ValueError("Context mixture and relabel fractions must define probabilities.")
         if context_buffer_capacity < batch_size:
             raise ValueError("context_buffer_capacity must hold at least one update batch.")
+        if rollout_context_refresh_steps < 1 or rollout_expert_steps < 1 or rollout_expert_context_steps < 1:
+            raise ValueError("Rollout context periods must be positive.")
+        if not 0.0 <= rollout_expert_fraction <= 1.0:
+            raise ValueError("rollout_expert_fraction must be in [0, 1].")
 
         requested_device = torch.device(device)
         self.model = model.to(requested_device)
@@ -234,6 +259,9 @@ class ForwardBackward:
         self.fb_target_tau = fb_target_tau
         self.scale_actor_helpers = scale_actor_helpers
         self.max_grad_norm = max_grad_norm
+        self.rollout_context_refresh_steps = rollout_context_refresh_steps
+        self.rollout_expert_steps = rollout_expert_steps
+        self.rollout_expert_context_steps = rollout_expert_context_steps
 
         backward_fields = model.observation_schema.route("backward")
         if (
@@ -319,6 +347,25 @@ class ForwardBackward:
         self.context_buffer_size = 0
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
+        self.rollout_contexts = model.context_random(replay.num_envs, generator=self.generator)
+        self._rollout_next_contexts = torch.empty_like(self.rollout_contexts)
+        self._rollout_context_changed = torch.zeros(replay.num_envs, device=self.device, dtype=torch.bool)
+        self._rollout_tracking_mask = torch.zeros_like(self._rollout_context_changed)
+        self._empty_auxiliary_evidence = torch.empty(replay.num_envs, 0, device=self.device, dtype=replay.dtype)
+        self.rollout_schedule_step = 0
+        self._rollout_tracking_count = round(replay.num_envs * rollout_expert_fraction)
+        self._rollout_tracking_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
+        self._rollout_tracking_contexts = torch.empty(
+            0, rollout_expert_steps, model.context_dim, device=self.device, dtype=replay.dtype
+        )
+        if self._rollout_tracking_count:
+            tracking_window = rollout_expert_steps + rollout_expert_context_steps - 1
+            if tracking_window not in expert.schema.window_lengths:
+                raise ValueError("The expert corpus does not provide the rollout tracking window.")
+            self._rollout_tracking_env_ids, self._rollout_tracking_contexts = self._sample_rollout_tracking()
+            self.rollout_contexts[self._rollout_tracking_env_ids] = self._rollout_tracking_contexts[:, 0]
+        self._collection_observations: TensorDict | None = None
+        self._collection_actions: torch.Tensor | None = None
         self.update_step = 0
         self.versions = {
             "actor": 0,
@@ -335,26 +382,164 @@ class ForwardBackward:
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
-        """Construct through the ordinary runner factory in Phase 1F."""
-        raise NotImplementedError("Forward-backward environment and expert construction is implemented in Phase 1F.")
+        """Build the strict model, storage, and learner stack from runner config."""
+        return _construct_forward_backward(obs, env, cfg, device)
+
+    @property
+    def ready_to_update(self) -> bool:
+        """Return whether replay holds at least one complete update batch."""
+        return self.replay.num_transitions >= self.batch_size
+
+    @property
+    def learning_rate(self) -> float:
+        """Return the current actor learning rate for ordinary runner logging."""
+        return float(self.actor_optimizer.param_groups[0]["lr"])
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        """Return the current action spread for ordinary runner logging."""
+        return self.model.action_distribution.std
+
+    def validate_collection(self) -> None:
+        """Reduce deferred replay contract errors at the runner control boundary."""
+        self.replay.assert_no_errors()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Collect actions after Phase 1F binds the rollout context schedule."""
-        raise NotImplementedError("Forward-backward collection is implemented in Phase 1F.")
+        """Sample one behavior action and retain its immutable transition fields."""
+        if self._collection_observations is not None:
+            raise RuntimeError("The previous behavior action has not been processed.")
+        observations = obs.to(self.device)
+        actions = self.model.action_sample(observations, self.rollout_contexts)
+        self._collection_observations = observations
+        self._collection_actions = actions
+        return actions
 
     def process_env_step(
         self,
         obs: TensorDict,
         rewards: torch.Tensor,
         dones: torch.Tensor,
-        extras: dict[str, torch.Tensor],
+        extras: dict,
     ) -> None:
-        """Normalize environment transitions through the Phase 1F adapter."""
-        raise NotImplementedError("Forward-backward collection is implemented in Phase 1F.")
+        """Normalize one environment result and append it to replay."""
+        if self._collection_observations is None or self._collection_actions is None:
+            raise RuntimeError("process_env_step requires a preceding act call.")
+
+        next_observations = obs.to(self.device)
+        current_observations = self._collection_observations
+        actions = self._collection_actions
+        num_envs = self.replay.num_envs
+        done = dones.to(self.device).bool().reshape(num_envs, 1)
+        timeout_value = extras.get("time_outs")
+        timeouts = (
+            torch.zeros_like(done)
+            if timeout_value is None
+            else timeout_value.to(self.device).bool().reshape(num_envs, 1)
+        )
+        truncated = done & timeouts
+        terminated = done & ~truncated
+
+        if self.replay.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP:
+            action_applied = extras["action_applied"].to(self.device).bool().reshape(num_envs, 1)
+        else:
+            applied_value = extras.get("action_applied", torch.ones_like(done))
+            action_applied = applied_value.to(self.device).bool().reshape(num_envs, 1)
+
+        evidence_names = self.replay.transition_schema.auxiliary_evidence_names
+        if evidence_names:
+            evidence = extras["auxiliary_reward_evidence"].to(self.device)
+        else:
+            evidence = self._empty_auxiliary_evidence
+
+        final_observations = current_observations
+        final_observation_valid = torch.zeros_like(done)
+        if (
+            self.replay.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.SAME_STEP
+            and "final_obs" in extras
+        ):
+            final_observations = _as_observations(extras["final_obs"], num_envs, self.device)
+            valid_value = extras.get("final_obs_valid", done)
+            final_observation_valid = valid_value.to(self.device).bool().reshape(num_envs, 1) & done
+
+        behavior_context = self.rollout_contexts
+        context_changed = self._advance_rollout_contexts(action_applied)
+        self.replay.add(
+            ForwardBackwardTransitionBatch(
+                observations=current_observations,
+                next_observations=next_observations,
+                final_observations=final_observations,
+                actions=actions,
+                behavior_context=behavior_context,
+                environment_reward=rewards.to(self.device).reshape(num_envs, 1),
+                auxiliary_reward_evidence=evidence,
+                terminated=terminated,
+                truncated=truncated,
+                context_changed=context_changed,
+                action_applied=action_applied,
+                final_observation_valid=final_observation_valid,
+            )
+        )
+        self._collection_observations = None
+        self._collection_actions = None
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Do nothing because direct-Q learning has no rollout-return phase."""
         del obs
+
+    @torch.no_grad()
+    def _sample_rollout_tracking(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample env assignments and rolling expert contexts for one cycle."""
+        env_ids = torch.randperm(self.replay.num_envs, device=self.device, generator=self.generator)[
+            : self._rollout_tracking_count
+        ]
+        window_length = self.rollout_expert_steps + self.rollout_expert_context_steps - 1
+        windows = self.expert.sample(self._rollout_tracking_count, window_length).frames
+        observations = self._make_expert_observations(windows)
+        backward = self.model.backward_map(observations).reshape(
+            self._rollout_tracking_count, window_length, self.model.context_dim
+        )
+        prefix = torch.cat((torch.zeros_like(backward[:, :1]), backward.cumsum(dim=1)), dim=1)
+        contexts = (
+            prefix[:, self.rollout_expert_context_steps :] - prefix[:, : -self.rollout_expert_context_steps]
+        ) / self.rollout_expert_context_steps
+        return env_ids, self.model.context_project(contexts)
+
+    @torch.no_grad()
+    def _advance_rollout_contexts(self, action_applied: torch.Tensor) -> torch.Tensor:
+        """Advance random and rolling-expert contexts after one vector step."""
+        next_step = self.rollout_schedule_step + 1
+        next_contexts = self._rollout_next_contexts
+        next_contexts.copy_(self.rollout_contexts)
+        changed = self._rollout_context_changed
+        changed.zero_()
+        tracking = self._rollout_tracking_mask
+        tracking.zero_()
+        tracking[self._rollout_tracking_env_ids] = True
+
+        if next_step % self.rollout_context_refresh_steps == 0:
+            env_ids = (~tracking).nonzero(as_tuple=False).squeeze(-1)
+            if env_ids.numel():
+                next_contexts[env_ids] = self.model.context_random(env_ids.shape[0], generator=self.generator)
+                changed[env_ids] = True
+
+        if self._rollout_tracking_count:
+            position = next_step % self.rollout_expert_steps
+            if position:
+                next_contexts[self._rollout_tracking_env_ids] = self._rollout_tracking_contexts[:, position]
+                changed[self._rollout_tracking_env_ids] = True
+            else:
+                previous_env_ids = self._rollout_tracking_env_ids
+                next_contexts[previous_env_ids] = self.model.context_random(
+                    previous_env_ids.shape[0], generator=self.generator
+                )
+                self._rollout_tracking_env_ids, self._rollout_tracking_contexts = self._sample_rollout_tracking()
+                next_contexts[self._rollout_tracking_env_ids] = self._rollout_tracking_contexts[:, 0]
+                changed[previous_env_ids] = True
+                changed[self._rollout_tracking_env_ids] = True
+
+        self.rollout_contexts, self._rollout_next_contexts = next_contexts, self.rollout_contexts
+        self.rollout_schedule_step = next_step
+        return changed.unsqueeze(-1) & action_applied
 
     def update(self) -> dict[str, float]:
         """Run one visible off-policy mutation sequence."""
@@ -402,7 +587,8 @@ class ForwardBackward:
 
             with torch.no_grad():
                 next_actions = self.model.action_sample(batch.next_observations, learner_contexts)
-            metrics.update(self._update_forward_backward(batch, learner_contexts, next_actions))
+            fb_metrics = self._update_forward_backward(batch, learner_contexts, next_actions)
+            metrics.update({name: value.clone() for name, value in fb_metrics.items()})
 
             raw_rewards = self._materialize_rewards(batch, learner_contexts)
             for name in self._value_specs:
@@ -735,6 +921,8 @@ class ForwardBackward:
         """Return learner-exact state at a canonical update boundary."""
         if self._update_in_progress:
             raise RuntimeError("Cannot checkpoint during a forward-backward update.")
+        if self._collection_observations is not None:
+            raise RuntimeError("Cannot checkpoint with an unresolved environment transition.")
         optimizers: dict[str, object] = {
             "actor": self.actor_optimizer.state_dict(),
             "forward": self.forward_optimizer.state_dict(),
@@ -761,6 +949,10 @@ class ForwardBackward:
             "context_buffer": self.context_buffer,
             "context_buffer_cursor": self.context_buffer_cursor,
             "context_buffer_size": self.context_buffer_size,
+            "rollout_contexts": self.rollout_contexts,
+            "rollout_schedule_step": self.rollout_schedule_step,
+            "rollout_tracking_env_ids": self._rollout_tracking_env_ids,
+            "rollout_tracking_contexts": self._rollout_tracking_contexts,
             "update_step": self.update_step,
             "versions": dict(self.versions),
             "rng_state": rng,
@@ -799,6 +991,10 @@ class ForwardBackward:
             self.context_buffer.copy_(loaded_dict["context_buffer"])
             self.context_buffer_cursor = int(loaded_dict["context_buffer_cursor"])
             self.context_buffer_size = int(loaded_dict["context_buffer_size"])
+            self.rollout_contexts.copy_(loaded_dict["rollout_contexts"])
+            self.rollout_schedule_step = int(loaded_dict["rollout_schedule_step"])
+            self._rollout_tracking_env_ids.copy_(loaded_dict["rollout_tracking_env_ids"])
+            self._rollout_tracking_contexts.copy_(loaded_dict["rollout_tracking_contexts"])
             self.update_step = int(loaded_dict["update_step"])
             self.versions = dict(loaded_dict["versions"])
         if load_cfg.get("rng"):
@@ -821,3 +1017,150 @@ class ForwardBackward:
             return
         self._update_forward_backward = torch.compile(self._update_forward_backward, mode=mode)
         self._update_actor = torch.compile(self._update_actor, mode=mode)
+
+
+def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
+    """Construct one forward-backward learner from ordinary RSL-RL sections."""
+    model_cfg = dict(cfg["model"])
+    model_class = resolve_callable(model_cfg.pop("class_name"))
+    actor_cfg = ForwardBackwardDualNetworkCfg(**dict(model_cfg.pop("actor_cfg")))
+    forward_cfg = ForwardBackwardDualNetworkCfg(**dict(model_cfg.pop("forward_cfg")))
+    value_heads = tuple(_make_value_head(value) for value in model_cfg.pop("value_heads", ()))
+    model = model_class(
+        obs.to(device),
+        cfg["obs_groups"],
+        env.num_actions,
+        actor_cfg=actor_cfg,
+        forward_cfg=forward_cfg,
+        value_heads=value_heads,
+        **model_cfg,
+    )
+    if not isinstance(model, ForwardBackwardModel):
+        raise TypeError("The configured model must be a ForwardBackwardModel.")
+
+    replay_cfg = dict(cfg["replay"])
+    replay_class = resolve_callable(replay_cfg.pop("class_name"))
+    reward_schema = ForwardBackwardRewardSchema(
+        tuple(ForwardBackwardRewardChannel(**dict(channel)) for channel in replay_cfg.pop("reward_channels"))
+    )
+    autoreset_mode = ForwardBackwardAutoresetMode(replay_cfg.pop("autoreset_mode"))
+    transition_schema = ForwardBackwardTransitionSchema(
+        observation_schema_hash=model.observation_schema.schema_hash,
+        reward_schema_hash=reward_schema.schema_hash,
+        action_width=env.num_actions,
+        context_width=model.context_dim,
+        environment_reward_name=replay_cfg.pop("environment_reward_name"),
+        auxiliary_evidence_names=tuple(replay_cfg.pop("auxiliary_evidence_names")),
+        autoreset_mode=autoreset_mode,
+    )
+    history_layout = _make_history_layout(replay_cfg.pop("history_layout", None))
+    replay = replay_class(
+        num_envs=env.num_envs,
+        observation_schema=model.observation_schema,
+        transition_schema=transition_schema,
+        reward_schema=reward_schema,
+        device=device,
+        history_layout=history_layout,
+        **replay_cfg,
+    )
+    if not isinstance(replay, ForwardBackwardReplay):
+        raise TypeError("The configured replay must be a ForwardBackwardReplay.")
+
+    expert_cfg = dict(cfg["expert"])
+    provider = resolve_callable(expert_cfg.pop("provider"))
+    expert = provider(env, model.observation_schema, device, **expert_cfg)
+    if not isinstance(expert, ForwardBackwardExpertBuffer):
+        raise TypeError("The expert provider must return ForwardBackwardExpertBuffer.")
+
+    algorithm_cfg = dict(cfg["algorithm"])
+    algorithm_class = resolve_callable(algorithm_cfg.pop("class_name"))
+    value_cfg = {
+        name: ForwardBackward.ValueCfg(**dict(value))
+        for name, value in dict(algorithm_cfg.pop("value_cfg", {})).items()
+    }
+    manifest = {
+        "config": {
+            "algorithm": _checkpoint_config(cfg["algorithm"]),
+            "model": _checkpoint_config(cfg["model"]),
+            "obs_groups": _checkpoint_config(cfg["obs_groups"]),
+            "replay": _checkpoint_config(cfg["replay"]),
+        },
+        "expert_schema_hash": expert.schema.schema_hash,
+        "observation_schema_hash": model.observation_schema.schema_hash,
+        "reward_schema_hash": reward_schema.schema_hash,
+        "transition_schema_hash": transition_schema.schema_hash,
+        "value_specs": tuple(_value_spec_data(spec) for spec in model.value_specs),
+    }
+    algorithm = algorithm_class(
+        model,
+        replay,
+        expert,
+        ForwardBackwardCheckpointHeader.from_manifest(manifest),
+        value_cfg=value_cfg,
+        device=device,
+        multi_gpu_cfg=cfg.get("multi_gpu"),
+        **algorithm_cfg,
+    )
+    if not isinstance(algorithm, ForwardBackward):
+        raise TypeError("The configured algorithm must be ForwardBackward.")
+    algorithm.compile(cfg.get("torch_compile_mode"))
+    return algorithm
+
+
+def _make_value_head(value: Mapping[str, object]) -> ForwardBackwardValueHeadCfg:
+    """Build one named value head from its strict spec and network sections."""
+    options = dict(value)
+    spec = ForwardBackwardValueSpec(**dict(options.pop("spec")))
+    network = ForwardBackwardDualNetworkCfg(**dict(options.pop("network")))
+    if options:
+        raise ValueError(f"Unknown value-head configuration: {tuple(options)}.")
+    return ForwardBackwardValueHeadCfg(spec, network)
+
+
+def _make_history_layout(value: object) -> ForwardBackwardHistoryLayout | None:
+    """Build the optional compact-history reconstruction contract."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("history_layout must be a mapping or None.")
+    options = dict(value)
+    sources = tuple(ForwardBackwardHistoryLayout.Source(**dict(source)) for source in options.pop("sources"))
+    return ForwardBackwardHistoryLayout(sources=sources, **options)
+
+
+def _checkpoint_config(value: object) -> object:
+    """Convert one resolved config section into stable JSON-compatible data."""
+    if isinstance(value, Mapping):
+        return {str(key): _checkpoint_config(item) for key, item in value.items() if key != "provider"}
+    if isinstance(value, (tuple, list)):
+        return tuple(_checkpoint_config(item) for item in value)
+    if callable(value):
+        return f"{value.__module__}:{value.__qualname__}"
+    if isinstance(value, torch.dtype):
+        return str(value)
+    return value
+
+
+def _value_spec_data(spec: ForwardBackwardValueSpec) -> dict[str, object]:
+    """Return the checkpoint-compatible fields of one value specification."""
+    return {
+        "ensemble_size": spec.ensemble_size,
+        "has_target": spec.has_target,
+        "kind": spec.kind,
+        "name": spec.name,
+        "reward_channels": spec.reward_channels,
+        "route": spec.route,
+    }
+
+
+def _as_observations(value: object, num_envs: int, device: torch.device) -> TensorDict:
+    """Normalize an environment final-observation payload to one TensorDict."""
+    if isinstance(value, TensorDict):
+        return value.to(device)
+    if not isinstance(value, Mapping):
+        raise TypeError("final_obs must be a TensorDict or tensor mapping.")
+    return TensorDict(
+        {str(name): tensor.to(device) for name, tensor in value.items()},
+        batch_size=[num_envs],
+        device=device,
+    )

@@ -16,3 +16,12 @@ Distillation
    :members:
    :undoc-members:
 
+
+Forward-Backward
+----------------
+
+.. automodule:: rsl_rl.algorithms.forward_backward
+   :members: ForwardBackward, ForwardBackwardCheckpointHeader
+   :undoc-members:
+   :show-inheritance:
+

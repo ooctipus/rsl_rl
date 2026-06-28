@@ -16,3 +16,12 @@ Distillation Runner
    :members:
    :undoc-members:
 
+
+Off-Policy Runner
+-----------------
+
+.. automodule:: rsl_rl.runners.off_policy_runner
+   :members:
+   :undoc-members:
+   :show-inheritance:
+

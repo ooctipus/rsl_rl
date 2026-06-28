@@ -36,6 +36,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+import warnings
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -84,6 +85,13 @@ class SuccessorFeatures(nn.Module):
         device: str = "cpu",
     ) -> None:
         """Store hyperparameters; the forward-backward target network is built later in :meth:`build`."""
+        warnings.warn(
+            "SuccessorFeatures is deprecated. Migrate off-policy forward-backward training to "
+            "rsl_rl.algorithms.ForwardBackward with rsl_rl.runners.OffPolicyRunner. The APIs are not "
+            "drop-in compatible because ForwardBackward owns replay, reward channels, and optimizer state.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self.feature_dim = feature_dim
         self.gamma = gamma

@@ -5,6 +5,8 @@
 
 """Storage for the learning algorithms."""
 
+from .forward_backward_expert import ForwardBackwardExpertBuffer
+from .forward_backward_replay import ForwardBackwardReplay
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["ForwardBackwardExpertBuffer", "ForwardBackwardReplay", "RolloutStorage"]

@@ -24,3 +24,12 @@ CNN Model
    :members:
    :undoc-members:
 
+
+Forward-Backward Model
+----------------------
+
+.. automodule:: rsl_rl.models.forward_backward_model
+   :members: ForwardBackwardModel
+   :undoc-members:
+   :show-inheritance:
+

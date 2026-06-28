@@ -21,6 +21,7 @@ import pytest
 import rsl_rl.algorithms
 import rsl_rl.extensions
 import rsl_rl.models
+import rsl_rl.runners
 import rsl_rl.storage
 from rsl_rl.algorithms.forward_backward import (
     FORWARD_BACKWARD_CHECKPOINT_FORMAT,
@@ -306,12 +307,14 @@ def test_algorithm_methods_follow_the_rsl_protocol(method_name: str) -> None:
     assert forward_backward_parameters == ppo_parameters
 
 
-def test_phase_1e_learner_is_concrete_but_collection_remains_phase_1f() -> None:
-    """The learner update is concrete while environment adaptation stays gated."""
+def test_phase_1f_collection_retains_one_immutable_pending_action() -> None:
+    """Collection should bind one observation/action/context tuple until env.step resolves it."""
     algorithm = _make_learner()
     assert not inspect.isabstract(ForwardBackward)
-    with pytest.raises(NotImplementedError):
-        algorithm.act(TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]))
+    actions = algorithm.act(TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]))
+    assert actions.shape == (4, 2)
+    with pytest.raises(RuntimeError, match="unresolved environment transition"):
+        algorithm.save()
 
 
 def _parameter_snapshot(module: torch.nn.Module) -> tuple[torch.Tensor, ...]:
@@ -576,14 +579,21 @@ def test_checkpoint_validation_requires_its_small_header() -> None:
         _make_header().validate_checkpoint({"actor_state_dict": {}})
 
 
-def test_public_exports_are_unchanged_during_phase_1a() -> None:
-    """The new internals should not expand the baseline public API prematurely."""
-    assert rsl_rl.algorithms.__all__ == ["PPO", "Distillation"]
-    assert rsl_rl.models.__all__ == ["CNNModel", "MLPModel", "RNNModel"]
-    assert rsl_rl.storage.__all__ == ["RolloutStorage"]
+def test_phase_1g_publishes_only_concrete_forward_backward_boundaries() -> None:
+    """The public API should expose concrete owners without legacy replay aliases."""
+    assert rsl_rl.algorithms.__all__ == ["PPO", "Distillation", "ForwardBackward"]
+    assert rsl_rl.models.__all__ == ["CNNModel", "ForwardBackwardModel", "MLPModel", "RNNModel"]
+    assert rsl_rl.runners.__all__ == ["DistillationRunner", "OffPolicyRunner", "OnPolicyRunner"]
+    assert rsl_rl.storage.__all__ == ["ForwardBackwardExpertBuffer", "ForwardBackwardReplay", "RolloutStorage"]
     assert "SuccessorFeatures" in rsl_rl.extensions.__all__
-    assert not hasattr(rsl_rl.algorithms, "ForwardBackward")
-    assert not hasattr(rsl_rl.models, "ForwardBackwardModel")
+    assert rsl_rl.algorithms.ForwardBackward is ForwardBackward
+    assert rsl_rl.models.ForwardBackwardModel is ForwardBackwardModel
+
+
+def test_successor_features_deprecation_points_to_the_unified_replacement() -> None:
+    """The retained public prototype should emit concrete migration guidance."""
+    with pytest.warns(DeprecationWarning, match="ForwardBackward.*OffPolicyRunner"):
+        rsl_rl.extensions.SuccessorFeatures()
 
 
 def test_new_rsl_modules_import_no_environment_or_reference_repository() -> None:
