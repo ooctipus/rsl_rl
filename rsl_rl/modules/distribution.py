@@ -227,6 +227,11 @@ class GaussianDistribution(Distribution):
     @property
     def std(self) -> torch.Tensor:
         """Return the standard deviation of the Gaussian distribution."""
+        if self._distribution is None:
+            if self.std_type == "scalar":
+                return self.std_param.clamp(self.std_range[0], self.std_range[1])
+            log_std = self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1])
+            return torch.exp(log_std)
         return self._distribution.stddev  # type: ignore
 
     @property

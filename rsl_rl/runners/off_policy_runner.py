@@ -38,6 +38,12 @@ class OffPolicyRunner(OnPolicyRunner):
         self.num_updates_per_iteration = int(self.cfg["num_updates_per_iteration"])
         if self.num_updates_per_iteration < 1:
             raise ValueError("num_updates_per_iteration must be positive.")
+        self.random_action_steps = int(self.cfg.get("random_action_steps", 0))
+        if self.random_action_steps < 0:
+            raise ValueError("random_action_steps must be non-negative.")
+        if self.random_action_steps and not callable(getattr(self.alg, "act_random", None)):
+            raise TypeError("random_action_steps requires an algorithm with act_random().")
+        self.collected_transitions = 0
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Alternate fixed-size collection blocks with zero or more updates."""
@@ -55,21 +61,27 @@ class OffPolicyRunner(OnPolicyRunner):
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            iteration_start_transitions = self.collected_transitions
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
-                    actions = self.alg.act(obs)
+                    if self.collected_transitions < self.random_action_steps:
+                        actions = self.alg.act_random(obs)
+                    else:
+                        actions = self.alg.act(obs)
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
                     obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.logger.process_env_step(rewards, dones, extras)
+                    self.collected_transitions += self.env.num_envs
             collect_time = time.time() - start
 
             start = time.time()
             metrics: list[dict[str, float]] = []
-            if self.alg.ready_to_update:
+            seed_phase_complete = not self.random_action_steps or iteration_start_transitions > self.random_action_steps
+            if self.alg.ready_to_update and seed_phase_complete:
                 self.alg.validate_collection()
                 metrics = [self.alg.update() for _ in range(self.num_updates_per_iteration)]
             loss_dict = self._mean_metrics(metrics)
@@ -102,6 +114,7 @@ class OffPolicyRunner(OnPolicyRunner):
         saved_dict["infos"] = infos
         saved_dict["environment_resume"] = "exact" if self.environment_resume_exact else "restart"
         saved_dict["environment_state_dict"] = self.env.state_dict() if self.environment_resume_exact else None
+        saved_dict["collected_transitions"] = self.collected_transitions
         torch.save(saved_dict, path)
         self.logger.save_model(path, self.current_learning_iteration)
 
@@ -122,6 +135,12 @@ class OffPolicyRunner(OnPolicyRunner):
             self.env.load_state_dict(environment_state)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+        legacy_vector_steps = loaded_dict.get("rollout_schedule_step")
+        if legacy_vector_steps is None:
+            legacy_vector_steps = (self.current_learning_iteration + 1) * self.cfg["num_steps_per_env"]
+        self.collected_transitions = int(
+            loaded_dict.get("collected_transitions", int(legacy_vector_steps) * self.env.num_envs)
+        )
         return loaded_dict["infos"]
 
     @staticmethod

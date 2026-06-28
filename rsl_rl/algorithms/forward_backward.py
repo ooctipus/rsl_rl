@@ -347,6 +347,8 @@ class ForwardBackward:
         self.context_buffer_size = 0
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
+        self.behavior_generator = torch.Generator(device=self.device)
+        self.behavior_generator.manual_seed(seed)
         self.rollout_contexts = model.context_random(replay.num_envs, generator=self.generator)
         self._rollout_next_contexts = torch.empty_like(self.rollout_contexts)
         self._rollout_context_changed = torch.zeros(replay.num_envs, device=self.device, dtype=torch.bool)
@@ -410,6 +412,25 @@ class ForwardBackward:
             raise RuntimeError("The previous behavior action has not been processed.")
         observations = obs.to(self.device)
         actions = self.model.action_sample(observations, self.rollout_contexts)
+        self._collection_observations = observations
+        self._collection_actions = actions
+        return actions
+
+    def act_random(self, obs: TensorDict) -> torch.Tensor:
+        """Sample uniform bounded behavior actions without advancing learner RNG."""
+        if self._collection_observations is not None:
+            raise RuntimeError("The previous behavior action has not been processed.")
+        observations = obs.to(self.device)
+        try:
+            lower, upper = self.model.action_distribution.action_range
+        except AttributeError as error:
+            raise TypeError("Random behavior requires an action distribution with action_range.") from error
+        actions = torch.empty(
+            self.replay.num_envs,
+            self.model.action_dim,
+            device=self.device,
+            dtype=self.replay.dtype,
+        ).uniform_(lower, upper, generator=self.behavior_generator)
         self._collection_observations = observations
         self._collection_actions = actions
         return actions
@@ -936,6 +957,7 @@ class ForwardBackward:
             "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
             "learner": self.generator.get_state(),
+            "behavior": self.behavior_generator.get_state(),
         }
         if torch.cuda.is_available():
             rng["cuda"] = torch.cuda.get_rng_state_all()
@@ -1003,6 +1025,7 @@ class ForwardBackward:
             np.random.set_state(rng["numpy"])
             torch.set_rng_state(rng["torch"])
             self.generator.set_state(rng["learner"])
+            self.behavior_generator.set_state(rng.get("behavior", rng["learner"]))
             if "cuda" in rng:
                 torch.cuda.set_rng_state_all(rng["cuda"])
         return bool(load_cfg.get("iteration", False))

@@ -99,13 +99,14 @@ def _expert_provider(
     return ForwardBackwardExpertBuffer(frames, offsets, priorities, schema, seed=17)
 
 
-def _make_cfg(*, rollout_expert_fraction: float = 0.0) -> dict:
+def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int = 0) -> dict:
     """Return a tiny strict configuration using every Phase 1F section."""
     network = {"hidden_dim": 16, "hidden_layers": 1, "embedding_layers": 2}
     value_network = {"hidden_dim": 16, "hidden_layers": 1, "embedding_layers": 2}
     return {
         "num_steps_per_env": 2,
         "num_updates_per_iteration": 1,
+        "random_action_steps": random_action_steps,
         "save_interval": 100,
         "obs_groups": {
             "actor": ["state"],
@@ -231,6 +232,30 @@ def test_runner_constructs_collects_and_updates_through_public_lifecycle() -> No
     )
 
 
+def test_runner_uses_random_seed_phase_and_delays_updates_one_iteration() -> None:
+    """Uniform source actions should precede actor behavior and the first update."""
+    runner = OffPolicyRunner(
+        ForwardBackwardDummyEnv(),
+        _make_cfg(random_action_steps=2 * NUM_ENVS),
+        log_dir=None,
+        device="cpu",
+    )
+    random_calls = 0
+    original = runner.alg.act_random
+
+    def count_random_actions(obs: TensorDict) -> torch.Tensor:
+        nonlocal random_calls
+        random_calls += 1
+        return original(obs)
+
+    runner.alg.act_random = count_random_actions
+    runner.learn(3)
+
+    assert random_calls == 2
+    assert runner.collected_transitions == 6 * NUM_ENVS
+    assert runner.alg.update_step == 1
+
+
 def test_same_step_collection_uses_true_final_observation_when_available() -> None:
     """A done edge should reach the pre-reset final observation, never the reset observation."""
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
@@ -299,4 +324,5 @@ def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
 
     assert runner.environment_resume_exact
     assert runner.current_learning_iteration == 7
+    assert runner.collected_transitions == 0
     torch.testing.assert_close(runner.env.state, expected_state)
