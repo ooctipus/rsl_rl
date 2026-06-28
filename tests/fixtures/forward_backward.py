@@ -14,6 +14,7 @@ from rsl_rl.models.forward_backward_model import ForwardBackwardObservationSchem
 from rsl_rl.modules.reward_channels import ForwardBackwardRewardChannel, ForwardBackwardRewardSchema
 from rsl_rl.storage.forward_backward_replay import (
     ForwardBackwardAutoresetMode,
+    ForwardBackwardReplayBatch,
     ForwardBackwardTransitionBatch,
     ForwardBackwardTransitionSchema,
 )
@@ -173,3 +174,138 @@ def make_transition(
         final_observation_valid=final_observation_valid,
     )
     return transition, schema, observation_schema, reward_schema
+
+
+class ForwardBackwardReplayOracle:
+    """Small explicit current-and-next replay used as a correctness oracle."""
+
+    def __init__(
+        self,
+        capacity_steps: int,
+        num_envs: int,
+        observation_schema: ForwardBackwardObservationSchema,
+        transition_schema: ForwardBackwardTransitionSchema,
+        reward_schema: ForwardBackwardRewardSchema,
+        device: str | torch.device,
+        seed: int = 0,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        """Allocate the dense oracle on one device."""
+        if capacity_steps < 1 or num_envs < 1:
+            raise ValueError("capacity_steps and num_envs must be positive.")
+        transition_schema.assert_compatible(observation_schema, reward_schema)
+        self.capacity_steps = capacity_steps
+        self.num_envs = num_envs
+        self.observation_schema = observation_schema
+        self.transition_schema = transition_schema
+        self.device = torch.device(device)
+        self.dtype = dtype
+        shape = (capacity_steps, num_envs)
+        self.observations = _allocate_oracle_observations(observation_schema, shape, self.device, dtype)
+        self.next_observations = _allocate_oracle_observations(observation_schema, shape, self.device, dtype)
+        self.actions = torch.zeros(*shape, transition_schema.action_width, device=self.device, dtype=dtype)
+        self.behavior_context = torch.zeros(*shape, transition_schema.context_width, device=self.device, dtype=dtype)
+        self.environment_reward = torch.zeros(*shape, 1, device=self.device, dtype=dtype)
+        self.auxiliary_reward_evidence = torch.zeros(
+            *shape, len(transition_schema.auxiliary_evidence_names), device=self.device, dtype=dtype
+        )
+        self.terminated = torch.zeros(*shape, 1, device=self.device, dtype=torch.bool)
+        self.truncated = torch.zeros_like(self.terminated)
+        self.context_changed = torch.zeros_like(self.terminated)
+        self.successor_uses_current = torch.zeros_like(self.terminated)
+        self.valid = torch.zeros_like(self.terminated)
+        self.step_ids = torch.full(shape, -1, device=self.device, dtype=torch.long)
+        self._total_steps = 0
+        self._size_steps = 0
+        self.generator = torch.Generator(device=self.device)
+        self.generator.manual_seed(seed)
+
+    @property
+    def total_steps(self) -> int:
+        """Number of vector steps observed since construction."""
+        return self._total_steps
+
+    def add(self, transition: ForwardBackwardTransitionBatch) -> None:
+        """Insert one vector step with an explicit logical reached state."""
+        row = self._total_steps % self.capacity_steps
+        replay = transition.replay_mask(self.transition_schema)
+        if self.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.SAME_STEP:
+            done = transition.done_mask()
+            uses_current = replay & done & ~transition.final_observation_valid
+        else:
+            done = torch.zeros_like(transition.action_applied)
+            uses_current = torch.zeros_like(transition.action_applied)
+        for name, _width in self.observation_schema.field_widths:
+            self.observations[name][row].copy_(transition.observations[name])
+            same_step_reached = torch.where(
+                transition.final_observation_valid,
+                transition.final_observations[name],
+                transition.observations[name],
+            )
+            reached = torch.where(done, same_step_reached, transition.next_observations[name])
+            self.next_observations[name][row].copy_(reached)
+        self.actions[row].copy_(transition.actions)
+        self.behavior_context[row].copy_(transition.behavior_context)
+        self.environment_reward[row].copy_(transition.environment_reward)
+        self.auxiliary_reward_evidence[row].copy_(transition.auxiliary_reward_evidence)
+        self.terminated[row].copy_(transition.terminated)
+        self.truncated[row].copy_(transition.truncated)
+        self.context_changed[row].copy_(transition.context_changed)
+        self.successor_uses_current[row].copy_(uses_current)
+        self.valid[row].copy_(replay)
+        self.step_ids[row].fill_(self._total_steps)
+        self._total_steps += 1
+        self._size_steps = min(self._size_steps + 1, self.capacity_steps)
+
+    def sample(self, step_ids: torch.Tensor, env_ids: torch.Tensor) -> ForwardBackwardReplayBatch:
+        """Sample explicit logical step/environment pairs."""
+        rows = torch.remainder(step_ids, self.capacity_steps)
+        valid = self.valid[rows, env_ids] & (self.step_ids[rows, env_ids] == step_ids).unsqueeze(-1)
+        observations = TensorDict(
+            {name: self.observations[name][rows, env_ids] for name, _width in self.observation_schema.field_widths},
+            batch_size=[step_ids.shape[0]],
+            device=self.device,
+        )
+        next_observations = TensorDict(
+            {
+                name: self.next_observations[name][rows, env_ids]
+                for name, _width in self.observation_schema.field_widths
+            },
+            batch_size=[step_ids.shape[0]],
+            device=self.device,
+        )
+        return ForwardBackwardReplayBatch(
+            observations=observations,
+            next_observations=next_observations,
+            actions=self.actions[rows, env_ids],
+            behavior_context=self.behavior_context[rows, env_ids],
+            environment_reward=self.environment_reward[rows, env_ids],
+            auxiliary_reward_evidence=self.auxiliary_reward_evidence[rows, env_ids],
+            terminated=self.terminated[rows, env_ids],
+            truncated=self.truncated[rows, env_ids],
+            context_changed=self.context_changed[rows, env_ids],
+            successor_uses_current=self.successor_uses_current[rows, env_ids],
+            valid=valid,
+        )
+
+    def sample_random(self, batch_size: int) -> ForwardBackwardReplayBatch:
+        """Sample physical rows uniformly, returning a validity mask for holes."""
+        if self._size_steps == 0:
+            raise RuntimeError("Cannot sample an empty replay.")
+        oldest = self._total_steps - self._size_steps
+        step_ids = torch.randint(oldest, self._total_steps, (batch_size,), device=self.device, generator=self.generator)
+        env_ids = torch.randint(self.num_envs, (batch_size,), device=self.device, generator=self.generator)
+        return self.sample(step_ids, env_ids)
+
+
+def _allocate_oracle_observations(
+    schema: ForwardBackwardObservationSchema,
+    batch_shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> TensorDict:
+    return TensorDict(
+        {name: torch.zeros(*batch_shape, width, device=device, dtype=dtype) for name, width in schema.field_widths},
+        batch_size=list(batch_shape),
+        device=device,
+    )

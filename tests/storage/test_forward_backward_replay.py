@@ -58,26 +58,6 @@ def test_masks_separate_termination_truncation_and_context_boundaries() -> None:
     assert transition.segment_continuation_mask(schema).squeeze(-1).tolist() == [True, False, False, False]
 
 
-@pytest.mark.parametrize(
-    ("mode", "reached_final", "bootstrap_final"),
-    (
-        (ForwardBackwardAutoresetMode.DISABLED, [False] * 4, [False] * 4),
-        (ForwardBackwardAutoresetMode.SAME_STEP, [False, True, True, False], [False, False, True, False]),
-        (ForwardBackwardAutoresetMode.NEXT_STEP, [False] * 4, [False] * 4),
-    ),
-)
-def test_successor_source_never_uses_same_step_reset_observation(
-    mode: ForwardBackwardAutoresetMode,
-    reached_final: list[bool],
-    bootstrap_final: list[bool],
-) -> None:
-    """Reached and bootstrap states should select true finals explicitly."""
-    transition, schema, _observation_schema, _reward_schema = make_transition(mode)
-
-    assert transition.reached_observation_uses_final(schema).squeeze(-1).tolist() == reached_final
-    assert transition.bootstrap_observation_uses_final(schema).squeeze(-1).tolist() == bootstrap_final
-
-
 def test_termination_dominates_truncation_for_bootstrap() -> None:
     """A row carrying both done flags should never bootstrap."""
     transition, schema, observation_schema, _reward_schema = make_transition()
@@ -86,23 +66,20 @@ def test_termination_dominates_truncation_for_bootstrap() -> None:
     transition = replace(transition, terminated=terminated)
 
     transition.assert_valid(schema, observation_schema)
-    assert transition.reached_observation_uses_final(schema)[2]
     assert not transition.bootstrap_mask(schema)[2]
 
 
-def test_missing_same_step_final_is_masked_without_reset_fallback() -> None:
-    """Malformed done rows should be excluded on-device and fail debug validation."""
+def test_missing_same_step_final_uses_explicit_pre_step_fallback() -> None:
+    """Unavailable finals should use the pre-step approximation, never the reset observation."""
     transition, schema, observation_schema, _reward_schema = make_transition()
     valid = transition.final_observation_valid.clone()
     valid[2] = False
-    malformed = replace(transition, final_observation_valid=valid)
+    fallback = replace(transition, final_observation_valid=valid)
 
-    assert malformed.contract_error_mask(schema).squeeze(-1).tolist() == [False, False, True, False]
-    assert not malformed.replay_mask(schema)[2]
-    assert not malformed.bootstrap_mask(schema)[2]
-    assert not malformed.reached_observation_uses_final(schema)[2]
-    with pytest.raises(ValueError, match="true final observation"):
-        malformed.assert_valid(schema, observation_schema)
+    assert fallback.contract_error_mask(schema).squeeze(-1).tolist() == [False] * 4
+    assert fallback.replay_mask(schema)[2]
+    assert fallback.bootstrap_mask(schema)[2]
+    fallback.assert_valid(schema, observation_schema)
 
 
 def test_same_step_rejects_stale_final_validity_on_continuing_row() -> None:
@@ -114,7 +91,7 @@ def test_same_step_rejects_stale_final_validity_on_continuing_row() -> None:
 
     assert malformed.contract_error_mask(schema).squeeze(-1).tolist() == [True, False, False, False]
     assert not malformed.replay_mask(schema)[0]
-    with pytest.raises(ValueError, match="true final observation"):
+    with pytest.raises(ValueError, match="final observations on done rows"):
         malformed.assert_valid(schema, observation_schema)
 
 
@@ -222,8 +199,6 @@ def test_hot_masks_do_not_call_reduction_validators(monkeypatch: pytest.MonkeyPa
     transition.bootstrap_mask(schema)
     transition.episode_continuation_mask(schema)
     transition.segment_continuation_mask(schema)
-    transition.reached_observation_uses_final(schema)
-    transition.bootstrap_observation_uses_final(schema)
 
 
 def test_transition_schema_copies_auxiliary_evidence_names() -> None:

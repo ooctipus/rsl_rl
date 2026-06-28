@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
+import torch
 from dataclasses import replace
 
 import pytest
 
-from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertSchema
+from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
 
 
 def _make_schema() -> ForwardBackwardExpertSchema:
@@ -90,3 +91,63 @@ def test_concrete_corpus_metadata_changes_schema_identity() -> None:
     )
 
     assert all(variant.schema_hash != schema.schema_hash for variant in variants)
+
+
+def _make_buffer(seed: int = 3) -> ForwardBackwardExpertBuffer:
+    schema = replace(
+        _make_schema(),
+        expert_feature_width=3,
+        num_frames=12,
+        num_clips=3,
+        window_lengths=(1, 3, 5),
+    )
+    frames = torch.arange(36, dtype=torch.float32).reshape(12, 3)
+    clip_offsets = torch.tensor([0, 2, 7, 12], dtype=torch.long)
+    priorities = torch.tensor([100.0, 1.0, 2.0])
+    return ForwardBackwardExpertBuffer(frames, clip_offsets, priorities, schema, seed)
+
+
+def test_expert_windows_are_contiguous_and_never_cross_clips() -> None:
+    """Every sampled index matrix should stay within its selected ragged clip."""
+    buffer = _make_buffer()
+    batch = buffer.sample(128, 3)
+    starts = buffer.clip_offsets[batch.clip_ids]
+    stops = buffer.clip_offsets[batch.clip_ids + 1]
+
+    assert torch.all(batch.frame_indices[:, 1:] == batch.frame_indices[:, :-1] + 1)
+    assert torch.all(batch.frame_indices >= starts.unsqueeze(-1))
+    assert torch.all(batch.frame_indices < stops.unsqueeze(-1))
+    assert torch.all(batch.clip_ids != 0)
+    torch.testing.assert_close(batch.frames, buffer.frames[batch.frame_indices])
+
+
+def test_expert_sampler_resumes_exactly() -> None:
+    """The dedicated device generator should produce the same next windows after restore."""
+    buffer = _make_buffer()
+    buffer.sample(7, 3)
+    state = buffer.state_dict()
+    restored = _make_buffer(seed=999)
+    restored.load_state_dict(state)
+
+    expected = buffer.sample(11, 5)
+    actual = restored.sample(11, 5)
+    torch.testing.assert_close(actual.frames, expected.frames)
+    torch.testing.assert_close(actual.clip_ids, expected.clip_ids)
+    torch.testing.assert_close(actual.frame_indices, expected.frame_indices)
+
+
+def test_expert_sampler_state_rejects_another_corpus() -> None:
+    """Mutable RNG state must not move between different immutable corpora."""
+    buffer = _make_buffer()
+    state = buffer.state_dict()
+    changed = _make_buffer()
+    changed.schema = replace(changed.schema, dataset_id="another-corpus")
+
+    with pytest.raises(ValueError, match="corpus schema"):
+        changed.load_state_dict(state)
+
+
+def test_expert_sampler_rejects_unavailable_window() -> None:
+    """Only lengths frozen in the expert schema should be sampleable."""
+    with pytest.raises(ValueError, match="Unsupported expert sequence length"):
+        _make_buffer().sample(4, 4)
