@@ -97,12 +97,12 @@ def _make_buffer(seed: int = 3) -> ForwardBackwardExpertBuffer:
     schema = replace(
         _make_schema(),
         expert_feature_width=3,
-        num_frames=12,
+        num_frames=14,
         num_clips=3,
         window_lengths=(1, 3, 5),
     )
-    frames = torch.arange(36, dtype=torch.float32).reshape(12, 3)
-    clip_offsets = torch.tensor([0, 2, 7, 12], dtype=torch.long)
+    frames = torch.arange(42, dtype=torch.float32).reshape(14, 3)
+    clip_offsets = torch.tensor([0, 2, 8, 14], dtype=torch.long)
     priorities = torch.tensor([100.0, 1.0, 2.0])
     return ForwardBackwardExpertBuffer(frames, clip_offsets, priorities, schema, seed)
 
@@ -111,6 +111,7 @@ def test_expert_windows_are_contiguous_and_never_cross_clips() -> None:
     """Every sampled index matrix should stay within its selected ragged clip."""
     buffer = _make_buffer()
     batch = buffer.sample(128, 3)
+    assert batch.frame_indices.shape == (128, 4)
     starts = buffer.clip_offsets[batch.clip_ids]
     stops = buffer.clip_offsets[batch.clip_ids + 1]
 
@@ -118,7 +119,8 @@ def test_expert_windows_are_contiguous_and_never_cross_clips() -> None:
     assert torch.all(batch.frame_indices >= starts.unsqueeze(-1))
     assert torch.all(batch.frame_indices < stops.unsqueeze(-1))
     assert torch.all(batch.clip_ids != 0)
-    torch.testing.assert_close(batch.frames, buffer.frames[batch.frame_indices])
+    torch.testing.assert_close(batch.observations, buffer.frames[batch.frame_indices[:, :-1]])
+    torch.testing.assert_close(batch.next_observations, buffer.frames[batch.frame_indices[:, 1:]])
 
 
 def test_expert_sampler_resumes_exactly() -> None:
@@ -132,7 +134,8 @@ def test_expert_sampler_resumes_exactly() -> None:
 
     expected = buffer.sample(11, 5)
     actual = restored.sample(11, 5)
-    torch.testing.assert_close(actual.frames, expected.frames)
+    torch.testing.assert_close(actual.observations, expected.observations)
+    torch.testing.assert_close(actual.next_observations, expected.next_observations)
     torch.testing.assert_close(actual.clip_ids, expected.clip_ids)
     torch.testing.assert_close(actual.frame_indices, expected.frame_indices)
 

@@ -48,7 +48,7 @@ from rsl_rl.storage.forward_backward_replay import (
 from rsl_rl.utils import resolve_callable, resolve_optimizer
 
 FORWARD_BACKWARD_CHECKPOINT_FORMAT = "rsl_rl.forward_backward"
-FORWARD_BACKWARD_CHECKPOINT_VERSION = 2
+FORWARD_BACKWARD_CHECKPOINT_VERSION = 3
 FORWARD_BACKWARD_CHECKPOINT_HEADER = "forward_backward_header"
 _CHECKPOINT_MANIFEST_KEYS = frozenset({
     "config",
@@ -369,6 +369,10 @@ class ForwardBackward:
         self._rollout_tracking_contexts = torch.empty(
             0, rollout_expert_steps, model.context_dim, device=self.device, dtype=replay.dtype
         )
+        self._rollout_tracking_positions = torch.zeros(
+            self._rollout_tracking_count, device=self.device, dtype=torch.long
+        )
+        self._rollout_tracking_slots = torch.arange(self._rollout_tracking_count, device=self.device, dtype=torch.long)
         if self._rollout_tracking_count:
             tracking_window = rollout_expert_steps + rollout_expert_context_steps - 1
             if tracking_window not in expert.schema.window_lengths:
@@ -492,7 +496,7 @@ class ForwardBackward:
 
         behavior_context = self.rollout_contexts
         episode_steps = extras["episode_steps"].to(self.device).reshape(num_envs)
-        context_changed = self._advance_rollout_contexts(action_applied, episode_steps)
+        context_changed = self._advance_rollout_contexts(action_applied, episode_steps, done.squeeze(-1))
         self.replay.add(
             ForwardBackwardTransitionBatch(
                 observations=current_observations,
@@ -527,6 +531,15 @@ class ForwardBackward:
         env_ids = (reset & ~tracking).nonzero(as_tuple=False).squeeze(-1)
         self.rollout_contexts[env_ids] = self._sample_rollout_contexts(env_ids.shape[0])
 
+        tracking_slots = reset[self._rollout_tracking_env_ids].nonzero(as_tuple=False).squeeze(-1)
+        if tracking_slots.shape[0]:
+            self._rollout_tracking_contexts[tracking_slots] = self._sample_rollout_tracking_contexts(
+                tracking_slots.shape[0]
+            )
+            self._rollout_tracking_positions[tracking_slots] = 0
+            tracking_env_ids = self._rollout_tracking_env_ids[tracking_slots]
+            self.rollout_contexts[tracking_env_ids] = self._rollout_tracking_contexts[tracking_slots, 0]
+
     def compute_returns(self, obs: TensorDict) -> None:
         """Do nothing because direct-Q learning has no rollout-return phase."""
         del obs
@@ -537,19 +550,21 @@ class ForwardBackward:
         env_ids = torch.randperm(self.replay.num_envs, device=self.device, generator=self.generator)[
             : self._rollout_tracking_count
         ]
+        return env_ids, self._sample_rollout_tracking_contexts(self._rollout_tracking_count)
+
+    @torch.no_grad()
+    def _sample_rollout_tracking_contexts(self, count: int) -> torch.Tensor:
+        """Sample rolling expert context sequences for assigned environments."""
         window_length = self.rollout_expert_steps + self.rollout_expert_context_steps - 1
-        windows = self.expert.sample(self._rollout_tracking_count, window_length).frames
+        windows = self.expert.sample(count, window_length).next_observations
         observations = self._make_expert_observations(windows)
-        backward = self.model.backward_map(observations).reshape(
-            self._rollout_tracking_count, window_length, self.model.context_dim
-        )
-        contexts = trajectory_context_sequence(
+        backward = self.model.backward_map(observations).reshape(count, window_length, self.model.context_dim)
+        return trajectory_context_sequence(
             backward,
             self.rollout_expert_context_steps,
             include_partial=False,
             radius=self.model.context_dim**0.5 if self.model.context_normalization else None,
         )
-        return env_ids, contexts
 
     def _sample_rollout_contexts(self, count: int) -> torch.Tensor:
         """Sample the learned update mixture, or the prior before its first update."""
@@ -566,7 +581,12 @@ class ForwardBackward:
         return self.context_buffer[indices]
 
     @torch.no_grad()
-    def _advance_rollout_contexts(self, action_applied: torch.Tensor, episode_steps: torch.Tensor) -> torch.Tensor:
+    def _advance_rollout_contexts(
+        self,
+        action_applied: torch.Tensor,
+        episode_steps: torch.Tensor,
+        done: torch.Tensor,
+    ) -> torch.Tensor:
         """Advance learned-mixture and rolling-expert contexts for the reached states."""
         next_step = self.rollout_schedule_step + 1
         next_contexts = self._rollout_next_contexts
@@ -583,19 +603,35 @@ class ForwardBackward:
         changed[env_ids] = True
 
         if self._rollout_tracking_count:
-            position = next_step % self.rollout_expert_steps
-            if position:
-                next_contexts[self._rollout_tracking_env_ids] = self._rollout_tracking_contexts[:, position]
-                changed[self._rollout_tracking_env_ids] = True
-            else:
+            tracking_env_ids = self._rollout_tracking_env_ids
+            tracking_applied = action_applied.squeeze(-1)[tracking_env_ids]
+            self._rollout_tracking_positions.add_(tracking_applied.long())
+
+            if next_step % self.rollout_expert_steps == 0:
                 previous_env_ids = self._rollout_tracking_env_ids
                 next_contexts[previous_env_ids] = self.model.context_random(
                     previous_env_ids.shape[0], generator=self.generator
                 )
                 self._rollout_tracking_env_ids, self._rollout_tracking_contexts = self._sample_rollout_tracking()
+                self._rollout_tracking_positions.zero_()
                 next_contexts[self._rollout_tracking_env_ids] = self._rollout_tracking_contexts[:, 0]
                 changed[previous_env_ids] = True
                 changed[self._rollout_tracking_env_ids] = True
+            else:
+                restart_slots = (
+                    (done[tracking_env_ids] | self._rollout_tracking_positions.ge(self.rollout_expert_steps))
+                    .nonzero(as_tuple=False)
+                    .squeeze(-1)
+                )
+                if restart_slots.shape[0]:
+                    self._rollout_tracking_contexts[restart_slots] = self._sample_rollout_tracking_contexts(
+                        restart_slots.shape[0]
+                    )
+                    self._rollout_tracking_positions[restart_slots] = 0
+                next_contexts[tracking_env_ids] = self._rollout_tracking_contexts[
+                    self._rollout_tracking_slots, self._rollout_tracking_positions
+                ]
+                changed[tracking_env_ids] = tracking_applied
 
         self.rollout_contexts, self._rollout_next_contexts = next_contexts, self.rollout_contexts
         self.rollout_schedule_step = next_step
@@ -620,10 +656,11 @@ class ForwardBackward:
             self.model.update_normalization(batch.next_observations)
             self.model.normalization_train(False)
 
-            expert_observations = self._make_expert_observations(expert_batch.frames)
+            expert_observations = self._make_expert_observations(expert_batch.observations)
+            expert_next_observations = self._make_expert_observations(expert_batch.next_observations)
             with torch.no_grad():
                 expert_contexts = trajectory_context(
-                    self.model.backward_map(expert_observations),
+                    self.model.backward_map(expert_next_observations),
                     radius=self.model.context_dim**0.5 if self.model.context_normalization else None,
                 )
                 expert_row_contexts = expert_contexts.repeat_interleave(self.expert_sequence_length, dim=0)
@@ -1016,6 +1053,7 @@ class ForwardBackward:
             "rollout_schedule_step": self.rollout_schedule_step,
             "rollout_tracking_env_ids": self._rollout_tracking_env_ids,
             "rollout_tracking_contexts": self._rollout_tracking_contexts,
+            "rollout_tracking_positions": self._rollout_tracking_positions,
             "update_step": self.update_step,
             "versions": dict(self.versions),
             "rng_state": rng,
@@ -1058,6 +1096,7 @@ class ForwardBackward:
             self.rollout_schedule_step = int(loaded_dict["rollout_schedule_step"])
             self._rollout_tracking_env_ids.copy_(loaded_dict["rollout_tracking_env_ids"])
             self._rollout_tracking_contexts.copy_(loaded_dict["rollout_tracking_contexts"])
+            self._rollout_tracking_positions.copy_(loaded_dict["rollout_tracking_positions"])
             self.update_step = int(loaded_dict["update_step"])
             self.versions = dict(loaded_dict["versions"])
         if load_cfg.get("rng"):

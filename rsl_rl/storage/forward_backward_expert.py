@@ -62,9 +62,10 @@ class ForwardBackwardExpertSchema:
 
 @dataclass(frozen=True, slots=True)
 class ForwardBackwardExpertBatch:
-    """Contiguous expert windows and their source indices."""
+    """Aligned current/reached expert windows and their source indices."""
 
-    frames: torch.Tensor
+    observations: torch.Tensor
+    next_observations: torch.Tensor
     clip_ids: torch.Tensor
     frame_indices: torch.Tensor
 
@@ -108,10 +109,10 @@ class ForwardBackwardExpertBuffer:
         self.device = frames.device
         self.clip_lengths = clip_lengths
         self._sequence_offsets = {
-            length: torch.arange(length, device=self.device, dtype=torch.long) for length in schema.window_lengths
+            length: torch.arange(length + 1, device=self.device, dtype=torch.long) for length in schema.window_lengths
         }
         self._eligible_priorities = {
-            length: torch.where(clip_lengths >= length, priorities, torch.zeros_like(priorities))
+            length: torch.where(clip_lengths > length, priorities, torch.zeros_like(priorities))
             for length in schema.window_lengths
         }
         if any(not torch.any(value > 0) for value in self._eligible_priorities.values()):
@@ -132,7 +133,7 @@ class ForwardBackwardExpertBuffer:
         if torch.any(priorities < 0) or not torch.any(priorities > 0):
             raise ValueError("Expert priorities must be non-negative with positive total mass.")
         eligible_priorities = {
-            length: torch.where(self.clip_lengths >= length, priorities, torch.zeros_like(priorities))
+            length: torch.where(self.clip_lengths > length, priorities, torch.zeros_like(priorities))
             for length in self.schema.window_lengths
         }
         if any(not torch.any(value > 0) for value in eligible_priorities.values()):
@@ -142,14 +143,14 @@ class ForwardBackwardExpertBuffer:
             self._eligible_priorities[length].copy_(values)
 
     def sample(self, batch_size: int, sequence_length: int) -> ForwardBackwardExpertBatch:
-        """Sample clips by priority and starts uniformly within each selected clip."""
+        """Sample edge-aligned state windows without crossing expert clips."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
         try:
             sequence_offsets = self._sequence_offsets[sequence_length]
         except KeyError as error:
             raise ValueError(f"Unsupported expert sequence length: {sequence_length}.") from error
-        num_starts = self.clip_lengths - sequence_length + 1
+        num_starts = self.clip_lengths - sequence_length
         clip_ids = torch.multinomial(
             self._eligible_priorities[sequence_length],
             batch_size,
@@ -163,7 +164,8 @@ class ForwardBackwardExpertBuffer:
         starts = self.clip_offsets[clip_ids] + start_offsets
         frame_indices = starts.unsqueeze(-1) + sequence_offsets
         return ForwardBackwardExpertBatch(
-            frames=self.frames[frame_indices],
+            observations=self.frames[frame_indices[:, :-1]],
+            next_observations=self.frames[frame_indices[:, 1:]],
             clip_ids=clip_ids,
             frame_indices=frame_indices,
         )

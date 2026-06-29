@@ -388,6 +388,20 @@ def test_rolling_expert_schedule_changes_only_assigned_context_segments() -> Non
     assert runner.alg._rollout_tracking_contexts.shape == (NUM_ENVS // 2, 4, 4)
 
 
+def test_rolling_expert_context_restarts_at_episode_reset() -> None:
+    """Tracking contexts should restart from reached-frame position zero after reset."""
+    runner = OffPolicyRunner(
+        ForwardBackwardDummyEnv(), _make_cfg(rollout_expert_fraction=0.5), log_dir=None, device="cpu"
+    )
+
+    _collect(runner, 2)
+    assert torch.all(runner.alg._rollout_tracking_positions == 2)
+    _collect(runner, 1)
+
+    assert torch.all(runner.alg._rollout_tracking_positions == 0)
+    assert runner.alg._rollout_tracking_env_ids.unique().numel() == NUM_ENVS // 2
+
+
 def test_collection_schedule_is_learner_exact_across_checkpoint() -> None:
     """Rollout contexts, expert assignments, and the next update should restore exactly."""
     expected = OffPolicyRunner(
@@ -403,6 +417,7 @@ def test_collection_schedule_is_learner_exact_across_checkpoint() -> None:
     torch.testing.assert_close(restored.alg.rollout_contexts, expected.alg.rollout_contexts)
     torch.testing.assert_close(restored.alg._rollout_tracking_env_ids, expected.alg._rollout_tracking_env_ids)
     torch.testing.assert_close(restored.alg._rollout_tracking_contexts, expected.alg._rollout_tracking_contexts)
+    torch.testing.assert_close(restored.alg._rollout_tracking_positions, expected.alg._rollout_tracking_positions)
     assert restored.alg.rollout_schedule_step == expected.alg.rollout_schedule_step
 
 
