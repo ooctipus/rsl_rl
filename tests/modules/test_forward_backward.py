@@ -21,6 +21,7 @@ from rsl_rl.modules.forward_backward import (
     discriminator_logistic_loss,
     ensemble_pessimistic,
     forward_backward_loss,
+    reward_context,
     reward_value_td_loss,
     soft_update,
     trajectory_context,
@@ -31,6 +32,34 @@ _VALUE_RTOL = 1.0e-10
 _VALUE_ATOL = 1.0e-12
 _GRAD_RTOL = 1.0e-9
 _GRAD_ATOL = 1.0e-11
+
+
+def test_reward_context_matches_weighted_integration_for_multiple_tasks() -> None:
+    """Reward inference should be the sampled reward integral against B."""
+    backward = torch.tensor(
+        [[1.0, 2.0, -1.0], [3.0, -2.0, 0.5], [-4.0, 1.0, 2.0]],
+        dtype=torch.float64,
+    )
+    rewards = torch.tensor([[2.0, -1.0], [0.5, 3.0], [-2.0, 4.0]], dtype=torch.float64)
+    weights = torch.tensor([[0.2, 0.5], [0.3, 0.25], [0.5, 0.25]], dtype=torch.float64)
+
+    actual = reward_context(backward, rewards, weights)
+    expected = torch.stack([
+        sum(weights[row, task] * rewards[row, task] * backward[row] for row in range(3)) for task in range(2)
+    ])
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_reward_context_preserves_one_reward_as_one_context_row() -> None:
+    """A scalar reward field should retain an explicit task dimension."""
+    backward = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    rewards = torch.tensor([1.0, -2.0, 0.5, 3.0])
+
+    actual = reward_context(backward, rewards)
+
+    assert actual.shape == (1, 3)
+    torch.testing.assert_close(actual[0], rewards @ backward)
 
 
 def _pessimistic_loop(

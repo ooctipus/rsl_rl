@@ -293,6 +293,40 @@ def discriminator_gradient_penalty(
     return (gradient_norm_squared.sqrt() - 1.0).square().mean()
 
 
+@torch.no_grad()
+def reward_context(
+    backward_features: torch.Tensor,
+    rewards: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Integrate backward features against one or more sampled rewards.
+
+    Args:
+        backward_features: Backward features, shape [samples, latent].
+        rewards: Sampled rewards, shape [samples] or [samples, tasks].
+        weights: Optional per-sample integration weights, with the same shape
+            as rewards or shape [samples].
+
+    Returns:
+        Unprojected reward contexts, shape [tasks, latent]. A one-dimensional
+        reward input produces one row.
+    """
+    if backward_features.ndim != 2 or backward_features.shape[0] < 1 or backward_features.shape[1] < 1:
+        raise ValueError("backward_features must have non-empty shape [samples, latent].")
+    if rewards.ndim == 1:
+        rewards = rewards.unsqueeze(-1)
+    if rewards.ndim != 2 or rewards.shape[0] != backward_features.shape[0] or rewards.shape[1] < 1:
+        raise ValueError("rewards must have shape [samples] or [samples, tasks].")
+    coefficients = rewards
+    if weights is not None:
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(-1)
+        if weights.shape not in (rewards.shape, (rewards.shape[0], 1)):
+            raise ValueError("weights must match rewards or contain one weight per sample.")
+        coefficients = rewards * weights
+    return coefficients.mT @ backward_features
+
+
 def trajectory_context(
     backward_features: torch.Tensor,
     *,

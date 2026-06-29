@@ -18,6 +18,7 @@ from typing import Literal, cast
 
 from rsl_rl.modules import MLP, EmpiricalNormalization, ExponentialNormalization, IdentityNormalization
 from rsl_rl.modules.distribution import Distribution
+from rsl_rl.modules.forward_backward import reward_context
 from rsl_rl.modules.mlp import MLPBlock, MLPEnsembleLinear
 from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec, get_forward_backward_schema_hash
 from rsl_rl.utils import resolve_callable
@@ -589,6 +590,25 @@ class ForwardBackwardModel(torch.nn.Module):
             generator=generator,
         )
         return self.context_project(context)
+
+    def context_infer_reward(
+        self,
+        backward_features: torch.Tensor,
+        rewards: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Infer projected contexts from sampled rewards and backward features.
+
+        Args:
+            backward_features: Backward features, shape [samples, latent].
+            rewards: Sampled rewards, shape [samples] or [samples, tasks].
+            weights: Optional integration weights matching rewards or
+                containing one value per sample.
+
+        Returns:
+            Projected reward contexts, shape [tasks, latent].
+        """
+        return self.context_project(reward_context(backward_features, rewards, weights))
 
     def actor_distribution(
         self,

@@ -551,6 +551,21 @@ def test_context_projection_uses_sqrt_dimension_radius() -> None:
     torch.testing.assert_close(context.norm(dim=-1), torch.full((7,), 2.0))
 
 
+def test_reward_context_inference_uses_shared_integration_and_projection() -> None:
+    """Model reward inference should add only configured context geometry."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    model = _make_model(observations, META_ROUTES)
+    backward = torch.randn(7, 4)
+    rewards = torch.randn(7, 2)
+    weights = torch.softmax(10.0 * rewards, dim=0)
+
+    actual = model.context_infer_reward(backward, rewards, weights)
+    expected = model.context_project((rewards * weights).mT @ backward)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual.norm(dim=-1), torch.full((2,), 2.0))
+
+
 def test_model_from_config_is_shared_by_training_and_inference() -> None:
     """The ordinary model config should construct the same inference topology without a learner."""
     observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
