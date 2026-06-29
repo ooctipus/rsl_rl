@@ -186,7 +186,7 @@ class ForwardBackward:
         optimizer: str = "adam",
         weight_decay: float = 0.0,
         discriminator_weight_decay: float = 0.0,
-        fb_pessimism: float = 0.5,
+        fb_pessimism: float = 0.0,
         actor_pessimism: float = 0.5,
         orthogonality_coefficient: float = 1.0,
         implied_value_coefficient: float = 0.0,

@@ -280,6 +280,11 @@ def _make_learner(
     )
 
 
+def test_vanilla_fb_default_uses_the_ensemble_mean_target() -> None:
+    """The base FB algorithm should not add pessimism absent an explicit choice."""
+    assert _make_learner().fb_pessimism == 0.0
+
+
 def test_algorithm_constructor_rejects_unknown_config_fields() -> None:
     """An algorithm typo should fail through Python's explicit constructor semantics."""
     with pytest.raises(TypeError, match="learnig_rate"):

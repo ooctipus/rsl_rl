@@ -270,13 +270,17 @@ class ClippedGaussianDistribution(GaussianDistribution):
         output_dim: int,
         init_std: float = 0.2,
         action_range: tuple[float, float] = (-1.0, 1.0),
+        noise_clip: float | None = None,
         eps: float = 1e-6,
     ) -> None:
         """Initialize a bounded direct-Q action distribution."""
         if action_range[0] >= action_range[1]:
             raise ValueError("action_range must be ordered from low to high.")
+        if noise_clip is not None and noise_clip <= 0.0:
+            raise ValueError("noise_clip must be positive or None.")
         super().__init__(output_dim, init_std=init_std, learn_std=False)
         self.action_range = action_range
+        self.noise_clip = noise_clip
         self.eps = eps
         self._center = 0.5 * (action_range[0] + action_range[1])
         self._half_range = 0.5 * (action_range[1] - action_range[0])
@@ -290,13 +294,19 @@ class ClippedGaussianDistribution(GaussianDistribution):
         clipped = action.clamp(self.action_range[0] + self.eps, self.action_range[1] - self.eps)
         return action - action.detach() + clipped.detach()
 
+    def _clip_noise(self, action: torch.Tensor) -> torch.Tensor:
+        if self.noise_clip is None:
+            return action
+        noise = action - self.mean
+        return self.mean + noise.clamp(-self.noise_clip, self.noise_clip)
+
     def sample(self) -> torch.Tensor:
         """Draw a bounded non-pathwise sample."""
-        return self._clip(super().sample())
+        return self._clip(self._clip_noise(super().sample()))
 
     def rsample(self) -> torch.Tensor:
         """Draw a bounded pathwise sample for direct-Q optimization."""
-        return self._clip(super().rsample())
+        return self._clip(self._clip_noise(super().rsample()))
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the bounded Gaussian mean."""

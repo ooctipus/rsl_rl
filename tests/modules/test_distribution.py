@@ -360,6 +360,23 @@ class TestPathwiseDistributions:
         assert output.grad is not None
         assert torch.count_nonzero(output.grad).item() > 0
 
+    def test_clipped_gaussian_can_match_reference_noise_truncation(self) -> None:
+        """Direct-Q anchors should bound exploration noise before bounding actions."""
+        distribution = ClippedGaussianDistribution(output_dim=2, init_std=10.0, noise_clip=0.3)
+        output = torch.zeros(64, 2, requires_grad=True)
+        distribution.update(output)
+
+        sample = distribution.sample()
+        action = distribution.rsample()
+
+        assert torch.all(sample.abs() <= 0.3)
+        assert torch.all(action.abs() <= 0.3)
+        action.sum().backward()
+        torch.testing.assert_close(output.grad, torch.ones_like(output))
+
+        with pytest.raises(ValueError, match="positive or None"):
+            ClippedGaussianDistribution(output_dim=2, noise_clip=0.0)
+
     def test_clipped_gaussian_refuses_inexact_ppo_density(self) -> None:
         """Clipped exploration must never masquerade as an exact PPO density."""
         distribution = ClippedGaussianDistribution(output_dim=2)

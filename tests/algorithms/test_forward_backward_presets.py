@@ -38,7 +38,9 @@ def test_metamotivo_preset_freezes_humenv_reference_choices() -> None:
     assert cfg["model"]["normalization_type"] == "exponential"
     assert cfg["model"]["normalization_eps"] == 1e-5
     assert cfg["model"]["normalization_momentum"] == 0.01
+    assert cfg["model"]["distribution_cfg"]["noise_clip"] == 0.3
     assert cfg["algorithm"]["batch_size"] == 1024
+    assert cfg["algorithm"]["fb_pessimism"] == 0.0
     assert cfg["algorithm"]["expert_sequence_length"] == 8
     assert cfg["algorithm"]["context_goal_fraction"] == 0.2
     assert cfg["algorithm"]["context_expert_fraction"] == 0.6
@@ -60,7 +62,9 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
     assert cfg["model"]["normalization_type"] == "exponential"
     assert cfg["model"]["normalization_eps"] == 1e-5
     assert cfg["model"]["normalization_momentum"] == 0.01
+    assert cfg["model"]["distribution_cfg"]["noise_clip"] == 0.3
     assert cfg["replay"]["capacity_steps"] == 5_000
+    assert cfg["algorithm"]["fb_pessimism"] == 0.0
     assert cfg["replay"]["history_layout"]["history_length"] == 4
     assert cfg["algorithm"]["rollout_expert_fraction"] == 0.5
     assert cfg["algorithm"]["rollout_expert_steps"] == 250
