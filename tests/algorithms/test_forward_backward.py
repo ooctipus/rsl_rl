@@ -349,7 +349,7 @@ def test_scalar_auxiliary_composes_channels_before_value_propagation() -> None:
 
     assert values.shape == (2, 4, 1)
     torch.testing.assert_close(learner._value_actor_coefficients["auxiliary"], torch.ones(1))
-    assert torch.isfinite(torch.tensor(learner.update()["value/auxiliary/loss"]))
+    assert torch.isfinite(learner.update()["value/auxiliary/loss"])
 
 
 def _parameter_snapshot(module: torch.nn.Module) -> tuple[torch.Tensor, ...]:
@@ -437,6 +437,7 @@ def test_one_update_mutates_every_declared_owner_and_no_actor_evaluator_grads() 
 
     metrics = learner.update()
 
+    assert all(value.ndim == 0 and not value.requires_grad for value in metrics.values())
     assert {
         "discriminator/loss",
         "fb/loss",

@@ -394,6 +394,16 @@ def test_collection_schedule_is_learner_exact_across_checkpoint() -> None:
     assert restored.alg.rollout_schedule_step == expected.alg.rollout_schedule_step
 
 
+def test_runner_materializes_mean_metrics_at_logging_boundary() -> None:
+    """Repeated device metrics should become ordinary logging scalars only after averaging."""
+    metrics = [
+        {"loss": torch.tensor(1.0), "value": torch.tensor(3.0)},
+        {"loss": torch.tensor(3.0), "value": torch.tensor(7.0)},
+    ]
+
+    assert OffPolicyRunner._mean_metrics(metrics) == {"loss": 2.0, "value": 5.0}
+
+
 def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
     """A restorable env should resume at the same collection boundary as its learner."""
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")

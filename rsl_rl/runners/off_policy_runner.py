@@ -80,7 +80,7 @@ class OffPolicyRunner(OnPolicyRunner):
             collect_time = time.time() - start
 
             start = time.time()
-            metrics: list[dict[str, float]] = []
+            metrics: list[dict[str, torch.Tensor]] = []
             seed_phase_complete = not self.random_action_steps or iteration_start_transitions > self.random_action_steps
             if self.alg.ready_to_update and seed_phase_complete:
                 self.alg.validate_collection()
@@ -150,11 +150,13 @@ class OffPolicyRunner(OnPolicyRunner):
         return loaded_dict["infos"]
 
     @staticmethod
-    def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
-        """Average repeated-update metrics without imposing a logging schema."""
+    def _mean_metrics(metrics: list[dict[str, torch.Tensor]]) -> dict[str, float]:
+        """Average GPU metrics and materialize them at one logging boundary."""
         if not metrics:
             return {}
-        names = metrics[0].keys()
-        if any(sample.keys() != names for sample in metrics[1:]):
+        names = tuple(metrics[0])
+        if any(tuple(sample) != names for sample in metrics[1:]):
             raise RuntimeError("Off-policy updates returned inconsistent metric keys.")
-        return {name: sum(sample[name] for sample in metrics) / len(metrics) for name in names}
+        values = torch.stack(tuple(sample[name] for sample in metrics for name in names)).view(len(metrics), len(names))
+        means = values.mean(dim=0).tolist()
+        return dict(zip(names, means))

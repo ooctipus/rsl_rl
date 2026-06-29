@@ -601,7 +601,7 @@ class ForwardBackward:
         self.rollout_schedule_step = next_step
         return changed.unsqueeze(-1) & action_applied
 
-    def update(self) -> dict[str, float]:
+    def update(self) -> dict[str, torch.Tensor]:
         """Run one visible off-policy mutation sequence."""
         if self._update_in_progress:
             raise RuntimeError("A forward-backward update is already in progress.")
@@ -661,8 +661,8 @@ class ForwardBackward:
             self._update_in_progress = False
 
         metric_names = tuple(metrics)
-        metric_values = torch.stack(tuple(metrics[name].detach() for name in metric_names)).tolist()
-        return dict(zip(metric_names, metric_values))
+        metric_values = torch.stack(tuple(metrics[name].detach() for name in metric_names))
+        return dict(zip(metric_names, metric_values.unbind()))
 
     def _make_expert_observations(self, frames: torch.Tensor) -> TensorDict:
         chunks = torch.split(frames, self._expert_field_widths, dim=-1)
