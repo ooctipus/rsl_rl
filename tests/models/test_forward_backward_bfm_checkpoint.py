@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import sys
 import torch
+from collections.abc import Mapping
 from pathlib import Path
 from tensordict import TensorDict
 from typing import Protocol
@@ -133,11 +135,33 @@ def _gradient_hash(named_gradients: list[tuple[str, torch.Tensor]]) -> str:
     return digest.hexdigest()
 
 
+def _gradient_hash_provenance() -> dict[str, object]:
+    """Return the execution identity required for byte-exact gradient hashes."""
+    return {
+        "policy": "named-autograd-grad-v1",
+        "node": platform.node(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_config_sha256": hashlib.sha256(torch.__config__.show().encode()).hexdigest(),
+        "num_threads": torch.get_num_threads(),
+        "num_interop_threads": torch.get_num_interop_threads(),
+        "mkldnn_enabled": torch.backends.mkldnn.enabled,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+    }
+
+
+def _gradient_hash_is_comparable(runtime: Mapping[str, object]) -> bool:
+    """Return whether an oracle hash was produced by this exact execution identity."""
+    return runtime.get("gradient_hash_provenance") == _gradient_hash_provenance()
+
+
 def _assert_gradient_parity(
     source: list[tuple[str, torch.Tensor]],
     clean: list[tuple[str, torch.Tensor]],
     summary: dict[str, float | int | str],
-    runtime_torch: str,
+    runtime: Mapping[str, object],
 ) -> None:
     source_by_name = dict(source)
     clean_by_name = dict(clean)
@@ -162,9 +186,31 @@ def _assert_gradient_parity(
     assert max_abs == pytest.approx(summary["max_abs"], rel=5e-5, abs=5e-6)
     assert dot / (clean_squared * squared_norm) ** 0.5 >= 0.99999
     assert (squared_error / squared_norm) ** 0.5 <= 1e-4
-    if _DEVICE.type == "cpu" and torch.__version__ == runtime_torch:
+    if _DEVICE.type == "cpu" and _gradient_hash_is_comparable(runtime):
         assert _gradient_hash(source) == summary["sha256"]
         assert _gradient_hash(clean) == summary["sha256"]
+
+
+def test_frozen_gradient_hash_requires_matching_runtime_provenance() -> None:
+    """A Torch version alone or a different host must not enable byte-exact checks."""
+    gradients = [("weight", torch.ones(1))]
+    summary: dict[str, float | int | str] = {
+        "l2": 1.0,
+        "max_abs": 1.0,
+        "numel": 1,
+        "sha256": "deliberately-not-the-gradient-hash",
+    }
+    provenance = _gradient_hash_provenance()
+
+    _assert_gradient_parity(gradients, gradients, summary, {"torch": torch.__version__})
+    _assert_gradient_parity(
+        gradients,
+        gradients,
+        summary,
+        {"gradient_hash_provenance": provenance | {"node": f"{provenance['node']}-different"}},
+    )
+    with pytest.raises(AssertionError):
+        _assert_gradient_parity(gradients, gradients, summary, {"gradient_hash_provenance": provenance})
 
 
 def _clean_named_gradients(
@@ -262,7 +308,7 @@ def test_bfm_actor_discriminator_gradients_and_fresh_adam_match_reference() -> N
             source_actor_named,
             clean_actor_named,
             manifest["gradient_summaries"]["actor"],
-            manifest["runtime"]["torch"],
+            manifest["runtime"],
         )
 
         source_expert_logits = source_discriminator.compute_logits(dict(expert_observations.items()), expert_contexts)
@@ -320,7 +366,7 @@ def test_bfm_actor_discriminator_gradients_and_fresh_adam_match_reference() -> N
             source_discriminator_named,
             clean_discriminator_named,
             discriminator_summary,
-            manifest["runtime"]["torch"],
+            manifest["runtime"],
         )
 
         source_actor_optimizer = torch.optim.Adam(source_actor.parameters(), lr=3e-4)
