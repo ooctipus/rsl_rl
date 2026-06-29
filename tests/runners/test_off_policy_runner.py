@@ -211,6 +211,30 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
     }
 
 
+class ObservedOffPolicyRunner(OffPolicyRunner):
+    """Record the exact runner-loop boundaries exposed to specialized subclasses."""
+
+    boundary_events: list[tuple]
+
+    def _observe_iteration_start(self, iteration: int, start_transitions: int) -> None:
+        """Record the boundary immediately before collection."""
+        self.boundary_events.append(("start", iteration, start_transitions))
+
+    def _observe_iteration_learning_complete(self, iteration: int, end_transitions: int) -> None:
+        """Record the boundary after updates and before metric materialization."""
+        self.boundary_events.append(("learning_complete", iteration, end_transitions))
+
+    def _observe_iteration_complete(
+        self,
+        iteration: int,
+        end_transitions: int,
+        collect_time: float,
+        learn_time: float,
+    ) -> None:
+        """Record existing decomposition timers before logging and checkpointing."""
+        self.boundary_events.append(("complete", iteration, end_transitions, collect_time, learn_time))
+
+
 def _collect(runner: OffPolicyRunner, steps: int) -> None:
     """Collect a fixed number of transitions without invoking the runner loop."""
     obs = runner.env.get_observations()
@@ -448,3 +472,93 @@ def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
     assert runner.current_learning_iteration == 7
     assert runner.collected_transitions == 0
     torch.testing.assert_close(runner.env.state, expected_state)
+
+
+def test_runner_exposes_exact_iteration_boundaries() -> None:
+    """Hooks should bracket unchanged collection/update work and precede logging."""
+    runner = ObservedOffPolicyRunner(
+        ForwardBackwardDummyEnv(),
+        _make_cfg(),
+        log_dir=None,
+        device="cpu",
+    )
+    runner.boundary_events = []
+    act = runner.alg.act
+    mean_metrics = runner._mean_metrics
+
+    def record_act(obs: TensorDict) -> torch.Tensor:
+        runner.boundary_events.append(("act", runner.collected_transitions))
+        return act(obs)
+
+    def record_update() -> dict[str, torch.Tensor]:
+        runner.boundary_events.append(("update", runner.collected_transitions))
+        return {"loss": torch.tensor(1.0)}
+
+    def record_mean_metrics(metrics: list[dict[str, torch.Tensor]]) -> dict[str, float]:
+        runner.boundary_events.append(("mean_metrics", runner.collected_transitions))
+        return mean_metrics(metrics)
+
+    def record_log(**kwargs: object) -> None:
+        runner.boundary_events.append(("log", kwargs["it"], runner.collected_transitions))
+
+    runner.alg.act = record_act
+    runner.alg.update = record_update
+    runner._mean_metrics = record_mean_metrics
+    runner.logger.log = record_log
+
+    runner.learn(1)
+
+    assert [event[0] for event in runner.boundary_events] == [
+        "start",
+        "act",
+        "act",
+        "update",
+        "learning_complete",
+        "mean_metrics",
+        "complete",
+        "log",
+    ]
+    assert runner.boundary_events[0] == ("start", 0, 0)
+    assert runner.boundary_events[4] == ("learning_complete", 0, 2 * NUM_ENVS)
+    complete = runner.boundary_events[6]
+    assert complete[:3] == ("complete", 0, 2 * NUM_ENVS)
+    assert complete[3] >= 0.0
+    assert complete[4] >= 0.0
+
+
+def test_default_iteration_observer_is_state_and_rng_inert() -> None:
+    """The default hooks should not mutate runner state or any owned RNG stream."""
+    runner = OffPolicyRunner(
+        ForwardBackwardDummyEnv(),
+        _make_cfg(),
+        log_dir=None,
+        device="cpu",
+    )
+    torch_rng = torch.get_rng_state().clone()
+    owned_rngs = tuple(
+        generator.get_state().clone()
+        for generator in (
+            runner.alg.generator,
+            runner.alg.behavior_generator,
+            runner.alg.replay.generator,
+            runner.alg.expert.generator,
+        )
+    )
+    state = (runner.current_learning_iteration, runner.collected_transitions)
+
+    runner._observe_iteration_start(0, 0)
+    runner._observe_iteration_learning_complete(0, 2 * NUM_ENVS)
+    runner._observe_iteration_complete(0, 2 * NUM_ENVS, 0.1, 0.2)
+
+    assert torch.equal(torch.get_rng_state(), torch_rng)
+    for generator, expected in zip(
+        (
+            runner.alg.generator,
+            runner.alg.behavior_generator,
+            runner.alg.replay.generator,
+            runner.alg.expert.generator,
+        ),
+        owned_rngs,
+    ):
+        assert torch.equal(generator.get_state(), expected)
+    assert (runner.current_learning_iteration, runner.collected_transitions) == state

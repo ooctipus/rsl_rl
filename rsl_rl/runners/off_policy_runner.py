@@ -45,6 +45,38 @@ class OffPolicyRunner(OnPolicyRunner):
             raise TypeError("random_action_steps requires an algorithm with act_random().")
         self.collected_transitions = 0
 
+    def _observe_iteration_start(self, iteration: int, start_transitions: int) -> None:
+        """Observe the exact boundary immediately before one collection block.
+
+        Args:
+            iteration: Zero-based runner iteration.
+            start_transitions: Environment transitions collected before this iteration.
+        """
+
+    def _observe_iteration_learning_complete(self, iteration: int, end_transitions: int) -> None:
+        """Observe the exact boundary after updates and before metric materialization.
+
+        Args:
+            iteration: Zero-based runner iteration.
+            end_transitions: Environment transitions collected through this iteration.
+        """
+
+    def _observe_iteration_complete(
+        self,
+        iteration: int,
+        end_transitions: int,
+        collect_time: float,
+        learn_time: float,
+    ) -> None:
+        """Observe existing decomposition timers before logging and checkpointing.
+
+        Args:
+            iteration: Zero-based runner iteration.
+            end_transitions: Environment transitions collected through this iteration.
+            collect_time: Collection wall time [s].
+            learn_time: Update and metric-materialization wall time [s].
+        """
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Alternate fixed-size collection blocks with zero or more updates."""
         if init_at_random_ep_len:
@@ -63,6 +95,7 @@ class OffPolicyRunner(OnPolicyRunner):
         last_saved_iteration: int | None = None
         for it in range(start_it, total_it):
             iteration_start_transitions = self.collected_transitions
+            self._observe_iteration_start(it, iteration_start_transitions)
             start = time.time()
             with torch.no_grad():
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -85,9 +118,11 @@ class OffPolicyRunner(OnPolicyRunner):
             if self.alg.ready_to_update and seed_phase_complete:
                 self.alg.validate_collection()
                 metrics = [self.alg.update() for _ in range(self.num_updates_per_iteration)]
+            self._observe_iteration_learning_complete(it, self.collected_transitions)
             loss_dict = self._mean_metrics(metrics)
             learn_time = time.time() - start
             self.current_learning_iteration = it + 1
+            self._observe_iteration_complete(it, self.collected_transitions, collect_time, learn_time)
 
             self.logger.log(
                 it=it,
