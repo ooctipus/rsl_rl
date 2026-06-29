@@ -64,7 +64,7 @@ class OffPolicyRunner(OnPolicyRunner):
         for it in range(start_it, total_it):
             iteration_start_transitions = self.collected_transitions
             start = time.time()
-            with torch.inference_mode():
+            with torch.no_grad():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     if self.collected_transitions < self.random_action_steps:
                         actions = self.alg.act_random(obs)

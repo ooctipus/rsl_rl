@@ -36,6 +36,7 @@ class ForwardBackwardDummyEnv(VecEnv):
         self.cfg = {}
         self.provide_final = provide_final
         self.state = torch.zeros(NUM_ENVS, STATE_DIM)
+        self.last_actions = torch.zeros(NUM_ENVS, ACTION_DIM)
 
     def get_observations(self) -> TensorDict:
         """Return the current emitted state."""
@@ -43,7 +44,7 @@ class ForwardBackwardDummyEnv(VecEnv):
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         """Advance every row and reset completed rows in the returned observation."""
-        del actions
+        self.last_actions = actions
         reached = self.state + 1.0
         self.episode_length_buf += 1
         dones = self.episode_length_buf == self.max_episode_length
@@ -232,6 +233,17 @@ def test_runner_constructs_collects_and_updates_through_public_lifecycle() -> No
         not torch.equal(actor_before[name], value)
         for name, value in runner.alg.model.actor_network.state_dict().items()
     )
+
+
+def test_collection_does_not_leak_inference_tensors_into_environment_state() -> None:
+    """State retained by an environment should remain mutable outside collection."""
+    env = ForwardBackwardDummyEnv()
+    runner = OffPolicyRunner(env, _make_cfg(), log_dir=None, device="cpu")
+
+    runner.learn(1)
+
+    assert not torch.is_inference(env.last_actions)
+    env.last_actions.zero_()
 
 
 def test_runner_uses_random_seed_phase_and_delays_updates_one_iteration() -> None:
