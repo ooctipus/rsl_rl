@@ -166,7 +166,9 @@ class PPO:
             # z-conditioned actor + value share ONE detached goal embedding z = B(current goal); the actor reads
             # the goal only through z (its obs is goal-free), and the value is V = <F(s, z), z>. The per-env
             # commanded task index is stored so the update recomputes the SAME z with the still-training B.
-            cmd_indices = self.successor.cmd_indices_fn() if self.successor.cmd_indices_fn is not None else None
+            if self.successor.cmd_indices_fn is None:
+                raise RuntimeError("Successor goal indices must be bound before acting.")
+            cmd_indices = self.successor.cmd_indices_fn().clone()
             self.transition.command_indices = cmd_indices
             z = self.successor.goal_z(self.critic, cmd_indices)
             self.transition.actions = self.actor(obs, z, stochastic_output=True).detach()
@@ -616,13 +618,7 @@ class PPO:
         # ``copy.deepcopy`` of a ``torch.compile`` OptimizedModule is fragile.
         if alg.successor is not None:
             alg.successor.build(alg._raw_critic)
-            # Bind the goal library for the z-conditioned value V = <F(s, z), z>, z = B(goal_cache[cmd_indices]).
-            # The command term named by ``successor_cfg.goal_command_name`` (a StateCommand) builds the per-task
-            # target-obs cache once (a teleport-to-target sweep, restored after) and exposes the per-env task
-            # index. Single deterministic lookup -- no discovery scan, no fallback: a wrong/missing name or a
-            # term lacking ``get_target_obs_cache`` fails loudly here at the boundary.
-            term = env.unwrapped.command_manager.get_term(alg.successor.goal_command_name)
-            alg.successor.bind_goals(term.get_target_obs_cache(), lambda: term.cmd_indices)
+            alg.successor.bind(env)
 
         # Bind the value-shift cache/buffers (owned by an external consumer) onto the extension
         if alg.value_shift is not None:

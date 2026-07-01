@@ -37,12 +37,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 import warnings
+from tensordict import TensorDict
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from tensordict import TensorDict
 
+    from rsl_rl.env import VecEnv
     from rsl_rl.models import MLPModel
 
 
@@ -61,15 +62,15 @@ class SuccessorFeatures(nn.Module):
         train_goal_ratio: Fraction of the FB ``z`` drawn from goal embeddings ``project_z(B(s')[perm])``; the
             remaining ``1 - ratio`` are uniform on the ``sqrt(d)`` sphere. The random-sphere half is what bounds
             ``F`` across the latent space (Meta-Motivo ``train_goal_ratio``, default ``0.5``).
-        goal_command_name: Name of the command-manager term (a ``StateCommand``) exposing the per-task target
-            observation cache via ``get_target_obs_cache()`` and the per-env ``cmd_indices``; bound once at
-            construction. Must match the env's command term (default ``"goal_point"`` for the position task).
+        goal_command_name: Deprecated command-manager lookup used when explicit goal bindings are absent.
         fb_batch_size: Cap on the forward-backward batch-matrix size (Meta-Motivo trains FB at 1024). If the
             PPO minibatch is larger, the FB loss subsamples to this many states; otherwise it's a no-op.
         target_tau: Polyak rate for the forward-backward target network, applied PER GRADIENT STEP. The PPO
             update calls :meth:`update_target` once per minibatch (= one gradient step), so this matches
             Meta-Motivo's per-step ``fb_target_tau`` (default ``0.01``).
         device: Torch device.
+        goal_observation_bind: Expression resolving to the immutable per-task goal-observation cache.
+        goal_indices_bind: Expression resolving to the stable per-environment goal-row tensor.
     """
 
     def __init__(
@@ -83,6 +84,8 @@ class SuccessorFeatures(nn.Module):
         fb_batch_size: int = 1024,
         target_tau: float = 0.01,
         device: str = "cpu",
+        goal_observation_bind: str | None = None,
+        goal_indices_bind: str | None = None,
     ) -> None:
         """Store hyperparameters; the forward-backward target network is built later in :meth:`build`."""
         warnings.warn(
@@ -101,6 +104,8 @@ class SuccessorFeatures(nn.Module):
         self.ortho_coef = ortho_coef
         self.train_goal_ratio = train_goal_ratio
         self.goal_command_name = goal_command_name
+        self.goal_observation_bind = goal_observation_bind
+        self.goal_indices_bind = goal_indices_bind
         self.fb_batch_size = fb_batch_size
         self.target_tau = target_tau
         self._device = device
@@ -108,10 +113,44 @@ class SuccessorFeatures(nn.Module):
         # the reward-free F. There are no learnable parameters here -- F/B live on the critic model.
         self.target_critic: MLPModel | None = None  # frozen Polyak copy for the FB bootstrap
         # z-conditioned VALUE goal: the per-task target observation library (raw obs at each goal, delta-0) and a
-        # callable returning the current per-env task index. Bound (REQUIRED) at ``construct_algorithm`` via
-        # :meth:`bind_goals`; the value and actor read it directly, with no fallback.
+        # callable returning the current per-env task index. Bound at ``construct_algorithm`` via :meth:`bind`.
+        # Explicit expressions are preferred; the command lookup remains only as a deprecated boundary.
         self.goal_cache: TensorDict | None = None
-        self.cmd_indices_fn = None
+        self.cmd_indices_fn: Callable[[], torch.Tensor] | None = None
+
+    def bind(self, env: VecEnv) -> None:
+        """Bind goal data from expressions or the deprecated command lookup.
+
+        Args:
+            env: Vectorized environment used to evaluate the configured expressions.
+        """
+        observation_bind = self.goal_observation_bind
+        indices_bind = self.goal_indices_bind
+        if (observation_bind is None) != (indices_bind is None):
+            raise ValueError("goal_observation_bind and goal_indices_bind must be configured together.")
+        if observation_bind is not None and indices_bind is not None:
+            namespace = {"env": env}
+            goal_cache = eval(observation_bind, namespace)
+            goal_indices = eval(indices_bind, namespace)
+            if not isinstance(goal_indices, torch.Tensor):
+                raise TypeError("goal_indices_bind must resolve to a torch.Tensor.")
+            if goal_indices.ndim != 1 or goal_indices.shape[0] != env.num_envs:
+                raise ValueError(
+                    "goal_indices_bind must resolve to one index per environment; "
+                    f"got shape {tuple(goal_indices.shape)} for {env.num_envs} environments."
+                )
+            if goal_indices.dtype != torch.long:
+                raise TypeError(f"goal_indices_bind must resolve to torch.long indices; got {goal_indices.dtype}.")
+            self.bind_goals(goal_cache, lambda: goal_indices)
+            return
+
+        warnings.warn(
+            "goal_command_name lookup is deprecated; configure goal_observation_bind and goal_indices_bind.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        term = env.unwrapped.command_manager.get_term(self.goal_command_name)
+        self.bind_goals(term.get_target_obs_cache(), lambda: term.cmd_indices)
 
     def build(self, critic: MLPModel) -> None:
         """Create the frozen forward-backward target network (a Polyak copy of the critic)."""
@@ -128,6 +167,8 @@ class SuccessorFeatures(nn.Module):
             cmd_indices_fn: Zero-arg callable returning the current ``[num_envs]`` per-env task index (which goal
                 each env is commanded to reach), read at rollout time and stored per transition.
         """
+        if not isinstance(goal_cache, TensorDict) or len(goal_cache.batch_size) == 0 or goal_cache.batch_size[0] < 1:
+            raise TypeError("Goal observations must be a non-empty TensorDict with a leading task dimension.")
         self.goal_cache = goal_cache.to(self._device)
         self.cmd_indices_fn = cmd_indices_fn
 
