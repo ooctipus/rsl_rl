@@ -143,18 +143,24 @@ class OnPolicyRunner:
         self.logger.save_model(path, self.current_learning_iteration)
 
     def load(
-        self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None
+        self,
+        path: str,
+        load_cfg: dict | None = None,
+        strict: bool = True,
+        map_location: str | None = None,
+        mmap: bool | None = None,
     ) -> dict:
         """Load the models and training state from a given path.
 
         Args:
-            path (str): Path to load the model from.
-            load_cfg (dict | None): Optional dictionary that defines what models and states to load. If None, all
-                models and states are loaded.
-            strict (bool): Whether state_dict loading should be strict.
-            map_location (str | None): Device mapping for loading the model.
+            path: Path to load the model from.
+            load_cfg: Optional dictionary that defines what models and states to load. If None, all models and states
+                are loaded.
+            strict: Whether state-dictionary loading should be strict.
+            map_location: Device mapping for loading the model.
+            mmap: Whether :func:`torch.load` should memory-map checkpoint tensor storage.
         """
-        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location, mmap=mmap)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]

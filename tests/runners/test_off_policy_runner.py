@@ -13,10 +13,14 @@ import torch
 from pathlib import Path
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.env import VecEnv
-from rsl_rl.models.forward_backward_model import ForwardBackwardObservationSchema
+from rsl_rl.models.forward_backward_model import ForwardBackwardModel, ForwardBackwardObservationSchema
+from rsl_rl.runners.lifecycle import RunnerLifecycleExtension
 from rsl_rl.runners.off_policy_runner import OffPolicyRunner
 from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
+from rsl_rl.storage.forward_backward_replay import ForwardBackwardReplay
 
 NUM_ENVS = 4
 STATE_DIM = 6
@@ -75,6 +79,39 @@ class ForwardBackwardDummyEnv(VecEnv):
         self.episode_length_buf.copy_(state["episode_length_buf"])
 
 
+class RecordingLifecycleExtension(RunnerLifecycleExtension):
+    """Record exact events and return deterministic reset observations."""
+
+    def __init__(
+        self,
+        env: VecEnv,
+        algorithm: object,
+        log_dir: str | None,
+        device: str,
+    ) -> None:
+        """Initialize the base resources and empty event history."""
+        super().__init__(env, algorithm, log_dir, device)
+        self.transitions: list[int] = []
+
+    def on_transition(self, transition: int) -> TensorDict:
+        """Record one event, reset the fixture, and return its observations."""
+        self.transitions.append(transition)
+        self.env.state.fill_(float(transition))
+        self.env.episode_length_buf.zero_()
+        return self.env.get_observations()
+
+    def state_dict(self) -> dict[str, object]:
+        """Return the exact recorded event history."""
+        return {"transitions": tuple(self.transitions)}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore the exact recorded event history."""
+        transitions = state["transitions"]
+        if not isinstance(transitions, tuple) or not all(isinstance(value, int) for value in transitions):
+            raise TypeError("Lifecycle transition state must be a tuple of integers.")
+        self.transitions = list(transitions)
+
+
 def _expert_provider(
     env: VecEnv,
     observation_schema: ForwardBackwardObservationSchema,
@@ -99,7 +136,7 @@ def _expert_provider(
         num_clips=2,
         window_lengths=window_lengths,
     )
-    return ForwardBackwardExpertBuffer(frames, offsets, priorities, schema, seed=17)
+    return ForwardBackwardExpertBuffer(frames, offsets, priorities, schema, seed=17, clip_ids=("clip_0", "clip_1"))
 
 
 def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int = 0) -> dict:
@@ -153,7 +190,7 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_steps": 8,
+            "capacity_transitions": 8 * NUM_ENVS,
             "terminal_capacity_per_env": 4,
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
@@ -211,6 +248,15 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
     }
 
 
+def _make_lifecycle_cfg(transition_interval: int = 2 * NUM_ENVS) -> dict:
+    cfg = _make_cfg()
+    cfg["lifecycle_extension"] = {
+        "class_name": RecordingLifecycleExtension,
+        "transition_interval": transition_interval,
+    }
+    return cfg
+
+
 class ObservedOffPolicyRunner(OffPolicyRunner):
     """Record the exact runner-loop boundaries exposed to specialized subclasses."""
 
@@ -259,6 +305,116 @@ def test_runner_constructs_collects_and_updates_through_public_lifecycle() -> No
     )
 
 
+def test_constructor_derives_time_major_rows_from_transition_capacity() -> None:
+    """High-level capacity should count transitions while replay stores vector steps."""
+    cfg = _make_cfg()
+    assert "capacity_steps" not in cfg["replay"]
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+
+    assert runner.alg.replay.capacity_steps == 8
+    assert runner.alg.replay.capacity_steps * runner.env.num_envs == 8 * NUM_ENVS
+
+
+@pytest.mark.parametrize("capacity_transitions", (False, 0, -1, 32.0, 8 * NUM_ENVS - 1))
+def test_constructor_rejects_invalid_transition_capacity(
+    capacity_transitions: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid transition counts should fail before replay storage is allocated."""
+    cfg = _make_cfg()
+    cfg["replay"]["capacity_transitions"] = capacity_transitions
+    monkeypatch.setattr(
+        ForwardBackwardReplay, "__init__", lambda *_args, **_kwargs: pytest.fail("replay storage was allocated")
+    )
+    monkeypatch.setattr(
+        ForwardBackwardModel,
+        "from_config",
+        classmethod(lambda *_args, **_kwargs: pytest.fail("model storage was allocated")),
+    )
+
+    with pytest.raises(ValueError, match="capacity_transitions"):
+        OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+
+
+def test_lifecycle_extension_runs_at_zero_each_interval_and_final() -> None:
+    """Lifecycle work should use completed transitions independently of save hooks."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
+    acted_from: list[torch.Tensor] = []
+    original_act = runner.alg.act
+
+    def record_act(observations: TensorDict) -> torch.Tensor:
+        """Record collection input before delegating to the real algorithm."""
+        acted_from.append(observations["state"].clone())
+        return original_act(observations)
+
+    runner.alg.act = record_act
+    runner.learn(2)
+
+    extension = runner.lifecycle_extension
+    assert isinstance(extension, RecordingLifecycleExtension)
+    assert extension.transitions == [0, 2 * NUM_ENVS, 4 * NUM_ENVS]
+    assert runner._lifecycle_last_transition == runner.collected_transitions == 4 * NUM_ENVS
+    torch.testing.assert_close(acted_from[2], torch.full_like(acted_from[2], 2 * NUM_ENVS))
+
+
+def test_one_vector_step_advances_transition_clock_by_exactly_num_envs() -> None:
+    """One physical vector step must contribute one transition per environment."""
+    cfg = _make_lifecycle_cfg(NUM_ENVS)
+    cfg["num_steps_per_env"] = 1
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+
+    runner.learn(1)
+
+    extension = runner.lifecycle_extension
+    assert isinstance(extension, RecordingLifecycleExtension)
+    assert runner.alg.replay.total_steps == 1
+    assert runner.collected_transitions == NUM_ENVS
+    assert extension.transitions == [0, NUM_ENVS]
+
+
+def test_lifecycle_extension_rejects_unreachable_transition_cadence() -> None:
+    """An interval must land on an exact completed collection boundary."""
+    with pytest.raises(ValueError, match="positive multiple of one collection block"):
+        OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(NUM_ENVS), log_dir=None, device="cpu")
+
+
+def test_lifecycle_extension_checkpoint_before_first_event_replays_zero_once() -> None:
+    """A pre-learning checkpoint should preserve the pending transition-zero event."""
+    fresh = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
+    restored = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
+
+    with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
+        fresh.save(checkpoint.name)
+        restored.load(checkpoint.name)
+
+    extension = restored.lifecycle_extension
+    assert isinstance(extension, RecordingLifecycleExtension)
+    assert extension.transitions == []
+
+    restored.learn(1)
+
+    assert extension.transitions == [0, 2 * NUM_ENVS]
+
+
+def test_lifecycle_extension_checkpoint_resumes_without_replaying_event_zero() -> None:
+    """Extension state and cadence should resume at the exact next transition event."""
+    expected = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
+    restored = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
+    expected.learn(1)
+
+    with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
+        expected.save(checkpoint.name)
+        restored.load(checkpoint.name)
+
+    restored_extension = restored.lifecycle_extension
+    assert isinstance(restored_extension, RecordingLifecycleExtension)
+    assert restored_extension.transitions == [0, 2 * NUM_ENVS]
+
+    restored.learn(1)
+
+    assert restored_extension.transitions == [0, 2 * NUM_ENVS, 4 * NUM_ENVS]
+    assert restored._lifecycle_last_transition == 4 * NUM_ENVS
+
+
 def test_collection_does_not_leak_inference_tensors_into_environment_state() -> None:
     """State retained by an environment should remain mutable outside collection."""
     env = ForwardBackwardDummyEnv()
@@ -292,6 +448,26 @@ def test_runner_uses_random_seed_phase_and_delays_updates_one_iteration() -> Non
     assert random_calls == 2
     assert runner.collected_transitions == 6 * NUM_ENVS
     assert runner.alg.update_step == 1
+
+
+def test_runner_training_summary_persists_exact_updates_and_finite_metric_keys() -> None:
+    """The completion boundary should expose counters and every emitted learner metric."""
+    runner = OffPolicyRunner(
+        ForwardBackwardDummyEnv(),
+        _make_cfg(random_action_steps=2 * NUM_ENVS),
+        log_dir=None,
+        device="cpu",
+    )
+
+    runner.learn(3)
+
+    summary = runner.training_summary()
+    assert summary["completed_iterations"] == 3
+    assert summary["collected_transitions"] == 6 * NUM_ENVS
+    assert summary["update_calls"] == runner.alg.update_step == 1
+    assert summary["all_metrics_finite"] is True
+    assert set(summary["metric_names"]) == set(summary["last_metrics"])
+    assert summary["metric_names"]
 
 
 def test_runner_counts_completed_iterations_and_saves_each_boundary_once() -> None:
@@ -466,12 +642,19 @@ def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
         runner.save(checkpoint.name)
         runner.env.state.add_(10.0)
         runner.current_learning_iteration = 11
-        runner.load(checkpoint.name)
+        runner.load(checkpoint.name, map_location="cpu", mmap=True)
 
     assert runner.environment_resume_exact
     assert runner.current_learning_iteration == 7
     assert runner.collected_transitions == 0
     torch.testing.assert_close(runner.env.state, expected_state)
+    assert runner.checkpoint_load_summary() == {
+        "environment_resume": "exact",
+        "environment_state_dict_is_none": False,
+        "map_location": "cpu",
+        "mmap": True,
+        "strict": True,
+    }
 
 
 def test_runner_exposes_exact_iteration_boundaries() -> None:

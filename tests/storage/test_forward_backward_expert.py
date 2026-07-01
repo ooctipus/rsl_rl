@@ -93,7 +93,12 @@ def test_concrete_corpus_metadata_changes_schema_identity() -> None:
     assert all(variant.schema_hash != schema.schema_hash for variant in variants)
 
 
-def _make_buffer(seed: int = 3) -> ForwardBackwardExpertBuffer:
+def _make_buffer(
+    seed: int = 3,
+    *,
+    clip_ids: tuple[str, ...] = ("short", "walk", "run"),
+    device: str = "cpu",
+) -> ForwardBackwardExpertBuffer:
     schema = replace(
         _make_schema(),
         expert_feature_width=3,
@@ -101,10 +106,17 @@ def _make_buffer(seed: int = 3) -> ForwardBackwardExpertBuffer:
         num_clips=3,
         window_lengths=(1, 3, 5),
     )
-    frames = torch.arange(42, dtype=torch.float32).reshape(14, 3)
-    clip_offsets = torch.tensor([0, 2, 8, 14], dtype=torch.long)
-    priorities = torch.tensor([100.0, 1.0, 2.0])
-    return ForwardBackwardExpertBuffer(frames, clip_offsets, priorities, schema, seed)
+    frames = torch.arange(42, dtype=torch.float32, device=device).reshape(14, 3)
+    clip_offsets = torch.tensor([0, 2, 8, 14], dtype=torch.long, device=device)
+    priorities = torch.tensor([100.0, 1.0, 2.0], device=device)
+    return ForwardBackwardExpertBuffer(frames, clip_offsets, priorities, schema, seed, clip_ids=clip_ids)
+
+
+@pytest.mark.parametrize("clip_ids", (("short", "walk", "walk"), ("short", "", "run")))
+def test_expert_sampler_requires_unique_nonempty_stable_clip_ids(clip_ids: tuple[str, ...]) -> None:
+    """Corpus construction must reject ambiguous or absent stable clip identity."""
+    with pytest.raises(ValueError, match="clip_ids"):
+        _make_buffer(clip_ids=clip_ids)
 
 
 def test_expert_windows_are_contiguous_and_never_cross_clips() -> None:
@@ -138,6 +150,49 @@ def test_expert_sampler_resumes_exactly() -> None:
     torch.testing.assert_close(actual.next_observations, expected.next_observations)
     torch.testing.assert_close(actual.clip_ids, expected.clip_ids)
     torch.testing.assert_close(actual.frame_indices, expected.frame_indices)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_expert_sampler_restores_cpu_mapped_state_into_cuda_corpus() -> None:
+    """A CPU-mapped checkpoint must restore mutable state onto its immutable corpus device."""
+    buffer = _make_buffer(device="cuda")
+    buffer.set_priorities(torch.tensor([0.0, 3.0, 1.0], device="cuda"))
+    buffer.sample(7, 3)
+    state = buffer.state_dict()
+    state["priorities"] = state["priorities"].cpu()
+    restored = _make_buffer(seed=999, device="cuda")
+
+    restored.load_state_dict(state)
+
+    assert restored.priorities.device.type == "cuda"
+    expected = buffer.sample(11, 5)
+    actual = restored.sample(11, 5)
+    torch.testing.assert_close(actual.observations, expected.observations)
+    torch.testing.assert_close(actual.next_observations, expected.next_observations)
+    torch.testing.assert_close(actual.clip_ids, expected.clip_ids)
+    torch.testing.assert_close(actual.frame_indices, expected.frame_indices)
+
+
+def test_expert_sampler_checkpoint_requires_exact_stable_clip_order() -> None:
+    """Sampler state must not move between equal-shaped corpora with reordered identities."""
+    buffer = _make_buffer()
+    state = buffer.state_dict()
+    reordered = _make_buffer(clip_ids=("short", "run", "walk"))
+
+    assert state["clip_ids"] == ("short", "walk", "run")
+    with pytest.raises(ValueError, match="clip ids"):
+        reordered.load_state_dict(state)
+
+    torch.testing.assert_close(reordered.priorities, torch.tensor([100.0, 1.0, 2.0]))
+
+
+def test_expert_sampler_checkpoint_requires_declared_stable_clip_ids() -> None:
+    """Legacy equal-shaped state without clip identity must be rejected."""
+    state = _make_buffer().state_dict()
+    state.pop("clip_ids")
+
+    with pytest.raises(ValueError, match="clip ids"):
+        _make_buffer().load_state_dict(state)
 
 
 def test_expert_priority_event_updates_all_windows_and_checkpoint_state() -> None:

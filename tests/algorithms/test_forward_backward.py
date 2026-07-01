@@ -241,6 +241,7 @@ def _make_learner(
         torch.ones(2),
         expert_schema,
         seed=43,
+        clip_ids=("clip_0", "clip_1"),
     )
     manifest = {
         "config": {"algorithm": {"gamma": 0.98}, "model": {"context_width": context_width}},
@@ -737,11 +738,16 @@ def test_checkpoint_validation_requires_its_small_header() -> None:
         _make_header().validate_checkpoint({"actor_state_dict": {}})
 
 
-def test_phase_1g_publishes_only_concrete_forward_backward_boundaries() -> None:
-    """The public API should expose concrete owners without legacy replay aliases."""
+def test_phase_1g_publishes_only_explicit_forward_backward_boundaries() -> None:
+    """The public API should expose explicit owners without legacy replay aliases."""
     assert rsl_rl.algorithms.__all__ == ["PPO", "Distillation", "ForwardBackward"]
     assert rsl_rl.models.__all__ == ["CNNModel", "ForwardBackwardModel", "MLPModel", "RNNModel"]
-    assert rsl_rl.runners.__all__ == ["DistillationRunner", "OffPolicyRunner", "OnPolicyRunner"]
+    assert rsl_rl.runners.__all__ == [
+        "DistillationRunner",
+        "OffPolicyRunner",
+        "OnPolicyRunner",
+        "RunnerLifecycleExtension",
+    ]
     assert rsl_rl.storage.__all__ == ["ForwardBackwardExpertBuffer", "ForwardBackwardReplay", "RolloutStorage"]
     assert "SuccessorFeatures" in rsl_rl.extensions.__all__
     assert rsl_rl.algorithms.ForwardBackward is ForwardBackward

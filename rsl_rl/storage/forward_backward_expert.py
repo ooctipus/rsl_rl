@@ -80,6 +80,8 @@ class ForwardBackwardExpertBuffer:
         priorities: torch.Tensor,
         schema: ForwardBackwardExpertSchema,
         seed: int = 0,
+        *,
+        clip_ids: tuple[str, ...],
     ) -> None:
         """Validate and retain one GPU corpus without copying it to the host."""
         if frames.ndim != 2 or tuple(frames.shape) != (schema.num_frames, schema.expert_feature_width):
@@ -101,6 +103,12 @@ class ForwardBackwardExpertBuffer:
             raise ValueError("Expert priorities must be finite.")
         if torch.any(priorities < 0) or not torch.any(priorities > 0):
             raise ValueError("Expert priorities must be non-negative with positive total mass.")
+        if (
+            len(clip_ids) != schema.num_clips
+            or len(set(clip_ids)) != schema.num_clips
+            or any(not isinstance(value, str) or not value for value in clip_ids)
+        ):
+            raise ValueError("clip_ids must contain one unique nonempty identifier per expert clip.")
 
         self.frames = frames
         self.clip_offsets = clip_offsets
@@ -108,6 +116,7 @@ class ForwardBackwardExpertBuffer:
         self.schema = schema
         self.device = frames.device
         self.clip_lengths = clip_lengths
+        self.clip_ids = clip_ids
         self._sequence_offsets = {
             length: torch.arange(length + 1, device=self.device, dtype=torch.long) for length in schema.window_lengths
         }
@@ -120,8 +129,8 @@ class ForwardBackwardExpertBuffer:
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
 
-    def set_priorities(self, priorities: torch.Tensor) -> None:
-        """Replace clip-sampling weights at one declared external priority event."""
+    def validate_priorities(self, priorities: torch.Tensor) -> None:
+        """Validate clip-sampling weights without mutating expert state."""
         if priorities.shape != self.priorities.shape or not priorities.is_floating_point():
             raise ValueError("priorities must be floating point with one entry per clip.")
         if priorities.device != self.device:
@@ -138,8 +147,13 @@ class ForwardBackwardExpertBuffer:
         }
         if any(not torch.any(value > 0) for value in eligible_priorities.values()):
             raise ValueError("Every configured window length needs a positive-priority eligible clip.")
+
+    def set_priorities(self, priorities: torch.Tensor) -> None:
+        """Replace clip-sampling weights at one declared external priority event."""
+        self.validate_priorities(priorities)
         self.priorities.copy_(priorities)
-        for length, values in eligible_priorities.items():
+        for length in self.schema.window_lengths:
+            values = torch.where(self.clip_lengths > length, priorities, torch.zeros_like(priorities))
             self._eligible_priorities[length].copy_(values)
 
     def sample(self, batch_size: int, sequence_length: int) -> ForwardBackwardExpertBatch:
@@ -174,6 +188,7 @@ class ForwardBackwardExpertBuffer:
         """Capture only mutable sampling state; corpus tensors are immutable inputs."""
         return {
             "schema_hash": self.schema.schema_hash,
+            "clip_ids": self.clip_ids,
             "priorities": self.priorities.clone(),
             "generator_state": self.generator.get_state(),
         }
@@ -182,9 +197,12 @@ class ForwardBackwardExpertBuffer:
         """Restore the exact next sample under the same corpus identity."""
         if state["schema_hash"] != self.schema.schema_hash:
             raise ValueError("Expert sampler state does not match the corpus schema.")
+        if state.get("clip_ids") != self.clip_ids:
+            raise ValueError("Expert sampler clip ids do not match the corpus.")
         priorities = state["priorities"]
         if not isinstance(priorities, torch.Tensor):
             raise TypeError("Expert priorities state must be a tensor.")
+        priorities = priorities.to(device=self.device)
         self.set_priorities(priorities)
         generator_state = state["generator_state"]
         if not isinstance(generator_state, torch.Tensor):

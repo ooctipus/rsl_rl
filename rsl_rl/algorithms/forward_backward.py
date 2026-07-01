@@ -1124,6 +1124,15 @@ class ForwardBackward:
 
 def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
     """Construct one forward-backward learner from ordinary RSL-RL sections."""
+    replay_cfg = dict(cfg["replay"])
+    replay_class = resolve_callable(replay_cfg.pop("class_name"))
+    capacity_transitions = replay_cfg.pop("capacity_transitions")
+    if isinstance(capacity_transitions, bool) or not isinstance(capacity_transitions, int) or capacity_transitions < 1:
+        raise ValueError("Replay capacity_transitions must be a positive integer.")
+    capacity_steps, remainder = divmod(capacity_transitions, env.num_envs)
+    if remainder:
+        raise ValueError("Replay capacity_transitions must be divisible by env.num_envs.")
+
     model_class = resolve_callable(cfg["model"]["class_name"])
     if not isinstance(model_class, type) or not issubclass(model_class, ForwardBackwardModel):
         raise TypeError("The configured model class must derive from ForwardBackwardModel.")
@@ -1134,8 +1143,6 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         cfg["model"],
     )
 
-    replay_cfg = dict(cfg["replay"])
-    replay_class = resolve_callable(replay_cfg.pop("class_name"))
     reward_schema = ForwardBackwardRewardSchema(
         tuple(ForwardBackwardRewardChannel(**dict(channel)) for channel in replay_cfg.pop("reward_channels"))
     )
@@ -1151,6 +1158,7 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     )
     history_layout = _make_history_layout(replay_cfg.pop("history_layout", None))
     replay = replay_class(
+        capacity_steps=capacity_steps,
         num_envs=env.num_envs,
         observation_schema=model.observation_schema,
         transition_schema=transition_schema,

@@ -184,6 +184,17 @@ class TestSaveLoad:
             data = torch.load(f.name, weights_only=False, map_location="cpu")
             assert "iter" in data
 
+    def test_load_supports_mmap_backed_cpu_deserialization(self) -> None:
+        """The common checkpoint boundary should support low-residency strict validation."""
+        runner = _build_runner()
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
+            runner.save(checkpoint.name)
+            runner.load(checkpoint.name, strict=True, map_location="cpu", mmap=True)
+
+        assert runner.current_learning_iteration == 0
+
     def test_load_restores_parameters(self) -> None:
         """Loading a checkpoint should restore model parameters exactly."""
         runner = _build_runner()

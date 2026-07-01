@@ -57,7 +57,7 @@ def metamotivo_config(expert_provider: Callable) -> dict:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_steps": 2_000_000,
+            "capacity_transitions": 2_000_000,
             "terminal_capacity_per_env": 16,
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
@@ -205,7 +205,7 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_steps": 5_000,
+            "capacity_transitions": 5_120_000,
             "terminal_capacity_per_env": 16,
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
