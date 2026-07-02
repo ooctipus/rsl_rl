@@ -564,6 +564,15 @@ class ForwardBackwardModel(torch.nn.Module):
         """Enable or freeze field-normalizer updates."""
         self.observation_normalizers.train(mode)
 
+    def as_inference_model(self) -> ForwardBackwardInferenceModel:
+        """Return a deterministic inference view over the learned policy modules.
+
+        The returned module shares tensors with this model. It contains only
+        the observation normalizers, backward map, actor, and deterministic
+        action transform required to infer contexts and run the policy.
+        """
+        return ForwardBackwardInferenceModel(self)
+
     def context_project(self, context: torch.Tensor) -> torch.Tensor:
         """Project context vectors onto the configured sphere."""
         if not self.context_normalization:
@@ -699,3 +708,88 @@ class ForwardBackwardModel(torch.nn.Module):
         route_name = cast(ForwardBackwardRouteName, spec.route)
         route = self.get_normalized_observations(observations, route_name)
         return network(torch.cat((route, actions), dim=-1), torch.cat((route, context), dim=-1))
+
+
+class ForwardBackwardInferenceModel(torch.nn.Module):
+    """Deterministic actor and backward-map view of a forward-backward model.
+
+    This view reuses the trained modules instead of rebuilding their algebra.
+    Its reduced state can be stacked with :func:`torch.func.stack_module_state`
+    to evaluate several compatible checkpoints through :func:`torch.vmap`.
+    """
+
+    def __init__(self, model: ForwardBackwardModel) -> None:
+        """Create a tensor-sharing deterministic view of the model.
+
+        Args:
+            model: Model whose actor, backward map, normalization state, and
+                observation schema define inference.
+        """
+        super().__init__()
+        self.observation_schema = model.observation_schema
+        self.action_dim = model.action_dim
+        self.context_dim = model.context_dim
+        self.context_normalization = model.context_normalization
+        fields = set(self.observation_schema.route("actor") + self.observation_schema.route("backward"))
+        self.observation_normalizers = torch.nn.ModuleDict({
+            name: model.observation_normalizers[name]
+            for name, _width in self.observation_schema.field_widths
+            if name in fields
+        })
+        self.actor_network = model.actor_network
+        self.backward_network = model.backward_network
+        self.deterministic_output = model.action_distribution.as_deterministic_output_module()
+
+    def get_normalized_observations(
+        self,
+        observations: TensorDict,
+        name: Literal["actor", "backward"],
+    ) -> torch.Tensor:
+        """Normalize and concatenate one deterministic inference route."""
+        fields = self.observation_schema.route(name)
+        values = [self.observation_normalizers[field](observations[field]) for field in fields]
+        return values[0] if len(values) == 1 else torch.cat(values, dim=-1)
+
+    def action_deterministic(self, observations: TensorDict, context: torch.Tensor) -> torch.Tensor:
+        """Return deterministic actions without mutating a distribution object."""
+        actor_observations = self.get_normalized_observations(observations, "actor")
+        output = self.actor_network(
+            actor_observations,
+            torch.cat((actor_observations, context), dim=-1),
+        )
+        return self.deterministic_output(output)
+
+    def backward_map(self, observations: TensorDict) -> torch.Tensor:
+        """Return live backward features for an observation batch."""
+        return self.backward_network(self.get_normalized_observations(observations, "backward"))
+
+    def context_project(self, context: torch.Tensor) -> torch.Tensor:
+        """Project context vectors onto the model's configured sphere."""
+        if not self.context_normalization:
+            return context
+        return math.sqrt(self.context_dim) * functional.normalize(context, dim=-1)
+
+    def forward(
+        self,
+        observations: TensorDict,
+        context: torch.Tensor | None = None,
+        *,
+        output: Literal["action", "backward"] = "action",
+    ) -> torch.Tensor:
+        """Evaluate one functional-call-friendly deterministic path.
+
+        Args:
+            observations: Raw observations with the model's recorded schema.
+            context: Actor contexts. Required when output is action.
+            output: Deterministic inference path to evaluate.
+
+        Returns:
+            Deterministic actions or backward features.
+        """
+        if output == "backward":
+            return self.backward_map(observations)
+        if output != "action":
+            raise ValueError(f"Unknown inference output: {output!r}.")
+        if context is None:
+            raise ValueError("Deterministic action inference requires context.")
+        return self.action_deterministic(observations, context)

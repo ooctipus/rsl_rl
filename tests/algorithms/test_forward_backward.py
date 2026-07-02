@@ -741,7 +741,13 @@ def test_checkpoint_validation_requires_its_small_header() -> None:
 def test_phase_1g_publishes_only_explicit_forward_backward_boundaries() -> None:
     """The public API should expose explicit owners without legacy replay aliases."""
     assert rsl_rl.algorithms.__all__ == ["PPO", "Distillation", "ForwardBackward"]
-    assert rsl_rl.models.__all__ == ["CNNModel", "ForwardBackwardModel", "MLPModel", "RNNModel"]
+    assert rsl_rl.models.__all__ == [
+        "CNNModel",
+        "ForwardBackwardInferenceModel",
+        "ForwardBackwardModel",
+        "MLPModel",
+        "RNNModel",
+    ]
     assert rsl_rl.runners.__all__ == [
         "DistillationRunner",
         "OffPolicyRunner",
