@@ -21,6 +21,7 @@ from rsl_rl.runners.lifecycle import RunnerLifecycleExtension
 from rsl_rl.runners.off_policy_runner import OffPolicyRunner
 from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
 from rsl_rl.storage.forward_backward_replay import ForwardBackwardReplay
+from rsl_rl.utils.utils import check_nan
 
 NUM_ENVS = 4
 STATE_DIM = 6
@@ -710,6 +711,20 @@ def test_same_step_collection_reads_named_auxiliary_evidence_fields() -> None:
         fallback.auxiliary_reward_evidence,
         torch.tensor([4.0, 104.0]).expand(NUM_ENVS, -1),
     )
+
+
+def test_nan_check_accepts_nested_observation_groups() -> None:
+    """Finite named evidence should pass the real runner NaN check."""
+    runner = OffPolicyRunner(NamedEvidenceDummyEnv(), _make_named_evidence_cfg(), log_dir=None, device="cpu")
+    runner.learn(1)
+
+
+def test_nan_check_reports_nested_observation_path() -> None:
+    """A nested NaN should identify its complete observation path."""
+    observations = NamedEvidenceDummyEnv().get_observations()
+    observations["transition", "impact"][0, 0] = torch.nan
+    with pytest.raises(ValueError, match=r"transition\.impact"):
+        check_nan(observations, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS))
 
 
 def test_same_step_collection_owns_action_and_reached_episode_steps() -> None:

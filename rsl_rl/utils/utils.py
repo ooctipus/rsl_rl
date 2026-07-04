@@ -293,11 +293,12 @@ def resolve_obs_groups(
 
 def check_nan(obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor) -> None:
     """Raise ``ValueError`` if any environment output contains NaN."""
-    for key, tensor in obs.items():
+    for key, tensor in obs.items(include_nested=True, leaves_only=True):
         if torch.isnan(tensor).any():
+            key_name = ".".join(key) if isinstance(key, tuple) else key
             raise ValueError(
-                f"The observation group '{key}' returned by the environment contains NaN values. This usually indicates"
-                " a bug in the environment's step() or reset() function."
+                f"The observation group '{key_name}' returned by the environment contains NaN values. This usually"
+                " indicates a bug in the environment's step() or reset() function."
             )
     if torch.isnan(rewards).any():
         raise ValueError(
