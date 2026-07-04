@@ -44,7 +44,13 @@ class ForwardBackwardDummyEnv(VecEnv):
 
     def get_observations(self) -> TensorDict:
         """Return the current emitted state."""
-        return TensorDict({"state": self.state.clone()}, batch_size=[NUM_ENVS])
+        return TensorDict(
+            {
+                "state": self.state.clone(),
+                "transition": self.state[:, :1].square(),
+            },
+            batch_size=[NUM_ENVS],
+        )
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         """Advance every row and reset completed rows in the returned observation."""
@@ -55,16 +61,19 @@ class ForwardBackwardDummyEnv(VecEnv):
         self.state = reached.clone()
         self.state[dones] = 0.0
         self.episode_length_buf[dones] = 0
-        extras: dict = {
-            "time_outs": dones.clone(),
-            "auxiliary_reward_evidence": reached[:, :1].square(),
-            "episode_steps": self.episode_length_buf,
-        }
+        extras: dict = {"time_outs": dones.clone()}
         if self.provide_final:
-            extras["final_obs"] = TensorDict({"state": reached}, batch_size=[NUM_ENVS])
+            extras["final_obs"] = TensorDict(
+                {
+                    "state": reached,
+                    "transition": reached[:, :1].square(),
+                },
+                batch_size=[NUM_ENVS],
+            )
             extras["final_obs_valid"] = dones.clone()
         rewards = reached[:, 0]
-        return self.get_observations(), rewards, dones, extras
+        observations = self.get_observations()
+        return observations, rewards, dones, extras
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Return exact deterministic environment state for runner checkpoints."""
@@ -77,6 +86,34 @@ class ForwardBackwardDummyEnv(VecEnv):
         """Restore exact deterministic environment state."""
         self.state.copy_(state["state"])
         self.episode_length_buf.copy_(state["episode_length_buf"])
+
+
+class NamedEvidenceDummyEnv(ForwardBackwardDummyEnv):
+    """Expose two named scalar evidence fields in non-schema insertion order."""
+
+    def get_observations(self) -> TensorDict:
+        """Return mixed-rank evidence fields with impact inserted before effort."""
+        observations = super().get_observations()
+        effort = observations["transition"][:, 0]
+        impact = effort.unsqueeze(-1) + 100.0
+        observations.set(
+            "transition",
+            TensorDict({"impact": impact, "effort": effort}, batch_size=[NUM_ENVS]),
+        )
+        return observations
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Replace flat final evidence with the same named mixed-rank layout."""
+        observations, rewards, dones, extras = super().step(actions)
+        final = extras.get("final_obs")
+        if final is not None:
+            effort = final["transition"][:, 0]
+            impact = effort.unsqueeze(-1) + 100.0
+            final.set(
+                "transition",
+                TensorDict({"impact": impact, "effort": effort}, batch_size=[NUM_ENVS]),
+            )
+        return observations, rewards, dones, extras
 
 
 class RecordingLifecycleExtension(RunnerLifecycleExtension):
@@ -136,7 +173,15 @@ def _expert_provider(
         num_clips=2,
         window_lengths=window_lengths,
     )
-    return ForwardBackwardExpertBuffer(frames, offsets, priorities, schema, seed=17, clip_ids=("clip_0", "clip_1"))
+    return ForwardBackwardExpertBuffer(
+        frames,
+        offsets,
+        priorities,
+        schema,
+        seed=17,
+        clip_ids=("clip_0", "clip_1"),
+        clip_length_values=(16, 16),
+    )
 
 
 def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int = 0) -> dict:
@@ -195,6 +240,7 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
             "auxiliary_evidence_names": ["effort"],
+            "auxiliary_evidence_observation_group": "transition",
             "reward_channels": [
                 {
                     "name": "environment",
@@ -248,11 +294,42 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
     }
 
 
+def _make_named_evidence_cfg() -> dict:
+    """Return the tiny config with a two-channel named evidence schema."""
+    cfg = _make_cfg()
+    cfg["replay"]["auxiliary_evidence_names"] = ["effort", "impact"]
+    cfg["replay"]["reward_channels"].append({
+        "name": "impact",
+        "provider_name": "impact",
+        "source": "stored_evidence",
+        "timing": "transition",
+        "context_dependent": False,
+        "sign": -1,
+    })
+    cfg["model"]["value_heads"][1]["spec"]["reward_channels"] = ["effort", "impact"]
+    cfg["algorithm"]["value_cfg"]["auxiliary"]["reward_coefficients"] = [0.1, 0.2]
+    return cfg
+
+
 def _make_lifecycle_cfg(transition_interval: int = 2 * NUM_ENVS) -> dict:
     cfg = _make_cfg()
     cfg["lifecycle_extension"] = {
         "class_name": RecordingLifecycleExtension,
         "transition_interval": transition_interval,
+    }
+    return cfg
+
+
+def _make_history_cfg() -> dict:
+    """Return a runner config whose actor history is derived by the learner."""
+    cfg = _make_cfg()
+    cfg["obs_groups"]["actor"] = ["state", "history_actor"]
+    cfg["obs_groups"]["forward"] = ["state", "history_actor"]
+    cfg["replay"]["history_layout"] = {
+        "history_field": "history_actor",
+        "history_length": 2,
+        "sources": [{"observation_name": "state"}],
+        "include_seed_observations": False,
     }
     return cfg
 
@@ -313,6 +390,52 @@ def test_constructor_derives_time_major_rows_from_transition_capacity() -> None:
 
     assert runner.alg.replay.capacity_steps == 8
     assert runner.alg.replay.capacity_steps * runner.env.num_envs == 8 * NUM_ENVS
+
+
+@pytest.mark.parametrize(
+    ("group", "error"),
+    (
+        (None, "non-empty string"),
+        ("state", "non-model observation group"),
+        ("missing", "was not returned by the environment"),
+    ),
+)
+def test_constructor_rejects_invalid_auxiliary_evidence_observation_group(
+    group: str | None,
+    error: str,
+) -> None:
+    """Evidence should be bound once to an existing non-policy observation group."""
+    cfg = _make_cfg()
+    cfg["replay"]["auxiliary_evidence_observation_group"] = group
+
+    with pytest.raises(ValueError, match=error):
+        OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+
+
+def test_constructor_rejects_auxiliary_evidence_width_mismatch() -> None:
+    """The configured channel order should exactly determine the observation width."""
+    cfg = _make_cfg()
+    cfg["replay"]["auxiliary_evidence_names"].append("impact")
+    cfg["replay"]["reward_channels"].append({
+        "name": "impact",
+        "provider_name": "impact",
+        "source": "stored_evidence",
+        "timing": "transition",
+        "context_dependent": False,
+        "sign": -1,
+    })
+
+    with pytest.raises(ValueError, match=r"must have shape \(4, 2\)"):
+        OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+
+
+def test_constructor_rejects_evidence_from_non_actor_model_route() -> None:
+    """Transition evidence must not leak into a representation or value input route."""
+    cfg = _make_cfg()
+    cfg["obs_groups"]["forward"] = ["state", "transition"]
+
+    with pytest.raises(ValueError, match="non-model observation group"):
+        OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
 
 
 @pytest.mark.parametrize("capacity_transitions", (False, 0, -1, 32.0, 8 * NUM_ENVS - 1))
@@ -545,15 +668,166 @@ def test_same_step_collection_uses_true_final_observation_when_available() -> No
     assert not torch.any(batch.successor_uses_current)
 
 
+def test_same_step_collection_reads_completed_edge_evidence_from_observations() -> None:
+    """Done-edge evidence should come from final_obs, not the reset observation."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    _collect(runner, 3)
+    env_ids = torch.arange(NUM_ENVS)
+
+    live = runner.alg.replay.sample(torch.full((NUM_ENVS,), 1), env_ids)
+    done = runner.alg.replay.sample(torch.full((NUM_ENVS,), 2), env_ids)
+
+    torch.testing.assert_close(live.auxiliary_reward_evidence, torch.full((NUM_ENVS, 1), 4.0))
+    torch.testing.assert_close(done.auxiliary_reward_evidence, torch.full((NUM_ENVS, 1), 9.0))
+
+
+def test_same_step_collection_reads_named_auxiliary_evidence_fields() -> None:
+    """Named fields should retain schema order through live, final, and fallback paths."""
+    runner = OffPolicyRunner(NamedEvidenceDummyEnv(), _make_named_evidence_cfg(), log_dir=None, device="cpu")
+    _collect(runner, 3)
+    env_ids = torch.arange(NUM_ENVS)
+
+    live = runner.alg.replay.sample(torch.full((NUM_ENVS,), 1), env_ids)
+    done = runner.alg.replay.sample(torch.full((NUM_ENVS,), 2), env_ids)
+    torch.testing.assert_close(
+        live.auxiliary_reward_evidence,
+        torch.tensor([4.0, 104.0]).expand(NUM_ENVS, -1),
+    )
+    torch.testing.assert_close(
+        done.auxiliary_reward_evidence,
+        torch.tensor([9.0, 109.0]).expand(NUM_ENVS, -1),
+    )
+
+    fallback_runner = OffPolicyRunner(
+        NamedEvidenceDummyEnv(provide_final=False),
+        _make_named_evidence_cfg(),
+        log_dir=None,
+        device="cpu",
+    )
+    _collect(fallback_runner, 3)
+    fallback = fallback_runner.alg.replay.sample(torch.full((NUM_ENVS,), 2), env_ids)
+    torch.testing.assert_close(
+        fallback.auxiliary_reward_evidence,
+        torch.tensor([4.0, 104.0]).expand(NUM_ENVS, -1),
+    )
+
+
+def test_same_step_collection_owns_action_and_reached_episode_steps() -> None:
+    """Same-step collection should require neither action nor episode metadata from the environment."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+
+    _collect(runner, 1)
+    assert runner.alg.replay.episode_steps.tolist() == [1] * NUM_ENVS
+    _collect(runner, 1)
+    assert runner.alg.replay.episode_steps.tolist() == [2] * NUM_ENVS
+    _collect(runner, 1)
+    assert runner.alg.replay.episode_steps.tolist() == [0] * NUM_ENVS
+
+
 def test_same_step_collection_falls_back_to_pre_step_when_final_is_unavailable() -> None:
-    """Missing final_obs should use the marked pre-step approximation, not reset state."""
+    """Missing final_obs should use the pre-step evidence approximation, not reset state."""
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(provide_final=False), _make_cfg(), log_dir=None, device="cpu")
     _collect(runner, 3)
     env_ids = torch.arange(NUM_ENVS)
     batch = runner.alg.replay.sample(torch.full((NUM_ENVS,), 2), env_ids)
 
     torch.testing.assert_close(batch.next_observations["state"], torch.full((NUM_ENVS, STATE_DIM), 2.0))
+    torch.testing.assert_close(batch.auxiliary_reward_evidence, torch.full((NUM_ENVS, 1), 4.0))
     assert torch.all(batch.successor_uses_current)
+
+
+def test_online_history_is_learner_owned_and_matches_replay_order() -> None:
+    """Raw environments should not materialize derived actor history."""
+    env = ForwardBackwardDummyEnv()
+    runner = OffPolicyRunner(env, _make_history_cfg(), log_dir=None, device="cpu")
+    observations = env.get_observations()
+
+    actions = runner.alg.act_random(observations)
+    assert "history_actor" not in observations
+    torch.testing.assert_close(
+        runner.alg._collection_observations["history_actor"],
+        torch.zeros(NUM_ENVS, 2 * STATE_DIM),
+    )
+    observations, rewards, dones, extras = env.step(actions)
+    runner.alg.process_env_step(observations, rewards, dones, extras)
+
+    actions = runner.alg.act_random(observations)
+    torch.testing.assert_close(
+        runner.alg._collection_observations["history_actor"],
+        torch.zeros(NUM_ENVS, 2 * STATE_DIM),
+    )
+    observations, rewards, dones, extras = env.step(actions)
+    runner.alg.process_env_step(observations, rewards, dones, extras)
+
+    actions = runner.alg.act_random(observations)
+    expected = torch.cat((torch.ones(NUM_ENVS, STATE_DIM), torch.zeros(NUM_ENVS, STATE_DIM)), dim=-1)
+    torch.testing.assert_close(runner.alg._collection_observations["history_actor"], expected)
+    observations, rewards, dones, extras = env.step(actions)
+    runner.alg.process_env_step(observations, rewards, dones, extras)
+
+    torch.testing.assert_close(runner.alg._online_history.current, torch.zeros(NUM_ENVS, 2 * STATE_DIM))
+    expected_final = torch.cat((torch.full((NUM_ENVS, STATE_DIM), 2.0), torch.ones(NUM_ENVS, STATE_DIM)), dim=-1)
+    torch.testing.assert_close(runner.alg._online_history.reached, expected_final)
+
+
+def test_online_history_external_reset_preserves_final_and_zeros_new_episode() -> None:
+    """An external reset should retain the closed edge and zero only reset streams."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_history_cfg(), log_dir=None, device="cpu")
+    _collect(runner, 2)
+    reset = torch.tensor([True, False, True, False])
+    final_history = runner.alg._online_history.current.clone()
+
+    runner.env.state[reset] = 50.0
+    runner.env.episode_length_buf[reset] = 0
+    runner.alg.process_env_reset(runner.env.get_observations(), reset)
+
+    expected_current = final_history.clone()
+    expected_current[reset] = 0.0
+    torch.testing.assert_close(runner.alg._online_history.current, expected_current)
+
+    reset_env_ids = reset.nonzero(as_tuple=False).squeeze(-1)
+    closed = runner.alg.replay.sample(torch.ones(reset_env_ids.shape[0], dtype=torch.long), reset_env_ids)
+    assert torch.all(closed.truncated)
+    torch.testing.assert_close(closed.next_observations["state"], torch.full((reset_env_ids.shape[0], STATE_DIM), 2.0))
+    torch.testing.assert_close(closed.next_observations["history_actor"], final_history[reset_env_ids])
+
+    runner.alg.act_random(runner.env.get_observations())
+    torch.testing.assert_close(runner.alg._collection_observations["history_actor"], expected_current)
+
+
+def test_online_history_checkpoint_resumes_the_exact_next_edge() -> None:
+    """Checkpoint restore must preserve the learner-owned history boundary exactly."""
+    expected = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_history_cfg(), log_dir=None, device="cpu")
+    restored = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_history_cfg(), log_dir=None, device="cpu")
+    _collect(expected, 2)
+    algorithm_state = copy.deepcopy(expected.alg.save())
+    environment_state = copy.deepcopy(expected.env.state_dict())
+    restored.env.load_state_dict(environment_state)
+    restored.alg.load(algorithm_state, load_cfg=None, strict=True)
+
+    torch.testing.assert_close(restored.alg._online_history.current, expected.alg._online_history.current)
+    torch.testing.assert_close(
+        restored.alg._online_history.current_source_valid,
+        expected.alg._online_history.current_source_valid,
+    )
+
+    expected_observations = expected.env.get_observations()
+    restored_observations = restored.env.get_observations()
+    expected_actions = expected.alg.act_random(expected_observations)
+    restored_actions = restored.alg.act_random(restored_observations)
+    torch.testing.assert_close(restored_actions, expected_actions, rtol=0.0, atol=0.0)
+
+    expected_observations, expected_rewards, expected_dones, expected_extras = expected.env.step(expected_actions)
+    restored_observations, restored_rewards, restored_dones, restored_extras = restored.env.step(restored_actions)
+    expected.alg.process_env_step(expected_observations, expected_rewards, expected_dones, expected_extras)
+    restored.alg.process_env_step(restored_observations, restored_rewards, restored_dones, restored_extras)
+
+    torch.testing.assert_close(restored.alg._online_history.current, expected.alg._online_history.current)
+    torch.testing.assert_close(
+        restored.alg._online_history.current_source_valid,
+        expected.alg._online_history.current_source_valid,
+    )
+    assert restored.alg.replay.total_steps == expected.alg.replay.total_steps
 
 
 def test_rollout_refresh_samples_the_learned_context_mixture_per_episode() -> None:

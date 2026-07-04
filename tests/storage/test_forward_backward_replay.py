@@ -246,12 +246,22 @@ def test_schema_compatibility_preserves_reward_source_semantics() -> None:
     """Stored tensor columns must not masquerade as learned reward providers."""
     _transition, schema, observation_schema, reward_schema = make_transition()
 
+    with pytest.raises(ValueError, match="required when the reward schema uses environment reward"):
+        replace(schema, environment_reward_name=None).assert_compatible(observation_schema, reward_schema)
     with pytest.raises(ValueError, match="environment reward channel"):
         replace(schema, environment_reward_name="discriminator").assert_compatible(observation_schema, reward_schema)
     with pytest.raises(ValueError, match="stored-evidence"):
         replace(schema, auxiliary_evidence_names=("action_rate", "discriminator")).assert_compatible(
             observation_schema, reward_schema
         )
+
+
+def test_schema_compatibility_requires_every_stored_evidence_channel() -> None:
+    """Replay columns must exactly cover stored-evidence reward channels in schema order."""
+    _transition, schema, observation_schema, reward_schema = make_transition()
+
+    with pytest.raises(ValueError, match="exactly match"):
+        replace(schema, auxiliary_evidence_names=("action_rate",)).assert_compatible(observation_schema, reward_schema)
 
 
 def test_unknown_reward_evidence_channel_fails_at_construction() -> None:

@@ -12,7 +12,7 @@ import random
 import torch
 from collections.abc import Mapping
 from dataclasses import dataclass
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models.forward_backward_model import ForwardBackwardModel
@@ -145,8 +145,179 @@ class ForwardBackwardCheckpointHeader:
             raise ValueError("Checkpoint schema is incompatible with the current learner.")
 
 
+class _ForwardBackwardOnlineHistory:
+    """Own derived online history using the replay history layout."""
+
+    def __init__(
+        self,
+        layout: ForwardBackwardHistoryLayout,
+        observations: TensorDictBase,
+    ) -> None:
+        """Allocate fixed online, reached, and returned-state buffers."""
+        if layout.history_field in observations:
+            raise ValueError(f"The environment must not materialize derived field {layout.history_field!r}.")
+
+        num_envs = observations.batch_size[0]
+        source_layout = []
+        cursor = 0
+        dtype: torch.dtype | None = None
+        device: torch.device | None = None
+        for source in layout.sources:
+            name = source.observation_name
+            if name not in observations:
+                raise ValueError(f"History source {name!r} is not returned by the environment.")
+            value = observations[name]
+            if value.ndim != 2 or value.shape[0] != num_envs or not value.is_floating_point():
+                raise ValueError(f"History source {name!r} must be a flat floating-point observation.")
+            width = value.shape[1]
+            if dtype is None:
+                dtype = value.dtype
+                device = value.device
+            elif value.dtype != dtype or value.device != device:
+                raise ValueError("History sources must share one dtype and device.")
+            stop = cursor + layout.history_length * width
+            source_layout.append((name, cursor, stop, width))
+            cursor = stop
+
+        if dtype is None or device is None:
+            first = next(iter(observations.values()))
+            dtype = first.dtype
+            device = first.device
+        self.layout = layout
+        self.source_layout = tuple(source_layout)
+        self.current = torch.zeros(num_envs, cursor, dtype=dtype, device=device)
+        self.reached = torch.empty_like(self.current)
+        self.returned = torch.empty_like(self.current)
+        self.current_source_valid = torch.full(
+            (num_envs, 1),
+            layout.include_seed_observations,
+            dtype=torch.bool,
+            device=device,
+        )
+        self.returned_source_valid = torch.empty_like(self.current_source_valid)
+        self.seed_source_valid = torch.full_like(self.current_source_valid, layout.include_seed_observations)
+        self.reset_rows = torch.empty_like(self.current_source_valid)
+
+    def decorate_current(self, observations: TensorDictBase) -> TensorDictBase:
+        """Attach the current derived fields without allocating tensor payloads."""
+        observations.set(self.layout.history_field, self.current)
+        return observations
+
+    def prepare_transition(
+        self,
+        current: TensorDictBase,
+        returned: TensorDictBase,
+        final: TensorDictBase,
+        done: torch.Tensor,
+        action_applied: torch.Tensor,
+        autoreset_mode: ForwardBackwardAutoresetMode,
+    ) -> None:
+        """Materialize reached and returned-state histories for one vector step."""
+        for name, start, stop, width in self.source_layout:
+            source = current[name]
+            newest = self.reached[:, start : start + width]
+            newest.copy_(source)
+            newest.mul_(self.current_source_valid)
+            if self.layout.history_length > 1:
+                self.reached[:, start + width : stop].copy_(self.current[:, start : stop - width])
+
+        if autoreset_mode is ForwardBackwardAutoresetMode.SAME_STEP:
+            self.reset_rows.copy_(done)
+        elif autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP:
+            torch.logical_not(action_applied, out=self.reset_rows)
+        else:
+            self.reset_rows.zero_()
+
+        self.returned.copy_(self.reached)
+        self.returned.masked_fill_(self.reset_rows, 0.0)
+        torch.where(
+            self.reset_rows,
+            self.seed_source_valid,
+            action_applied,
+            out=self.returned_source_valid,
+        )
+        returned.set(self.layout.history_field, self.returned)
+        if final is not current:
+            final.set(self.layout.history_field, self.reached)
+
+    def prepare_reset(self, observations: TensorDictBase, reset: torch.Tensor) -> None:
+        """Zero derived fields on reset rows and preserve all other rows."""
+        reset = reset.reshape(self.current.shape[0], 1)
+        self.returned.copy_(self.current)
+        self.returned.masked_fill_(reset, 0.0)
+        torch.where(
+            reset,
+            self.seed_source_valid,
+            self.current_source_valid,
+            out=self.returned_source_valid,
+        )
+        observations.set(self.layout.history_field, self.returned)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return exact online history at a canonical transition boundary."""
+        return {
+            "schema_hash": self.layout.schema_hash,
+            "current": self.current,
+            "current_source_valid": self.current_source_valid,
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        """Restore exact online history with strict layout compatibility."""
+        if state["schema_hash"] != self.layout.schema_hash:
+            raise ValueError("Online history state is incompatible with the configured layout.")
+        current = state["current"]
+        source_valid = state["current_source_valid"]
+        if not isinstance(current, torch.Tensor) or not isinstance(source_valid, torch.Tensor):
+            raise TypeError("Online history values must be tensors.")
+        self.current.copy_(current)
+        self.current_source_valid.copy_(source_valid)
+
+    def commit_transition(self) -> None:
+        """Promote the prepared returned state after replay insertion succeeds."""
+        self.current, self.returned = self.returned, self.current
+        self.current_source_valid, self.returned_source_valid = (
+            self.returned_source_valid,
+            self.current_source_valid,
+        )
+
+
 class ForwardBackward:
     """Unified off-policy MetaMotivo/BFM-Zero learner."""
+
+    class EvaluationHistory:
+        """Own an independent same-step history session for deterministic evaluation."""
+
+        def __init__(self, layout: ForwardBackwardHistoryLayout, observations: TensorDictBase) -> None:
+            """Create zeroed history without aliasing learner collection state."""
+            self._history = _ForwardBackwardOnlineHistory(layout, observations)
+            self._action_applied = self._history.current.new_ones(
+                (observations.batch_size[0], 1),
+                dtype=torch.bool,
+            )
+
+        def decorate_current(self, observations: TensorDictBase) -> TensorDictBase:
+            """Attach the current derived history before evaluating one action."""
+            return self._history.decorate_current(observations)
+
+        def advance(
+            self,
+            current: TensorDictBase,
+            returned: TensorDictBase,
+            done: torch.Tensor,
+        ) -> None:
+            """Advance exactly one same-step transition and attach returned history."""
+            num_envs = self._action_applied.shape[0]
+            if done.shape != (num_envs,) or done.dtype is not torch.bool or done.device != self._action_applied.device:
+                raise ValueError("Evaluation done flags must be one boolean per environment on the history device.")
+            self._history.prepare_transition(
+                current,
+                returned,
+                current,
+                done.unsqueeze(-1),
+                self._action_applied,
+                ForwardBackwardAutoresetMode.SAME_STEP,
+            )
+            self._history.commit_transition()
 
     @dataclass(frozen=True, slots=True)
     class ValueCfg:
@@ -176,6 +347,8 @@ class ForwardBackward:
         expert: ForwardBackwardExpertBuffer,
         checkpoint_header: ForwardBackwardCheckpointHeader,
         *,
+        online_history: _ForwardBackwardOnlineHistory | None = None,
+        auxiliary_evidence_observation_group: str | None,
         batch_size: int = 1024,
         expert_sequence_length: int = 8,
         gamma: float = 0.98,
@@ -250,6 +423,37 @@ class ForwardBackward:
             raise ValueError("Model, replay, and expert corpus must share the learner device.")
         if model.observation_schema.schema_hash != replay.observation_schema.schema_hash:
             raise ValueError("Model and replay observation schemas do not match.")
+        self._online_history = online_history
+        if (online_history is None) != (replay.history_layout is None):
+            raise ValueError("Online and replay history must be configured together.")
+        if online_history is not None and online_history.layout != replay.history_layout:
+            raise ValueError("Online and replay history layouts must match.")
+
+        evidence_names = replay.transition_schema.auxiliary_evidence_names
+        if evidence_names:
+            if not isinstance(auxiliary_evidence_observation_group, str) or not auxiliary_evidence_observation_group:
+                raise ValueError(
+                    "auxiliary_evidence_observation_group must name the observation containing configured evidence."
+                )
+            if auxiliary_evidence_observation_group in dict(model.observation_schema.field_widths):
+                raise ValueError("Auxiliary evidence must come from a non-model observation group.")
+            evidence_group = auxiliary_evidence_observation_group
+        elif auxiliary_evidence_observation_group is None:
+            evidence_group = None
+        else:
+            raise ValueError(
+                "auxiliary_evidence_observation_group must be None when auxiliary_evidence_names is empty."
+            )
+        self._auxiliary_evidence_observation_group = evidence_group
+        self._auxiliary_evidence = torch.empty(
+            replay.num_envs,
+            len(evidence_names),
+            device=self.device,
+            dtype=replay.dtype,
+        )
+        self._auxiliary_evidence_scratch = torch.empty_like(self._auxiliary_evidence)
+        self._auxiliary_evidence_mask = torch.empty(replay.num_envs, 1, dtype=torch.bool, device=self.device)
+        self._empty_environment_reward = torch.empty(replay.num_envs, 0, device=self.device, dtype=replay.dtype)
 
         self.batch_size = batch_size
         self.expert_sequence_length = expert_sequence_length
@@ -362,7 +566,8 @@ class ForwardBackward:
         self._rollout_next_contexts = torch.empty_like(self.rollout_contexts)
         self._rollout_context_changed = torch.zeros(replay.num_envs, device=self.device, dtype=torch.bool)
         self._rollout_tracking_mask = torch.zeros_like(self._rollout_context_changed)
-        self._empty_auxiliary_evidence = torch.empty(replay.num_envs, 0, device=self.device, dtype=replay.dtype)
+        self._action_applied = torch.ones(replay.num_envs, 1, device=self.device, dtype=torch.bool)
+        self._reached_episode_steps = torch.empty_like(replay.episode_steps)
         self.rollout_schedule_step = 0
         self._rollout_tracking_count = round(replay.num_envs * rollout_expert_fraction)
         self._rollout_tracking_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
@@ -419,11 +624,41 @@ class ForwardBackward:
         """Reduce deferred replay contract errors at the runner control boundary."""
         self.replay.assert_no_errors()
 
+    def _copy_auxiliary_evidence(self, observations: TensorDict, mask: torch.Tensor | None = None) -> None:
+        """Pack a flat or named evidence group into the fixed replay row."""
+        group_name = self._auxiliary_evidence_observation_group
+        if group_name is None:
+            raise RuntimeError("Auxiliary evidence observations are not configured.")
+        group = observations[group_name]
+        if isinstance(group, torch.Tensor):
+            if mask is None:
+                self._auxiliary_evidence.copy_(group)
+            else:
+                torch.where(mask, group, self._auxiliary_evidence, out=self._auxiliary_evidence)
+            return
+
+        values = []
+        for name in self.replay.transition_schema.auxiliary_evidence_names:
+            value = group[name]
+            values.append(value if value.ndim == 2 else value.unsqueeze(-1))
+        if mask is None:
+            torch.cat(values, dim=-1, out=self._auxiliary_evidence)
+        else:
+            torch.cat(values, dim=-1, out=self._auxiliary_evidence_scratch)
+            torch.where(
+                mask,
+                self._auxiliary_evidence_scratch,
+                self._auxiliary_evidence,
+                out=self._auxiliary_evidence,
+            )
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample one behavior action and retain its immutable transition fields."""
         if self._collection_observations is not None:
             raise RuntimeError("The previous behavior action has not been processed.")
         observations = obs.to(self.device)
+        if self._online_history is not None:
+            observations = self._online_history.decorate_current(observations)
         actions = self.model.action_sample(observations, self.rollout_contexts)
         self._collection_observations = observations
         self._collection_actions = actions
@@ -436,6 +671,8 @@ class ForwardBackward:
         if self.random_action_range is None:
             raise TypeError("Random behavior requires explicit or distribution-owned action bounds.")
         observations = obs.to(self.device)
+        if self._online_history is not None:
+            observations = self._online_history.decorate_current(observations)
         lower, upper = self.random_action_range
         actions = torch.empty(
             self.replay.num_envs,
@@ -475,14 +712,7 @@ class ForwardBackward:
         if self.replay.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.NEXT_STEP:
             action_applied = extras["action_applied"].to(self.device).bool().reshape(num_envs, 1)
         else:
-            applied_value = extras.get("action_applied", torch.ones_like(done))
-            action_applied = applied_value.to(self.device).bool().reshape(num_envs, 1)
-
-        evidence_names = self.replay.transition_schema.auxiliary_evidence_names
-        if evidence_names:
-            evidence = extras["auxiliary_reward_evidence"].to(self.device)
-        else:
-            evidence = self._empty_auxiliary_evidence
+            action_applied = self._action_applied
 
         final_observations = current_observations
         final_observation_valid = torch.zeros_like(done)
@@ -494,9 +724,39 @@ class ForwardBackward:
             valid_value = extras.get("final_obs_valid", done)
             final_observation_valid = valid_value.to(self.device).bool().reshape(num_envs, 1) & done
 
+        if self._online_history is not None:
+            self._online_history.prepare_transition(
+                current_observations,
+                next_observations,
+                final_observations,
+                done,
+                action_applied,
+                self.replay.transition_schema.autoreset_mode,
+            )
+        environment_reward = (
+            self._empty_environment_reward
+            if self.replay.transition_schema.environment_reward_name is None
+            else rewards.to(self.device).reshape(num_envs, 1)
+        )
+        evidence_group = self._auxiliary_evidence_observation_group
+        if evidence_group is not None:
+            evidence = self._auxiliary_evidence
+            self._copy_auxiliary_evidence(next_observations)
+            if self.replay.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.SAME_STEP:
+                self._copy_auxiliary_evidence(final_observations, final_observation_valid)
+                torch.logical_not(final_observation_valid, out=self._auxiliary_evidence_mask)
+                self._auxiliary_evidence_mask.logical_and_(done)
+                self._copy_auxiliary_evidence(current_observations, self._auxiliary_evidence_mask)
+        else:
+            evidence = self._auxiliary_evidence
+
         behavior_context = self.rollout_contexts
-        episode_steps = extras["episode_steps"].to(self.device).reshape(num_envs)
-        context_changed = self._advance_rollout_contexts(action_applied, episode_steps, done.squeeze(-1))
+        self._reached_episode_steps.copy_(self.replay.episode_steps).add_(action_applied.squeeze(-1))
+        context_changed = self._advance_rollout_contexts(
+            action_applied,
+            self._reached_episode_steps,
+            done.squeeze(-1),
+        )
         self.replay.add(
             ForwardBackwardTransitionBatch(
                 observations=current_observations,
@@ -504,7 +764,7 @@ class ForwardBackward:
                 final_observations=final_observations,
                 actions=actions,
                 behavior_context=behavior_context,
-                environment_reward=rewards.to(self.device).reshape(num_envs, 1),
+                environment_reward=environment_reward,
                 auxiliary_reward_evidence=evidence,
                 terminated=terminated,
                 truncated=truncated,
@@ -514,16 +774,22 @@ class ForwardBackward:
             )
         )
         self._collection_observations = None
+        if self._online_history is not None:
+            self._online_history.commit_transition()
         self._collection_actions = None
 
     def process_env_reset(self, obs: TensorDict, reset: torch.Tensor) -> None:
         """Record an algorithm-controlled reset performed between environment steps."""
         if self._collection_observations is not None or self._collection_actions is not None:
             raise RuntimeError("process_env_reset cannot interrupt a pending behavior action.")
-        reset = reset.to(self.device)
+        reset = reset.to(self.device).bool().reshape(self.replay.num_envs, 1)
         observations = obs.to(self.device)
+        if self._online_history is not None:
+            self._online_history.prepare_reset(observations, reset)
         self.replay.process_env_reset(observations, reset)
-        reset = reset.reshape(self.replay.num_envs)
+        if self._online_history is not None:
+            self._online_history.commit_transition()
+        reset = reset.squeeze(-1)
 
         tracking = self._rollout_tracking_mask
         tracking.zero_()
@@ -598,6 +864,8 @@ class ForwardBackward:
         tracking[self._rollout_tracking_env_ids] = True
 
         refresh = episode_steps.remainder(self.rollout_context_refresh_steps) == 0
+        refresh.logical_or_(done)
+        refresh.logical_and_(action_applied.squeeze(-1))
         env_ids = (refresh & ~tracking).nonzero(as_tuple=False).squeeze(-1)
         next_contexts[env_ids] = self._sample_rollout_contexts(env_ids.shape[0])
         changed[env_ids] = True
@@ -861,7 +1129,10 @@ class ForwardBackward:
         discriminator_rewards: dict[str, torch.Tensor] = {}
         for channel in self.replay.reward_schema.channels:
             if channel.source == "environment":
-                if channel.name != self.replay.transition_schema.environment_reward_name:
+                if (
+                    self.replay.transition_schema.environment_reward_name is None
+                    or channel.name != self.replay.transition_schema.environment_reward_name
+                ):
                     raise RuntimeError("Replay contains one declared environment reward channel.")
                 value = batch.environment_reward
             elif channel.source == "stored_evidence":
@@ -1045,6 +1316,7 @@ class ForwardBackward:
             "optimizer_state_dicts": optimizers,
             "reward_normalizer_state_dict": self.reward_normalizers.state_dict(),
             "replay_state_dict": self.replay.state_dict(),
+            "online_history_state_dict": (None if self._online_history is None else self._online_history.state_dict()),
             "expert_state_dict": self.expert.state_dict(),
             "context_buffer": self.context_buffer,
             "context_buffer_cursor": self.context_buffer_cursor,
@@ -1088,6 +1360,14 @@ class ForwardBackward:
         if load_cfg.get("storage"):
             self.replay.load_state_dict(loaded_dict["replay_state_dict"])
             self.expert.load_state_dict(loaded_dict["expert_state_dict"])
+            history_state = loaded_dict["online_history_state_dict"]
+            if self._online_history is None:
+                if history_state is not None:
+                    raise ValueError("Checkpoint contains online history but the configured layout does not.")
+            else:
+                if not isinstance(history_state, Mapping):
+                    raise TypeError("Configured online history checkpoint state must be a mapping.")
+                self._online_history.load_state_dict(history_state)
         if load_cfg.get("context"):
             self.context_buffer.copy_(loaded_dict["context_buffer"])
             self.context_buffer_cursor = int(loaded_dict["context_buffer_cursor"])
@@ -1110,6 +1390,17 @@ class ForwardBackward:
                 torch.cuda.set_rng_state_all(rng["cuda"])
         return bool(load_cfg.get("iteration", False))
 
+    def evaluation_history(
+        self,
+        observations: TensorDictBase,
+    ) -> EvaluationHistory | None:
+        """Return a fresh evaluator-owned history session for raw observations."""
+        if self._online_history is None:
+            return None
+        if self.replay.transition_schema.autoreset_mode is not ForwardBackwardAutoresetMode.SAME_STEP:
+            raise NotImplementedError("Evaluation history currently requires same-step autoreset semantics.")
+        return self.EvaluationHistory(self._online_history.layout, observations)
+
     def get_policy(self) -> ForwardBackwardModel:
         """Return the uncompiled composite policy model."""
         return self._raw_model
@@ -1124,7 +1415,10 @@ class ForwardBackward:
 
 def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
     """Construct one forward-backward learner from ordinary RSL-RL sections."""
+    model_cfg = dict(cfg["model"])
     replay_cfg = dict(cfg["replay"])
+    expert_cfg = dict(cfg["expert"])
+    algorithm_cfg = dict(cfg["algorithm"])
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
     capacity_transitions = replay_cfg.pop("capacity_transitions")
     if isinstance(capacity_transitions, bool) or not isinstance(capacity_transitions, int) or capacity_transitions < 1:
@@ -1133,30 +1427,37 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     if remainder:
         raise ValueError("Replay capacity_transitions must be divisible by env.num_envs.")
 
-    model_class = resolve_callable(cfg["model"]["class_name"])
+    model_class = resolve_callable(model_cfg["class_name"])
+    history_layout = _make_history_layout(replay_cfg.pop("history_layout", None))
+    online_history = None
     if not isinstance(model_class, type) or not issubclass(model_class, ForwardBackwardModel):
         raise TypeError("The configured model class must derive from ForwardBackwardModel.")
+    observations = obs.to(device)
+    if history_layout is not None:
+        online_history = _ForwardBackwardOnlineHistory(history_layout, observations)
+        observations = online_history.decorate_current(observations)
     model = model_class.from_config(
-        obs.to(device),
+        observations,
         cfg["obs_groups"],
         env.num_actions,
-        cfg["model"],
+        model_cfg,
     )
 
     reward_schema = ForwardBackwardRewardSchema(
         tuple(ForwardBackwardRewardChannel(**dict(channel)) for channel in replay_cfg.pop("reward_channels"))
     )
     autoreset_mode = ForwardBackwardAutoresetMode(replay_cfg.pop("autoreset_mode"))
+    auxiliary_evidence_names = tuple(replay_cfg.pop("auxiliary_evidence_names"))
+    auxiliary_evidence_observation_group = replay_cfg.pop("auxiliary_evidence_observation_group")
     transition_schema = ForwardBackwardTransitionSchema(
         observation_schema_hash=model.observation_schema.schema_hash,
         reward_schema_hash=reward_schema.schema_hash,
         action_width=env.num_actions,
         context_width=model.context_dim,
         environment_reward_name=replay_cfg.pop("environment_reward_name"),
-        auxiliary_evidence_names=tuple(replay_cfg.pop("auxiliary_evidence_names")),
+        auxiliary_evidence_names=auxiliary_evidence_names,
         autoreset_mode=autoreset_mode,
     )
-    history_layout = _make_history_layout(replay_cfg.pop("history_layout", None))
     replay = replay_class(
         capacity_steps=capacity_steps,
         num_envs=env.num_envs,
@@ -1169,18 +1470,21 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     )
     if not isinstance(replay, ForwardBackwardReplay):
         raise TypeError("The configured replay must be a ForwardBackwardReplay.")
+    _validate_auxiliary_evidence_observation_group(
+        observations,
+        auxiliary_evidence_observation_group,
+        model,
+        replay,
+    )
 
-    expert_cfg = dict(cfg["expert"])
     provider = resolve_callable(expert_cfg.pop("provider"))
     expert = provider(env, model.observation_schema, device, **expert_cfg)
     if not isinstance(expert, ForwardBackwardExpertBuffer):
         raise TypeError("The expert provider must return ForwardBackwardExpertBuffer.")
 
-    algorithm_cfg = dict(cfg["algorithm"])
     algorithm_class = resolve_callable(algorithm_cfg.pop("class_name"))
     value_cfg = {
-        name: ForwardBackward.ValueCfg(**dict(value))
-        for name, value in dict(algorithm_cfg.pop("value_cfg", {})).items()
+        name: ForwardBackward.ValueCfg(**dict(value)) for name, value in algorithm_cfg.pop("value_cfg").items()
     }
     manifest = {
         "config": {
@@ -1200,8 +1504,10 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         replay,
         expert,
         ForwardBackwardCheckpointHeader.from_manifest(manifest),
+        auxiliary_evidence_observation_group=auxiliary_evidence_observation_group,
         value_cfg=value_cfg,
         device=device,
+        online_history=online_history,
         multi_gpu_cfg=cfg.get("multi_gpu"),
         **algorithm_cfg,
     )
@@ -1220,6 +1526,55 @@ def _make_history_layout(value: object) -> ForwardBackwardHistoryLayout | None:
     options = dict(value)
     sources = tuple(ForwardBackwardHistoryLayout.Source(**dict(source)) for source in options.pop("sources"))
     return ForwardBackwardHistoryLayout(sources=sources, **options)
+
+
+def _validate_auxiliary_evidence_observation_group(
+    observations: TensorDict,
+    group: object,
+    model: ForwardBackwardModel,
+    replay: ForwardBackwardReplay,
+) -> None:
+    """Validate the direct observation-to-replay evidence boundary once."""
+    names = replay.transition_schema.auxiliary_evidence_names
+    if not names:
+        if group is not None:
+            raise ValueError("auxiliary_evidence_observation_group must be None without auxiliary evidence.")
+        return
+    if not isinstance(group, str) or not group:
+        raise ValueError("auxiliary_evidence_observation_group must be a non-empty string.")
+    if group in dict(model.observation_schema.field_widths):
+        raise ValueError("Auxiliary evidence must come from a non-model observation group.")
+    if group not in observations:
+        raise ValueError(f"Auxiliary evidence observation group {group!r} was not returned by the environment.")
+    evidence = observations[group]
+    if isinstance(evidence, torch.Tensor):
+        expected_shape = (replay.num_envs, len(names))
+        if tuple(evidence.shape) != expected_shape:
+            raise ValueError(
+                f"Auxiliary evidence observation group {group!r} must have shape {expected_shape}, "
+                f"got {tuple(evidence.shape)}."
+            )
+        if evidence.device != replay.device:
+            raise ValueError(f"Auxiliary evidence group {group!r} is on {evidence.device}, expected {replay.device}.")
+        if evidence.dtype != replay.dtype:
+            raise ValueError(f"Auxiliary evidence group {group!r} has dtype {evidence.dtype}, expected {replay.dtype}.")
+        return
+    elif isinstance(evidence, Mapping):
+        if set(evidence.keys()) != set(names):
+            raise ValueError(f"Named auxiliary evidence fields must be exactly {names}.")
+        values = tuple((name, evidence[name]) for name in names)
+    else:
+        raise TypeError("Auxiliary evidence must be one flat tensor or a mapping of named scalar tensors.")
+
+    for name, value in values:
+        expected_shapes = ((replay.num_envs,), (replay.num_envs, 1))
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) not in expected_shapes:
+            shape = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+            raise ValueError(f"Auxiliary evidence field {name!r} must be scalar per environment, got {shape}.")
+        if value.device != replay.device:
+            raise ValueError(f"Auxiliary evidence field {name!r} is on {value.device}, expected {replay.device}.")
+        if value.dtype != replay.dtype:
+            raise ValueError(f"Auxiliary evidence field {name!r} has dtype {value.dtype}, expected {replay.dtype}.")
 
 
 def _checkpoint_config(value: object) -> object:

@@ -109,7 +109,15 @@ def _make_buffer(
     frames = torch.arange(42, dtype=torch.float32, device=device).reshape(14, 3)
     clip_offsets = torch.tensor([0, 2, 8, 14], dtype=torch.long, device=device)
     priorities = torch.tensor([100.0, 1.0, 2.0], device=device)
-    return ForwardBackwardExpertBuffer(frames, clip_offsets, priorities, schema, seed, clip_ids=clip_ids)
+    return ForwardBackwardExpertBuffer(
+        frames,
+        clip_offsets,
+        priorities,
+        schema,
+        seed,
+        clip_ids=clip_ids,
+        clip_length_values=(2, 6, 6),
+    )
 
 
 @pytest.mark.parametrize("clip_ids", (("short", "walk", "walk"), ("short", "", "run")))
@@ -193,6 +201,49 @@ def test_expert_sampler_checkpoint_requires_declared_stable_clip_ids() -> None:
 
     with pytest.raises(ValueError, match="clip ids"):
         _make_buffer().load_state_dict(state)
+
+
+def test_expert_sampler_checkpoint_requires_declared_clip_lengths() -> None:
+    """Equal-shaped state must retain immutable host-side clip lengths."""
+    state = _make_buffer().state_dict()
+    state.pop("clip_length_values")
+
+    with pytest.raises(ValueError, match="clip lengths"):
+        _make_buffer().load_state_dict(state)
+
+
+def test_expert_buffer_copies_host_clip_length_identity() -> None:
+    """Caller mutation must not alter immutable corpus identity or checkpoint state."""
+    original = _make_buffer()
+    clip_length_values = [2, 6, 6]
+    copied = ForwardBackwardExpertBuffer(
+        original.frames,
+        original.clip_offsets,
+        original.priorities,
+        original.schema,
+        clip_ids=original.clip_ids,
+        clip_length_values=clip_length_values,
+    )
+
+    clip_length_values[0] = 1
+
+    assert copied.clip_length_values == (2, 6, 6)
+    assert copied.state_dict()["clip_length_values"] == (2, 6, 6)
+
+
+def test_expert_buffer_rejects_clip_lengths_that_differ_from_offsets() -> None:
+    """Host-side lengths must describe the exact immutable device offsets."""
+    buffer = _make_buffer()
+
+    with pytest.raises(ValueError, match="match clip_offsets"):
+        ForwardBackwardExpertBuffer(
+            buffer.frames,
+            buffer.clip_offsets,
+            buffer.priorities,
+            buffer.schema,
+            clip_ids=buffer.clip_ids,
+            clip_length_values=(3, 5, 6),
+        )
 
 
 def test_expert_priority_event_updates_all_windows_and_checkpoint_state() -> None:

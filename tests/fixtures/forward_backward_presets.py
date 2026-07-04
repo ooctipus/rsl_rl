@@ -62,6 +62,7 @@ def metamotivo_config(expert_provider: Callable) -> dict:
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
             "auxiliary_evidence_names": [],
+            "auxiliary_evidence_observation_group": None,
             "reward_channels": [
                 {
                     "name": "environment",
@@ -119,13 +120,17 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
         "penalty_slippage",
     )
     magnitudes = (0.0, 0.1, 10.0, 0.0, 1.0, 0.4, 4.0, 2.0)
+    state = ["joint_position", "joint_velocity", "projected_gravity", "base_angular_velocity"]
+    actor_route = [*state, "last_action", "history_actor"]
+    forward_route = [*state, "privileged_state", "last_action", "history_actor"]
+    backward_route = [*state, "privileged_state"]
     routes = {
-        "actor": ["state", "last_action", "history_actor"],
-        "forward": ["state", "privileged_state", "last_action", "history_actor"],
-        "backward": ["state", "privileged_state"],
-        "discriminator": ["state", "privileged_state"],
-        "critic_discriminator": ["state", "privileged_state", "last_action", "history_actor"],
-        "critic_auxiliary": ["state", "privileged_state", "last_action", "history_actor"],
+        "actor": actor_route,
+        "forward": forward_route,
+        "backward": backward_route,
+        "discriminator": backward_route,
+        "critic_discriminator": forward_route,
+        "critic_auxiliary": forward_route,
     }
     reward_channels = [
         {
@@ -177,6 +182,7 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "normalization_type": "exponential",
             "normalization_eps": 1e-5,
             "normalization_momentum": 0.01,
+            "normalization_groups": [{"name": "state", "fields": state}],
             "value_heads": [
                 {
                     "spec": {
@@ -210,17 +216,17 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "autoreset_mode": "same_step",
             "environment_reward_name": "environment",
             "auxiliary_evidence_names": list(evidence),
+            "auxiliary_evidence_observation_group": "transition",
             "reward_channels": reward_channels,
             "history_layout": {
                 "history_field": "history_actor",
                 "history_length": 4,
-                "last_action_field": "last_action",
                 "sources": [
-                    {"observation_name": None, "start": 0, "stop": 29},
-                    {"observation_name": "state", "start": 61, "stop": 64},
-                    {"observation_name": "state", "start": 0, "stop": 29},
-                    {"observation_name": "state", "start": 29, "stop": 58},
-                    {"observation_name": "state", "start": 58, "stop": 61},
+                    {"observation_name": "last_action"},
+                    {"observation_name": "base_angular_velocity"},
+                    {"observation_name": "joint_position"},
+                    {"observation_name": "joint_velocity"},
+                    {"observation_name": "projected_gravity"},
                 ],
             },
         },

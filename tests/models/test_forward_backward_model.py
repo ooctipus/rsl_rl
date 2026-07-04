@@ -66,6 +66,7 @@ def _make_model(
     normalization_type: Literal["none", "empirical", "exponential"] = "none",
     normalization_eps: float = 1e-2,
     normalization_momentum: float = 0.1,
+    normalization_groups: tuple[dict[str, object], ...] = (),
     distribution_cfg: dict[str, object] | None = None,
     initialization_type: Literal["default", "orthogonal"] = "default",
 ) -> ForwardBackwardModel:
@@ -83,6 +84,7 @@ def _make_model(
         normalization_type=normalization_type,
         normalization_eps=normalization_eps,
         normalization_momentum=normalization_momentum,
+        normalization_groups=normalization_groups,
         distribution_cfg=distribution_cfg,
         initialization_type=initialization_type,
     )
@@ -407,6 +409,79 @@ def test_field_normalizers_update_once_freeze_and_round_trip() -> None:
     )
 
 
+def test_named_fields_share_one_strictly_loadable_normalization_owner() -> None:
+    """A semantic field split must preserve one concatenated statistical/checkpoint owner."""
+    state = torch.randn(7, 8)
+    flat_observations = TensorDict({"state": state}, batch_size=[7])
+    flat_routes = {name: ("state",) for name in META_ROUTES}
+    flat = _make_model(flat_observations, flat_routes, normalization_type="exponential")
+    flat.update_normalization(flat_observations)
+
+    named_observations = TensorDict(
+        {
+            "joint_position": state[:, :3],
+            "joint_velocity": state[:, 3:6],
+            "projected_gravity": state[:, 6:7],
+            "base_angular_velocity": state[:, 7:8],
+        },
+        batch_size=[7],
+    )
+    state_fields = ("joint_position", "joint_velocity", "projected_gravity", "base_angular_velocity")
+    named_routes = {name: state_fields for name in META_ROUTES}
+    named = _make_model(
+        named_observations,
+        named_routes,
+        normalization_type="exponential",
+        normalization_groups=({"name": "state", "fields": state_fields},),
+    )
+
+    loaded = named.load_state_dict(copy.deepcopy(flat.state_dict()), strict=True)
+    assert not loaded.missing_keys and not loaded.unexpected_keys
+    assert tuple(named.observation_normalizers) == ("state",)
+    expected = flat.get_normalized_observations(flat_observations, "actor")
+    actual = named.get_normalized_observations(named_observations, "actor")
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    normalizer = named.observation_normalizers["state"]
+    recovered = actual * torch.sqrt(normalizer.running_var + normalizer.eps) + normalizer.running_mean
+    torch.testing.assert_close(recovered, state)
+    inference = named.as_inference_model()
+    torch.testing.assert_close(inference.get_normalized_observations(named_observations, "actor"), expected)
+
+
+@pytest.mark.parametrize(
+    ("groups", "match"),
+    (
+        (({"name": "state", "fields": ("joint_position", "missing")},), "unknown fields"),
+        (
+            (
+                {"name": "first", "fields": ("joint_position", "joint_velocity")},
+                {"name": "second", "fields": ("joint_velocity", "projected_gravity")},
+            ),
+            "multiple groups",
+        ),
+        (({"name": "state", "fields": ("joint_velocity", "joint_position")},), "atomically and in declared order"),
+    ),
+)
+def test_normalization_groups_reject_unknown_overlapping_or_nonatomic_fields(
+    groups: tuple[dict[str, object], ...],
+    match: str,
+) -> None:
+    """Normalization groups must be disjoint schema-owned units in route order."""
+    observations = TensorDict(
+        {
+            "joint_position": torch.zeros(2, 2),
+            "joint_velocity": torch.zeros(2, 2),
+            "projected_gravity": torch.zeros(2, 1),
+        },
+        batch_size=[2],
+    )
+    routes = {name: ("joint_position", "joint_velocity", "projected_gravity") for name in META_ROUTES}
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        _make_model(observations, routes, normalization_groups=groups)
+
+
 def test_exponential_field_normalizer_matches_released_two_batch_update() -> None:
     """Meta/BFM mode should reproduce two ordered BatchNorm statistic updates."""
     observations = _make_bfm_observations(batch_size=5)
@@ -586,6 +661,41 @@ def test_model_from_config_is_shared_by_training_and_inference() -> None:
     assert model.action_dim == 2
     assert model.context_dim == 4
     assert model.observation_normalizers["state"].momentum == 0.01
+
+
+def test_model_from_config_reuses_forward_architecture_for_unspecified_value_head_network() -> None:
+    """An omitted value-head override should reuse topology while creating independent parameters."""
+    observations = TensorDict({"state": torch.randn(3, 358)}, batch_size=[3])
+    config = {
+        "context_dim": 4,
+        "actor_cfg": {"hidden_dim": 16, "hidden_layers": 2, "embedding_layers": 2},
+        "forward_cfg": {"hidden_dim": 16, "hidden_layers": 2, "embedding_layers": 3},
+        "backward_hidden_dims": [8, 8],
+        "normalization_type": "none",
+        "value_heads": [
+            {
+                "spec": {
+                    "name": "discriminator",
+                    "kind": "critic",
+                    "route": "critic_discriminator",
+                    "reward_channels": ["discriminator"],
+                    "ensemble_size": 2,
+                    "has_target": True,
+                },
+                "network": None,
+            }
+        ],
+    }
+
+    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config)
+    value_network = model.value_networks["discriminator"]
+    forward_parameters = {id(parameter) for parameter in model.forward_network.parameters()}
+    value_parameters = {id(parameter) for parameter in value_network.parameters()}
+
+    assert len(value_network.left_embedding.network) == len(model.forward_network.left_embedding.network)
+    assert len(value_network.right_embedding.network) == len(model.forward_network.right_embedding.network)
+    assert len(value_network.trunk) == len(model.forward_network.trunk)
+    assert forward_parameters.isdisjoint(value_parameters)
 
 
 def _simple_dual_parameter_count(

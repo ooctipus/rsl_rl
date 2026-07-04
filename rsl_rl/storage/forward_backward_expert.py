@@ -82,8 +82,10 @@ class ForwardBackwardExpertBuffer:
         seed: int = 0,
         *,
         clip_ids: tuple[str, ...],
+        clip_length_values: tuple[int, ...],
     ) -> None:
         """Validate and retain one GPU corpus without copying it to the host."""
+        clip_length_values = tuple(clip_length_values)
         if frames.ndim != 2 or tuple(frames.shape) != (schema.num_frames, schema.expert_feature_width):
             raise ValueError("frames do not match the expert schema.")
         if clip_offsets.shape != (schema.num_clips + 1,) or clip_offsets.dtype is not torch.long:
@@ -109,6 +111,17 @@ class ForwardBackwardExpertBuffer:
             or any(not isinstance(value, str) or not value for value in clip_ids)
         ):
             raise ValueError("clip_ids must contain one unique nonempty identifier per expert clip.")
+        if (
+            len(clip_length_values) != schema.num_clips
+            or any(type(value) is not int or value < 1 for value in clip_length_values)
+            or sum(clip_length_values) != schema.num_frames
+        ):
+            raise ValueError(
+                "clip_length_values must contain one positive integer per expert clip and span all frames."
+            )
+        expected_clip_lengths = torch.tensor(clip_length_values, dtype=torch.long, device=frames.device)
+        if not torch.equal(clip_lengths, expected_clip_lengths):
+            raise ValueError("clip_length_values must match clip_offsets exactly.")
 
         self.frames = frames
         self.clip_offsets = clip_offsets
@@ -117,6 +130,7 @@ class ForwardBackwardExpertBuffer:
         self.device = frames.device
         self.clip_lengths = clip_lengths
         self.clip_ids = clip_ids
+        self.clip_length_values = clip_length_values
         self._sequence_offsets = {
             length: torch.arange(length + 1, device=self.device, dtype=torch.long) for length in schema.window_lengths
         }
@@ -189,6 +203,7 @@ class ForwardBackwardExpertBuffer:
         return {
             "schema_hash": self.schema.schema_hash,
             "clip_ids": self.clip_ids,
+            "clip_length_values": self.clip_length_values,
             "priorities": self.priorities.clone(),
             "generator_state": self.generator.get_state(),
         }
@@ -199,6 +214,8 @@ class ForwardBackwardExpertBuffer:
             raise ValueError("Expert sampler state does not match the corpus schema.")
         if state.get("clip_ids") != self.clip_ids:
             raise ValueError("Expert sampler clip ids do not match the corpus.")
+        if state.get("clip_length_values") != self.clip_length_values:
+            raise ValueError("Expert sampler clip lengths do not match the corpus.")
         priorities = state["priorities"]
         if not isinstance(priorities, torch.Tensor):
             raise TypeError("Expert priorities state must be a tensor.")

@@ -31,6 +31,7 @@ from rsl_rl.algorithms.forward_backward import (
     FORWARD_BACKWARD_CHECKPOINT_VERSION,
     ForwardBackward,
     ForwardBackwardCheckpointHeader,
+    _ForwardBackwardOnlineHistory,
 )
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models.forward_backward_model import (
@@ -43,6 +44,7 @@ from rsl_rl.modules.reward_channels import ForwardBackwardRewardSchema, ForwardB
 from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
 from rsl_rl.storage.forward_backward_replay import (
     ForwardBackwardAutoresetMode,
+    ForwardBackwardHistoryLayout,
     ForwardBackwardReplay,
     ForwardBackwardTransitionBatch,
     ForwardBackwardTransitionSchema,
@@ -123,6 +125,7 @@ def _make_learner(
     normalization_type: Literal["empirical", "exponential"] = "empirical",
     auxiliary_composition: Literal["vector", "scalar"] = "vector",
     random_action_range: tuple[float, float] | None = None,
+    include_environment_reward: bool = True,
 ) -> ForwardBackward:
     """Create a small deterministic learner with live replay and expert data."""
     torch.manual_seed(13)
@@ -140,6 +143,10 @@ def _make_learner(
         "critic_auxiliary": ("state",),
     }
     reward_schema = make_reward_schema()
+    if not include_environment_reward:
+        reward_schema = ForwardBackwardRewardSchema(
+            tuple(channel for channel in reward_schema.channels if channel.source != "environment")
+        )
     states = [torch.randn(num_envs, state_width, generator=generator) + step for step in range(6)]
     observations = TensorDict({"state": states[0]}, batch_size=[num_envs])
     network = ForwardBackwardDualNetworkCfg(hidden_dim=16, hidden_layers=1, embedding_layers=2)
@@ -190,7 +197,7 @@ def _make_learner(
         reward_schema_hash=reward_schema.schema_hash,
         action_width=action_width,
         context_width=context_width,
-        environment_reward_name="environment",
+        environment_reward_name="environment" if include_environment_reward else None,
         auxiliary_evidence_names=("action_rate", "slip"),
         autoreset_mode=ForwardBackwardAutoresetMode.SAME_STEP,
     )
@@ -215,7 +222,11 @@ def _make_learner(
                 ),
                 actions=torch.randn(num_envs, action_width, generator=generator),
                 behavior_context=model.context_project(torch.randn(num_envs, context_width, generator=generator)),
-                environment_reward=torch.randn(num_envs, 1, generator=generator),
+                environment_reward=(
+                    torch.randn(num_envs, 1, generator=generator)
+                    if include_environment_reward
+                    else torch.empty(num_envs, 0)
+                ),
                 auxiliary_reward_evidence=torch.rand(num_envs, 2, generator=generator),
                 terminated=false,
                 truncated=false,
@@ -242,6 +253,7 @@ def _make_learner(
         expert_schema,
         seed=43,
         clip_ids=("clip_0", "clip_1"),
+        clip_length_values=(8, 8),
     )
     manifest = {
         "config": {"algorithm": {"gamma": 0.98}, "model": {"context_width": context_width}},
@@ -268,6 +280,7 @@ def _make_learner(
         replay,
         expert,
         ForwardBackwardCheckpointHeader.from_manifest(manifest),
+        auxiliary_evidence_observation_group="transition",
         batch_size=8,
         expert_sequence_length=2,
         value_cfg=value_cfg,
@@ -279,6 +292,91 @@ def _make_learner(
         random_action_range=random_action_range,
         multi_gpu_cfg=multi_gpu_cfg,
     )
+
+
+def _evaluation_history_layout() -> ForwardBackwardHistoryLayout:
+    """Return the compact reached-transition history used by evaluator tests."""
+    return ForwardBackwardHistoryLayout(
+        history_field="history_actor",
+        history_length=2,
+        sources=(ForwardBackwardHistoryLayout.Source("state"),),
+        include_seed_observations=False,
+    )
+
+
+def test_evaluation_history_allocates_from_sources_when_tensordict_device_is_none() -> None:
+    """Derived tensors should follow source tensors rather than TensorDict metadata."""
+    observations = TensorDict({"state": torch.ones(2, 2)}, batch_size=[2])
+    assert observations.device is None
+
+    history = ForwardBackward.EvaluationHistory(_evaluation_history_layout(), observations)
+    decorated = history.decorate_current(observations)
+
+    assert decorated["history_actor"].device == observations["state"].device
+    assert decorated["history_actor"].shape == (2, 4)
+    torch.testing.assert_close(decorated["history_actor"], torch.zeros(2, 4))
+
+
+def test_evaluation_history_advances_exactly_once_and_resets_done_rows() -> None:
+    """Same-step evaluation should shift reached sources and clear autoreset rows."""
+    initial = TensorDict({"state": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}, batch_size=[2])
+    history = ForwardBackward.EvaluationHistory(_evaluation_history_layout(), initial)
+    history.decorate_current(initial)
+
+    first = TensorDict({"state": torch.tensor([[10.0, 11.0], [12.0, 13.0]])}, batch_size=[2])
+    history.advance(initial, first, torch.tensor([False, True]))
+    torch.testing.assert_close(first["history_actor"], torch.zeros(2, 4))
+
+    second = TensorDict({"state": torch.tensor([[20.0, 21.0], [22.0, 23.0]])}, batch_size=[2])
+    history.advance(first, second, torch.tensor([False, False]))
+    torch.testing.assert_close(
+        second["history_actor"],
+        torch.tensor([[10.0, 11.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]),
+    )
+
+    third = TensorDict({"state": torch.tensor([[30.0, 31.0], [32.0, 33.0]])}, batch_size=[2])
+    history.advance(second, third, torch.tensor([False, False]))
+    torch.testing.assert_close(
+        third["history_actor"],
+        torch.tensor([[20.0, 21.0, 10.0, 11.0], [22.0, 23.0, 0.0, 0.0]]),
+    )
+
+
+def test_evaluation_history_factory_is_optional_and_independent_from_collection() -> None:
+    """Evaluation should allocate a fresh session without aliasing collection history."""
+    learner = _make_learner()
+    raw = TensorDict({"state": torch.ones(4, 6)}, batch_size=[4])
+    assert learner.evaluation_history(raw) is None
+
+    layout = ForwardBackwardHistoryLayout(
+        history_field="history_actor",
+        history_length=1,
+        sources=(ForwardBackwardHistoryLayout.Source("state"),),
+        include_seed_observations=False,
+    )
+    learner._online_history = _ForwardBackwardOnlineHistory(layout, raw)
+    learner._online_history.current.fill_(7.0)
+    evaluation = learner.evaluation_history(raw)
+
+    assert evaluation is not None
+    decorated = evaluation.decorate_current(raw.clone())
+    torch.testing.assert_close(decorated["history_actor"], torch.zeros_like(learner._online_history.current))
+    assert decorated["history_actor"].data_ptr() != learner._online_history.current.data_ptr()
+
+
+def test_evaluation_history_factory_rejects_non_same_step_replay() -> None:
+    """The evaluator must not guess history semantics for another autoreset mode."""
+    learner = _make_learner()
+    raw = TensorDict({"state": torch.ones(4, 6)}, batch_size=[4])
+    layout = _evaluation_history_layout()
+    learner._online_history = _ForwardBackwardOnlineHistory(layout, raw)
+    learner.replay.transition_schema = replace(
+        learner.replay.transition_schema,
+        autoreset_mode=ForwardBackwardAutoresetMode.NEXT_STEP,
+    )
+
+    with pytest.raises(NotImplementedError, match="same-step"):
+        learner.evaluation_history(raw)
 
 
 def test_vanilla_fb_default_uses_the_ensemble_mean_target() -> None:
@@ -330,6 +428,39 @@ def test_phase_1f_collection_retains_one_immutable_pending_action() -> None:
     assert actions.shape == (4, 2)
     with pytest.raises(RuntimeError, match="unresolved environment transition"):
         algorithm.save()
+
+
+def test_collection_ignores_environment_rewards_when_channel_is_absent() -> None:
+    """A helper-only learner should neither inspect nor materialize environment rewards."""
+    algorithm = _make_learner(include_environment_reward=False)
+    observations = TensorDict(
+        {
+            "state": torch.zeros(4, 6),
+            "transition": TensorDict(
+                {
+                    "action_rate": torch.ones(4),
+                    "slip": 2.0 * torch.ones(4),
+                },
+                batch_size=[4],
+            ),
+        },
+        batch_size=[4],
+    )
+    algorithm.act(observations)
+
+    algorithm.process_env_step(
+        observations,
+        torch.tensor(float("nan")),
+        torch.zeros(4, dtype=torch.bool),
+        {},
+    )
+    batch = algorithm.replay.sample(torch.full((4,), 5), torch.arange(4))
+    rewards = algorithm._materialize_rewards(batch, algorithm.rollout_contexts)
+
+    assert algorithm.replay.environment_reward.shape == (5, 4, 0)
+    assert batch.environment_reward.shape == (4, 0)
+    assert rewards.shape == (4, 3)
+    assert torch.all(torch.isfinite(rewards))
 
 
 def test_random_behavior_uses_independent_explicit_action_bounds() -> None:

@@ -186,6 +186,67 @@ class ForwardBackwardObservationSchema:
         return torch.cat(values, dim=-1)
 
 
+def _normalization_layout(
+    schema: ForwardBackwardObservationSchema,
+    groups: Sequence[Mapping[str, object]],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], tuple[tuple[ForwardBackwardRouteName, tuple[str, ...]], ...]]:
+    """Resolve disjoint atomic normalization owners from semantic observation fields."""
+    widths = dict(schema.field_widths)
+    if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
+        raise TypeError("normalization_groups must be an ordered sequence of group records.")
+    grouped_fields: set[str] = set()
+    layout: list[tuple[str, tuple[str, ...]]] = []
+    for group in groups:
+        if not isinstance(group, Mapping) or set(group) != {"name", "fields"}:
+            raise TypeError("Each normalization group requires exactly name and fields.")
+        owner = group["name"]
+        members_value = group["fields"]
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("Normalization group names must be nonempty strings.")
+        if isinstance(members_value, str) or not isinstance(members_value, Sequence):
+            raise TypeError("Normalization group fields must be an ordered sequence of names.")
+        members = tuple(members_value)
+        if not members or any(not isinstance(field, str) or not field for field in members):
+            raise ValueError("Normalization groups must contain nonempty field names.")
+        if len(members) != len(set(members)):
+            raise ValueError(f"Normalization group {owner!r} contains duplicate fields.")
+        unknown = set(members).difference(widths)
+        if unknown:
+            raise ValueError(f"Normalization group {owner!r} uses unknown fields: {tuple(sorted(unknown))}.")
+        overlap = grouped_fields.intersection(members)
+        if overlap:
+            raise ValueError(f"Normalization fields belong to multiple groups: {tuple(sorted(overlap))}.")
+        grouped_fields.update(members)
+        layout.append((owner, members))
+
+    grouped_owners = {owner for owner, _members in layout}
+    ungrouped_fields = tuple(field for field, _width in schema.field_widths if field not in grouped_fields)
+    owner_collisions = grouped_owners.intersection(ungrouped_fields)
+    if owner_collisions:
+        raise ValueError(f"Normalization group names collide with ungrouped fields: {tuple(sorted(owner_collisions))}.")
+    layout.extend((field, (field,)) for field in ungrouped_fields)
+    owner_by_field = {field: owner for owner, members in layout for field in members}
+    members_by_owner = dict(layout)
+
+    routes: list[tuple[ForwardBackwardRouteName, tuple[str, ...]]] = []
+    for route_name, route_fields in schema.routes:
+        owners: list[str] = []
+        index = 0
+        while index < len(route_fields):
+            field = route_fields[index]
+            owner = owner_by_field[field]
+            members = members_by_owner[owner]
+            if tuple(route_fields[index : index + len(members)]) != members:
+                raise ValueError(
+                    f"Normalization group {owner!r} must appear atomically and in declared order "
+                    f"in route {route_name!r}."
+                )
+            owners.append(owner)
+            index += len(members)
+        routes.append((route_name, tuple(owners)))
+    return tuple(layout), tuple(routes)
+
+
 @dataclass(frozen=True, slots=True)
 class ForwardBackwardDualNetworkCfg:
     """Architecture shared by actor, forward map, and named value heads."""
@@ -377,7 +438,8 @@ class ForwardBackwardModel(torch.nn.Module):
         for value in options.pop("value_heads", ()):
             value_options = dict(value)
             spec = ForwardBackwardValueSpec(**dict(value_options.pop("spec")))
-            network = ForwardBackwardDualNetworkCfg(**dict(value_options.pop("network")))
+            network_options = value_options.pop("network", None)
+            network = forward_cfg if network_options is None else ForwardBackwardDualNetworkCfg(**dict(network_options))
             if value_options:
                 raise ValueError(f"Unknown value-head configuration: {tuple(value_options)}.")
             value_heads.append(ForwardBackwardValueHeadCfg(spec, network))
@@ -411,6 +473,7 @@ class ForwardBackwardModel(torch.nn.Module):
         normalization_eps: float = 1e-2,
         normalization_momentum: float = 0.1,
         normalization_until: int | None = None,
+        normalization_groups: Sequence[Mapping[str, object]] = (),
         context_normalization: bool = True,
     ) -> None:
         """Build the composite model from explicit component configurations."""
@@ -429,17 +492,26 @@ class ForwardBackwardModel(torch.nn.Module):
         self.context_normalization = context_normalization
         self.value_specs = tuple(head.spec for head in value_heads)
 
+        self.normalization_layout, normalization_routes = _normalization_layout(
+            self.observation_schema, normalization_groups
+        )
+        self._normalization_fields = dict(self.normalization_layout)
+        self._normalization_routes = dict(normalization_routes)
+        field_widths = dict(self.observation_schema.field_widths)
+        owner_widths = {
+            owner: sum(field_widths[field] for field in fields) for owner, fields in self.normalization_layout
+        }
         if normalization_type == "none":
-            normalizers = {name: IdentityNormalization() for name, _width in self.observation_schema.field_widths}
+            normalizers = {owner: IdentityNormalization() for owner in owner_widths}
         elif normalization_type == "empirical":
             normalizers = {
-                name: EmpiricalNormalization(width, eps=normalization_eps, until=normalization_until)
-                for name, width in self.observation_schema.field_widths
+                owner: EmpiricalNormalization(width, eps=normalization_eps, until=normalization_until)
+                for owner, width in owner_widths.items()
             }
         elif normalization_type == "exponential":
             normalizers = {
-                name: ExponentialNormalization(width, eps=normalization_eps, momentum=normalization_momentum)
-                for name, width in self.observation_schema.field_widths
+                owner: ExponentialNormalization(width, eps=normalization_eps, momentum=normalization_momentum)
+                for owner, width in owner_widths.items()
             }
         else:
             raise ValueError(f"Unknown normalization_type: {normalization_type!r}.")
@@ -550,15 +622,22 @@ class ForwardBackwardModel(torch.nn.Module):
         name: ForwardBackwardRouteName,
     ) -> torch.Tensor:
         """Normalize shared fields and concatenate one route."""
-        fields = self.observation_schema.route(name)
-        values = [self.observation_normalizers[field](observations[field]) for field in fields]
+        owners = self._normalization_routes[name]
+        values = []
+        for owner in owners:
+            fields = self._normalization_fields[owner]
+            raw_values = [observations[field] for field in fields]
+            raw = raw_values[0] if len(raw_values) == 1 else torch.cat(raw_values, dim=-1)
+            values.append(self.observation_normalizers[owner](raw))
         return values[0] if len(values) == 1 else torch.cat(values, dim=-1)
 
     @torch.no_grad()
     def update_normalization(self, observations: TensorDict) -> None:
         """Update each field normalizer exactly once from raw observations."""
-        for field_name, _width in self.observation_schema.field_widths:
-            self.observation_normalizers[field_name].update(observations[field_name])
+        for owner, fields in self.normalization_layout:
+            raw_values = [observations[field] for field in fields]
+            raw = raw_values[0] if len(raw_values) == 1 else torch.cat(raw_values, dim=-1)
+            self.observation_normalizers[owner].update(raw)
 
     def normalization_train(self, mode: bool = True) -> None:
         """Enable or freeze field-normalizer updates."""
@@ -730,11 +809,13 @@ class ForwardBackwardInferenceModel(torch.nn.Module):
         self.action_dim = model.action_dim
         self.context_dim = model.context_dim
         self.context_normalization = model.context_normalization
+        self.normalization_layout = model.normalization_layout
+        self._normalization_fields = model._normalization_fields
+        self._normalization_routes = {name: model._normalization_routes[name] for name in ("actor", "backward")}
         fields = set(self.observation_schema.route("actor") + self.observation_schema.route("backward"))
+        owners = tuple(owner for owner, members in self.normalization_layout if fields.intersection(members))
         self.observation_normalizers = torch.nn.ModuleDict({
-            name: model.observation_normalizers[name]
-            for name, _width in self.observation_schema.field_widths
-            if name in fields
+            owner: model.observation_normalizers[owner] for owner in owners
         })
         self.actor_network = model.actor_network
         self.backward_network = model.backward_network
@@ -746,8 +827,12 @@ class ForwardBackwardInferenceModel(torch.nn.Module):
         name: Literal["actor", "backward"],
     ) -> torch.Tensor:
         """Normalize and concatenate one deterministic inference route."""
-        fields = self.observation_schema.route(name)
-        values = [self.observation_normalizers[field](observations[field]) for field in fields]
+        values = []
+        for owner in self._normalization_routes[name]:
+            fields = self._normalization_fields[owner]
+            raw_values = [observations[field] for field in fields]
+            raw = raw_values[0] if len(raw_values) == 1 else torch.cat(raw_values, dim=-1)
+            values.append(self.observation_normalizers[owner](raw))
         return values[0] if len(values) == 1 else torch.cat(values, dim=-1)
 
     def action_deterministic(self, observations: TensorDict, context: torch.Tensor) -> torch.Tensor:

@@ -14,6 +14,7 @@ from tensordict import TensorDict
 import pytest
 
 from rsl_rl.models.forward_backward_model import ForwardBackwardObservationSchema
+from rsl_rl.modules.reward_channels import ForwardBackwardRewardChannel, ForwardBackwardRewardSchema
 from rsl_rl.storage.forward_backward_replay import (
     ForwardBackwardAutoresetMode,
     ForwardBackwardHistoryLayout,
@@ -156,6 +157,53 @@ def _assert_batches_equal(expected: ForwardBackwardReplayBatch, actual: ForwardB
         "valid",
     ):
         torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+
+
+def test_replay_omits_environment_reward_storage_when_not_declared() -> None:
+    """A helper-only learner should own no environment-reward tensor elements."""
+    observation_schema = ForwardBackwardObservationSchema.from_config({"state": 2}, {"actor": ("state",)})
+    reward_schema = ForwardBackwardRewardSchema((
+        ForwardBackwardRewardChannel(
+            name="discriminator",
+            provider_name="discriminator",
+            source="recomputed",
+            timing="state",
+            context_dependent=True,
+            sign=1,
+        ),
+    ))
+    transition_schema = ForwardBackwardTransitionSchema(
+        observation_schema_hash=observation_schema.schema_hash,
+        reward_schema_hash=reward_schema.schema_hash,
+        action_width=2,
+        context_width=3,
+        environment_reward_name=None,
+        auxiliary_evidence_names=(),
+        autoreset_mode=ForwardBackwardAutoresetMode.SAME_STEP,
+    )
+    replay = ForwardBackwardReplay(
+        2,
+        3,
+        1,
+        observation_schema,
+        transition_schema,
+        reward_schema,
+        "cpu",
+    )
+    transition = _transition(0, transition_schema.autoreset_mode, observation_schema, transition_schema)
+    transition = replace(
+        transition,
+        environment_reward=torch.empty(3, 0),
+        auxiliary_reward_evidence=torch.empty(3, 0),
+    )
+
+    transition.assert_valid(transition_schema, observation_schema)
+    replay.add(transition)
+    batch = replay.sample(torch.tensor([0, 0, 0]), torch.tensor([0, 1, 2]))
+
+    assert replay.environment_reward.shape == (2, 3, 0)
+    assert replay.environment_reward.numel() == 0
+    assert batch.environment_reward.shape == (3, 0)
 
 
 def test_node_edge_replay_matches_dense_oracle_through_wrap_and_boundaries() -> None:
@@ -474,13 +522,34 @@ def test_external_reset_rejects_next_step_streams() -> None:
         )
 
 
+def test_history_layout_rejects_its_derived_field_as_a_source() -> None:
+    """A derived history cannot be reconstructed from the field omitted from node storage."""
+    observation_schema, transition_schema = _contracts(field_widths={"state": 2, "history_actor": 4})
+    layout = ForwardBackwardHistoryLayout(
+        history_field="history_actor",
+        history_length=1,
+        sources=(ForwardBackwardHistoryLayout.Source("history_actor"),),
+    )
+
+    with pytest.raises(ValueError, match="own derived history field"):
+        ForwardBackwardReplay(
+            3,
+            3,
+            3,
+            observation_schema,
+            transition_schema,
+            make_reward_schema(),
+            "cpu",
+            history_layout=layout,
+        )
+
+
 def _history_layout() -> ForwardBackwardHistoryLayout:
     source = ForwardBackwardHistoryLayout.Source
     return ForwardBackwardHistoryLayout(
         history_field="history_actor",
         history_length=2,
-        sources=(source(None, 0, 2), source("state", 1, 3)),
-        last_action_field="last_action",
+        sources=(source("last_action"), source("state_tail")),
     )
 
 
@@ -494,10 +563,11 @@ def _history_observation(
     zeros_action = torch.zeros_like(actions[0])
     zeros_state = torch.zeros_like(state[:, 1:3])
     last_action = actions[step - 1] if step - 1 >= episode_start else zeros_action
-    action_history = [actions[step - lag] if step - lag >= episode_start else zeros_action for lag in (1, 2)]
+    action_history = [actions[step - lag - 1] if step - lag - 1 >= episode_start else zeros_action for lag in (1, 2)]
     state_history = [states[step - lag][:, 1:3] if step - lag >= episode_start else zeros_state for lag in (1, 2)]
     return {
         "state": state,
+        "state_tail": state[:, 1:3],
         "last_action": last_action,
         "history_actor": torch.cat((*action_history, *state_history), dim=-1),
     }
@@ -505,7 +575,7 @@ def _history_observation(
 
 def test_versioned_history_reconstruction_matches_dense_emitted_noise_after_wrap() -> None:
     """Compact history must use retained emitted tensors, including their noise."""
-    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    fields = {"state": 4, "state_tail": 2, "last_action": 2, "history_actor": 8}
     observation_schema, transition_schema = _contracts(field_widths=fields)
     layout = _history_layout()
     oracle, replay = _make_replays(3, 3, observation_schema, transition_schema, layout)
@@ -544,9 +614,9 @@ def test_versioned_history_reconstruction_matches_dense_emitted_noise_after_wrap
     assert replay.storage_bytes() < dense_replay.storage_bytes()
 
 
-def test_history_excludes_seeded_observations_but_keeps_applied_actions() -> None:
-    """A reset seed may be absent from observation history while its outgoing action is retained."""
-    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+def test_history_excludes_seeded_observations_from_every_named_source() -> None:
+    """A reset seed must not leak into any named observation-history source."""
+    fields = {"state": 4, "state_tail": 2, "last_action": 2, "history_actor": 8}
     observation_schema, transition_schema = _contracts(field_widths=fields)
     layout = replace(_history_layout(), include_seed_observations=False)
     oracle, replay = _make_replays(5, 3, observation_schema, transition_schema, layout)
@@ -558,7 +628,10 @@ def test_history_excludes_seeded_observations_but_keeps_applied_actions() -> Non
         dense = _history_observation(step, states, actions, 0)
         zeros_state = torch.zeros_like(states[0][:, 1:3])
         state_history = [states[step - lag][:, 1:3] if step - lag >= 1 else zeros_state for lag in (1, 2)]
-        dense["history_actor"] = torch.cat((dense["history_actor"][:, :4], *state_history), dim=-1)
+        action_history = [
+            actions[step - lag - 1] if step - lag >= 1 else torch.zeros_like(actions[0]) for lag in (1, 2)
+        ]
+        dense["history_actor"] = torch.cat((*action_history, *state_history), dim=-1)
         return dense
 
     for step in range(4):
@@ -587,20 +660,19 @@ def _bfm_history_layout() -> ForwardBackwardHistoryLayout:
         history_field="history_actor",
         history_length=4,
         sources=(
-            source("last_action", 0, 29),
-            source("state", 61, 64),
-            source("state", 0, 29),
-            source("state", 29, 58),
-            source("state", 58, 61),
+            source("last_action"),
+            source("base_angular_velocity"),
+            source("joint_position"),
+            source("joint_velocity"),
+            source("projected_gravity"),
         ),
-        last_action_field=None,
         include_seed_observations=False,
     )
 
 
 def _bfm_observation(
     step: int,
-    states: list[torch.Tensor],
+    states: dict[str, list[torch.Tensor]],
     privileged_states: list[torch.Tensor],
     actions: list[torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -610,18 +682,20 @@ def _bfm_observation(
         for lag in range(1, 5):
             source_step = step - lag
             if source_step < 1:
-                width = source.stop - source.start
-                history_parts.append(torch.zeros(states[0].shape[0], width))
+                template = (
+                    zeros_action if source.observation_name == "last_action" else states[source.observation_name][0]
+                )
+                history_parts.append(torch.zeros_like(template))
             elif source.observation_name == "last_action":
                 action_step = source_step - 1
                 if action_step < 0:
-                    history_parts.append(torch.zeros(states[0].shape[0], source.stop - source.start))
+                    history_parts.append(zeros_action)
                 else:
-                    history_parts.append(actions[action_step][:, source.start : source.stop])
+                    history_parts.append(actions[action_step])
             else:
-                history_parts.append(states[source_step][:, source.start : source.stop])
+                history_parts.append(states[source.observation_name][source_step])
     return {
-        "state": states[step],
+        **{name: values[step] for name, values in states.items()},
         "privileged_state": privileged_states[step],
         "last_action": actions[step - 1] if step > 0 else zeros_action,
         "history_actor": torch.cat(history_parts, dim=-1),
@@ -630,12 +704,25 @@ def _bfm_observation(
 
 def test_bfm_field_major_history_layout_matches_dense_oracle() -> None:
     """The compact layout should reproduce BFM's sorted field-major, newest-first history."""
-    fields = {"state": 64, "last_action": 29, "history_actor": 372, "privileged_state": 463}
+    fields = {
+        "joint_position": 29,
+        "joint_velocity": 29,
+        "projected_gravity": 3,
+        "base_angular_velocity": 3,
+        "last_action": 29,
+        "history_actor": 372,
+        "privileged_state": 463,
+    }
     observation_schema, transition_schema = _contracts(field_widths=fields, action_width=29)
     layout = _bfm_history_layout()
     oracle, replay = _make_replays(3, 3, observation_schema, transition_schema, layout)
     generator = torch.Generator().manual_seed(23)
-    states = [torch.randn(3, 64, generator=generator) + step for step in range(7)]
+    states = {
+        "joint_position": [torch.randn(3, 29, generator=generator) + step for step in range(7)],
+        "joint_velocity": [torch.randn(3, 29, generator=generator) + step for step in range(7)],
+        "projected_gravity": [torch.randn(3, 3, generator=generator) + step for step in range(7)],
+        "base_angular_velocity": [torch.randn(3, 3, generator=generator) + step for step in range(7)],
+    }
     privileged_states = [torch.randn(3, 463, generator=generator) + step for step in range(7)]
     actions = [torch.randn(3, 29, generator=generator) + step for step in range(6)]
     for step in range(6):
@@ -660,7 +747,7 @@ def test_bfm_field_major_history_layout_matches_dense_oracle() -> None:
 
 def test_history_and_last_action_zero_pad_after_reset_but_final_keeps_old_episode() -> None:
     """The final state should advance old history while the reset state starts from zero."""
-    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    fields = {"state": 4, "state_tail": 2, "last_action": 2, "history_actor": 8}
     observation_schema, transition_schema = _contracts(field_widths=fields)
     layout = _history_layout()
     oracle, replay = _make_replays(5, 5, observation_schema, transition_schema, layout)
@@ -687,6 +774,7 @@ def test_history_and_last_action_zero_pad_after_reset_but_final_keeps_old_episod
     final = _history_observation(3, states, actions, 0)
     reset = {
         "state": states[3] + 1000,
+        "state_tail": states[3][:, 1:3] + 1000,
         "last_action": torch.zeros(3, 2),
         "history_actor": torch.zeros(3, 8),
     }
@@ -732,9 +820,66 @@ def test_history_and_last_action_zero_pad_after_reset_but_final_keeps_old_episod
     torch.testing.assert_close(reset_batch.observations["history_actor"], torch.zeros(1, 8))
 
 
+def test_history_excludes_same_step_reset_seed_from_next_reached_state() -> None:
+    """A same-step reset seed should stay absent from histories when the layout excludes seeds."""
+    fields = {"state": 4, "state_tail": 2, "history_actor": 4}
+    observation_schema, transition_schema = _contracts(field_widths=fields)
+    layout = ForwardBackwardHistoryLayout(
+        history_field="history_actor",
+        history_length=2,
+        sources=(ForwardBackwardHistoryLayout.Source("state_tail"),),
+        include_seed_observations=False,
+    )
+    _oracle, replay = _make_replays(5, 5, observation_schema, transition_schema, layout)
+
+    def observation(step: int) -> dict[str, torch.Tensor]:
+        state = _state(step, 3, 4)
+        return {
+            "state": state,
+            "state_tail": state[:, 1:3],
+            "history_actor": torch.zeros(3, 4),
+        }
+
+    replay.add(_transition(0, transition_schema.autoreset_mode, observation_schema, transition_schema))
+    current = observation(1)
+    final = observation(2)
+    reset = observation(2)
+    reset["state"][0] += 1000.0
+    reset["state_tail"][0] = reset["state"][0, 1:3]
+    replay.add(
+        _transition(
+            1,
+            transition_schema.autoreset_mode,
+            observation_schema,
+            transition_schema,
+            done_envs=(0,),
+            current=current,
+            reached=final,
+            reset=reset,
+        )
+    )
+
+    reached = observation(3)
+    reached["state"][0] = reset["state"][0] + 1.0
+    reached["state_tail"][0] = reached["state"][0, 1:3]
+    replay.add(
+        _transition(
+            2,
+            transition_schema.autoreset_mode,
+            observation_schema,
+            transition_schema,
+            current=reset,
+            reached=reached,
+        )
+    )
+
+    batch = replay.sample(torch.tensor([2]), torch.tensor([0]))
+    torch.testing.assert_close(batch.next_observations["history_actor"], torch.zeros(1, 4))
+
+
 def test_external_reset_preserves_final_history_and_zero_pads_new_episode() -> None:
     """A between-step reset should split derived history at the same exact boundary."""
-    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    fields = {"state": 4, "state_tail": 2, "last_action": 2, "history_actor": 8}
     observation_schema, transition_schema = _contracts(field_widths=fields)
     layout = _history_layout()
     _oracle, replay = _make_replays(6, 6, observation_schema, transition_schema, layout)
@@ -874,11 +1019,11 @@ def test_next_step_replay_state_restores_valid_population_and_rng() -> None:
 
 def test_replay_state_rejects_history_layout_mismatch() -> None:
     """A checkpoint must not reinterpret history under another layout."""
-    fields = {"state": 4, "last_action": 2, "history_actor": 8}
+    fields = {"state": 4, "state_tail": 2, "last_action": 2, "history_actor": 8}
     observation_schema, transition_schema = _contracts(field_widths=fields)
     _oracle, replay = _make_replays(3, 3, observation_schema, transition_schema, _history_layout())
     state = replay.state_dict()
-    changed_layout = replace(_history_layout(), version=1, sources=tuple(reversed(_history_layout().sources)))
+    changed_layout = replace(_history_layout(), sources=tuple(reversed(_history_layout().sources)))
     _other_oracle, restored = _make_replays(3, 3, observation_schema, transition_schema, changed_layout)
 
     with pytest.raises(ValueError, match="incompatible"):

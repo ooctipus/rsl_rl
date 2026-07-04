@@ -64,6 +64,17 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
     assert cfg["model"]["normalization_type"] == "exponential"
     assert cfg["model"]["normalization_eps"] == 1e-5
     assert cfg["model"]["normalization_momentum"] == 0.01
+    assert cfg["model"]["normalization_groups"] == [
+        {
+            "name": "state",
+            "fields": [
+                "joint_position",
+                "joint_velocity",
+                "projected_gravity",
+                "base_angular_velocity",
+            ],
+        }
+    ]
     assert cfg["model"]["distribution_cfg"]["noise_clip"] == 0.3
     assert cfg["replay"]["capacity_transitions"] == 5_120_000
     assert "capacity_steps" not in cfg["replay"]

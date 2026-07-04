@@ -43,7 +43,7 @@ class ForwardBackwardTransitionSchema:
     reward_schema_hash: str
     action_width: int
     context_width: int
-    environment_reward_name: str
+    environment_reward_name: str | None
     auxiliary_evidence_names: tuple[str, ...]
     autoreset_mode: ForwardBackwardAutoresetMode
     schema_version: int = 1
@@ -58,8 +58,10 @@ class ForwardBackwardTransitionSchema:
             raise ValueError("Action and context widths must be positive.")
         if len(auxiliary_evidence_names) != len(set(auxiliary_evidence_names)):
             raise ValueError("Auxiliary evidence names must be unique.")
-        if self.environment_reward_name in auxiliary_evidence_names:
+        if self.environment_reward_name is not None and self.environment_reward_name in auxiliary_evidence_names:
             raise ValueError("The environment reward must not also be auxiliary evidence.")
+        if self.environment_reward_name == "":
+            raise ValueError("environment_reward_name must be nonempty or None.")
         if not isinstance(self.autoreset_mode, ForwardBackwardAutoresetMode):
             raise ValueError(f"Unsupported autoreset mode: {self.autoreset_mode!r}.")
         if self.schema_version != 1:
@@ -97,14 +99,31 @@ class ForwardBackwardTransitionSchema:
 
         channel_by_name = {channel.name: channel for channel in reward_schema.channels}
         try:
-            environment_channel = channel_by_name[self.environment_reward_name]
             evidence_channels = tuple(channel_by_name[name] for name in self.auxiliary_evidence_names)
+        except KeyError as error:
+            raise ValueError(f"Transition references unknown reward channel {error.args[0]!r}.") from error
+        if any(channel.source != "stored_evidence" for channel in evidence_channels):
+            raise ValueError("Auxiliary evidence names must identify stored-evidence reward channels.")
+        stored_evidence_names = tuple(
+            channel.name for channel in reward_schema.channels if channel.source == "stored_evidence"
+        )
+        if self.auxiliary_evidence_names != stored_evidence_names:
+            raise ValueError(
+                "auxiliary_evidence_names must exactly match stored-evidence reward channels in schema order."
+            )
+        environment_channels = tuple(channel for channel in reward_schema.channels if channel.source == "environment")
+        if self.environment_reward_name is None:
+            if environment_channels:
+                raise ValueError("environment_reward_name is required when the reward schema uses environment reward.")
+            return
+        try:
+            environment_channel = channel_by_name[self.environment_reward_name]
         except KeyError as error:
             raise ValueError(f"Transition references unknown reward channel {error.args[0]!r}.") from error
         if environment_channel.source != "environment":
             raise ValueError("environment_reward_name must identify an environment reward channel.")
-        if any(channel.source != "stored_evidence" for channel in evidence_channels):
-            raise ValueError("Auxiliary evidence names must identify stored-evidence reward channels.")
+        if len(environment_channels) != 1:
+            raise ValueError("A transition schema supports at most one environment reward channel.")
 
 
 @dataclass(frozen=True)
@@ -203,7 +222,11 @@ class ForwardBackwardTransitionBatch:
         float_fields = (
             ("actions", self.actions, (batch_size, schema.action_width)),
             ("behavior_context", self.behavior_context, (batch_size, schema.context_width)),
-            ("environment_reward", self.environment_reward, (batch_size, 1)),
+            (
+                "environment_reward",
+                self.environment_reward,
+                (batch_size, int(schema.environment_reward_name is not None)),
+            ),
             (
                 "auxiliary_reward_evidence",
                 self.auxiliary_reward_evidence,
@@ -269,7 +292,7 @@ class ForwardBackwardTransitionBatch:
 
 @dataclass(frozen=True, slots=True)
 class ForwardBackwardHistoryLayout:
-    """Versioned reconstruction of derived last-action and history fields.
+    """Versioned reconstruction of one derived history field.
 
     ``include_seed_observations`` controls whether observations introduced
     without an applied transition, at stream initialization or an external
@@ -279,27 +302,20 @@ class ForwardBackwardHistoryLayout:
 
     @dataclass(frozen=True, slots=True)
     class Source:
-        """One field-major history source.
+        """One complete named observation used as a field-major history source."""
 
-        ``observation_name=None`` selects applied actions. Otherwise ``start``
-        and ``stop`` select an emitted observation slice.
-        """
-
-        observation_name: str | None
-        start: int
-        stop: int
+        observation_name: str
 
         def __post_init__(self) -> None:
-            """Reject empty source slices."""
-            if self.start < 0 or self.stop <= self.start:
-                raise ValueError("History source slices must be non-empty and non-negative.")
+            """Reject unnamed history sources."""
+            if not self.observation_name:
+                raise ValueError("History sources must name one observation field.")
 
     history_field: str
     history_length: int
     sources: tuple[Source, ...]
-    last_action_field: str | None = None
     include_seed_observations: bool = True
-    version: int = 1
+    version: int = 2
     schema_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -312,9 +328,7 @@ class ForwardBackwardHistoryLayout:
             raise ValueError("history_length must be positive.")
         if not sources:
             raise ValueError("At least one history source is required.")
-        if self.last_action_field == self.history_field:
-            raise ValueError("last_action_field and history_field must differ.")
-        if self.version != 1:
+        if self.version != 2:
             raise ValueError(f"Unsupported history layout version: {self.version!r}.")
         object.__setattr__(
             self,
@@ -323,8 +337,7 @@ class ForwardBackwardHistoryLayout:
                 "history_field": self.history_field,
                 "history_length": self.history_length,
                 "include_seed_observations": self.include_seed_observations,
-                "last_action_field": self.last_action_field,
-                "sources": tuple((source.observation_name, source.start, source.stop) for source in sources),
+                "sources": tuple(source.observation_name for source in sources),
                 "version": self.version,
             }),
         )
@@ -364,8 +377,8 @@ class ForwardBackwardReplay:
 
     The edge ring has ``capacity_steps`` vector rows. Emitted observation nodes
     retain one successor guard row plus the optional history horizon. Derived
-    last-action and actor-history fields are reconstructed from emitted nodes
-    and applied actions when a :class:`ForwardBackwardHistoryLayout` is given.
+    actor-history fields are reconstructed from emitted nodes when a
+    :class:`ForwardBackwardHistoryLayout` is given.
 
     Calls to :meth:`add` must form one contiguous vector-environment stream:
     except for explicit-reset mode, one call's ``next_observations`` are the
@@ -417,12 +430,10 @@ class ForwardBackwardReplay:
 
         history_length = history_layout.history_length if history_layout is not None else 0
         self.node_capacity_steps = capacity_steps + history_length + 1
-        self.action_capacity_steps = capacity_steps + history_length
+        self.action_capacity_steps = capacity_steps
         derived_fields = set()
         if history_layout is not None:
             derived_fields.add(history_layout.history_field)
-            if history_layout.last_action_field is not None:
-                derived_fields.add(history_layout.last_action_field)
         self._stored_fields = tuple(
             name for name, _width in observation_schema.field_widths if name not in derived_fields
         )
@@ -450,7 +461,9 @@ class ForwardBackwardReplay:
         self.behavior_context = torch.zeros(
             *edge_shape, transition_schema.context_width, device=self.device, dtype=dtype
         )
-        self.environment_reward = torch.zeros(*edge_shape, 1, device=self.device, dtype=dtype)
+        self.environment_reward = torch.zeros(
+            *edge_shape, int(transition_schema.environment_reward_name is not None), device=self.device, dtype=dtype
+        )
         self.auxiliary_reward_evidence = torch.zeros(
             *edge_shape, len(transition_schema.auxiliary_evidence_names), device=self.device, dtype=dtype
         )
@@ -553,6 +566,8 @@ class ForwardBackwardReplay:
         self.node_episode_steps[next_node_row].copy_(next_episode_steps)
         if self.node_history_valid is not None:
             self.node_history_valid[next_node_row].copy_(replay)
+            if self.transition_schema.autoreset_mode is ForwardBackwardAutoresetMode.SAME_STEP:
+                self.node_history_valid[next_node_row].masked_fill_(done, False)
 
         self.actions[action_row].copy_(transition.actions)
         edge_flags = transition.terminated.squeeze(-1).to(torch.uint8) * _EDGE_TERMINATED
@@ -905,29 +920,18 @@ class ForwardBackwardReplay:
         layout = self.history_layout
         if layout is None:
             return
+        if any(source.observation_name == layout.history_field for source in layout.sources):
+            raise ValueError("A history layout cannot use its own derived history field as a source.")
         try:
             expected_history_width = self._field_widths[layout.history_field]
         except KeyError as error:
             raise ValueError(f"Unknown history field: {layout.history_field!r}.") from error
-        source_width = 0
-        for source in layout.sources:
-            width = (
-                self.transition_schema.action_width
-                if source.observation_name is None
-                else self._field_widths.get(source.observation_name, 0)
-            )
-            if source.stop > width:
-                raise ValueError("History source slice exceeds its observation or action width.")
-            source_width += source.stop - source.start
+        try:
+            source_width = sum(self._field_widths[source.observation_name] for source in layout.sources)
+        except KeyError as error:
+            raise ValueError(f"Unknown history source field: {error.args[0]!r}.") from error
         if expected_history_width != layout.history_length * source_width:
-            raise ValueError("History field width does not match its source slices and history length.")
-        if layout.last_action_field is not None:
-            try:
-                last_action_width = self._field_widths[layout.last_action_field]
-            except KeyError as error:
-                raise ValueError(f"Unknown last-action field: {layout.last_action_field!r}.") from error
-            if last_action_width != self.transition_schema.action_width:
-                raise ValueError("The reconstructed last-action field must match action_width.")
+            raise ValueError("History field width does not match its named sources and history length.")
 
     def _reconstruct_derived(
         self,
@@ -941,43 +945,20 @@ class ForwardBackwardReplay:
         if layout is None:
             return {}, complete
         derived: dict[str, torch.Tensor] = {}
-        if layout.last_action_field is not None:
-            source_steps = state_steps - 1
-            rows = torch.remainder(source_steps, self.action_capacity_steps)
-            node_rows = torch.remainder(source_steps, self.node_capacity_steps)
-            source_valid = (self.node_episode_ids[node_rows, env_ids] == episode_ids) & (
-                self.node_episode_steps[node_rows, env_ids] == episode_steps - 1
-            )
-            required = episode_steps >= 1
-            complete &= (~required | source_valid).unsqueeze(-1)
-            values = self.actions[rows, env_ids]
-            derived[layout.last_action_field] = torch.where(
-                source_valid.unsqueeze(-1), values, torch.zeros_like(values)
-            )
-
         history_parts = []
         for source in layout.sources:
             lag_parts = []
             for lag in range(1, layout.history_length + 1):
                 source_steps = state_steps - lag
                 required = episode_steps >= lag
-                if source.observation_name is None:
-                    rows = torch.remainder(source_steps, self.action_capacity_steps)
-                    node_rows = torch.remainder(source_steps, self.node_capacity_steps)
-                    source_valid = (self.node_episode_ids[node_rows, env_ids] == episode_ids) & (
-                        self.node_episode_steps[node_rows, env_ids] == episode_steps - lag
-                    )
-                    source_complete = source_valid
-                    values = self.actions[rows, env_ids, source.start : source.stop]
-                else:
-                    rows = torch.remainder(source_steps, self.node_capacity_steps)
-                    source_valid = (self.node_episode_ids[rows, env_ids] == episode_ids) & (
-                        self.node_episode_steps[rows, env_ids] == episode_steps - lag
-                    )
-                    source_complete = source_valid
-                    if self.node_history_valid is not None:
-                        source_valid = source_valid & self.node_history_valid[rows, env_ids]
-                    values = self.nodes[source.observation_name][rows, env_ids, source.start : source.stop]
+                rows = torch.remainder(source_steps, self.node_capacity_steps)
+                source_valid = (self.node_episode_ids[rows, env_ids] == episode_ids) & (
+                    self.node_episode_steps[rows, env_ids] == episode_steps - lag
+                )
+                source_complete = source_valid
+                if self.node_history_valid is not None:
+                    source_valid = source_valid & self.node_history_valid[rows, env_ids]
+                values = self.nodes[source.observation_name][rows, env_ids]
                 complete &= (~required | source_complete).unsqueeze(-1)
                 lag_parts.append(torch.where(source_valid.unsqueeze(-1), values, torch.zeros_like(values)))
             history_parts.append(torch.cat(lag_parts, dim=-1))
