@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RSL-RL lifecycle and checkpoint boundary for forward-backward learning."""
+"""RSL-RL algorithm and construction boundary for forward-backward learning."""
 
 from __future__ import annotations
 
@@ -373,6 +373,7 @@ class ForwardBackward:
         scale_actor_helpers: bool = True,
         max_grad_norm: float | None = None,
         random_action_range: tuple[float, float] | None = None,
+        random_action_transitions: int = 0,
         seed: int = 0,
         rollout_context_refresh_steps: int = 100,
         rollout_expert_fraction: float = 0.0,
@@ -410,7 +411,14 @@ class ForwardBackward:
             random_action_range = tuple(float(bound) for bound in random_action_range)
             if len(random_action_range) != 2 or random_action_range[0] >= random_action_range[1]:
                 raise ValueError("random_action_range must contain ordered lower and upper bounds.")
+        if type(random_action_transitions) is not int or random_action_transitions < 0:
+            raise ValueError("random_action_transitions must be a non-negative integer.")
+        if random_action_transitions % replay.num_envs:
+            raise ValueError("random_action_transitions must contain complete vector steps.")
+        if random_action_transitions and random_action_range is None:
+            raise ValueError("Random warm-up requires bounded random actions.")
         self.random_action_range = random_action_range
+        self.random_action_transitions = random_action_transitions
 
         requested_device = torch.device(device)
         self.model = model.to(requested_device)
@@ -607,8 +615,13 @@ class ForwardBackward:
 
     @property
     def ready_to_update(self) -> bool:
-        """Return whether replay holds at least one complete update batch."""
-        return self.replay.num_transitions >= self.batch_size
+        """Return whether replay is batched beyond the released warm-up boundary."""
+        collected_transitions = self.replay.total_steps * self.replay.num_envs
+        warmup_complete = (
+            not self.random_action_transitions
+            or collected_transitions > self.random_action_transitions + self.replay.num_envs
+        )
+        return self.replay.num_transitions >= self.batch_size and warmup_complete
 
     @property
     def learning_rate(self) -> float:
@@ -619,10 +632,6 @@ class ForwardBackward:
     def action_std(self) -> torch.Tensor:
         """Return the current action spread for ordinary runner logging."""
         return self.model.action_distribution.std
-
-    def validate_collection(self) -> None:
-        """Reduce deferred replay contract errors at the runner control boundary."""
-        self.replay.assert_no_errors()
 
     def _copy_auxiliary_evidence(self, observations: TensorDict, mask: torch.Tensor | None = None) -> None:
         """Pack a flat or named evidence group into the fixed replay row."""
@@ -653,7 +662,10 @@ class ForwardBackward:
             )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Sample one behavior action and retain its immutable transition fields."""
+        """Sample the configured warm-up or policy behavior action."""
+        collected_transitions = self.replay.total_steps * self.replay.num_envs
+        if collected_transitions < self.random_action_transitions:
+            return self.act_random(obs)
         if self._collection_observations is not None:
             raise RuntimeError("The previous behavior action has not been processed.")
         observations = obs.to(self.device)
@@ -907,6 +919,7 @@ class ForwardBackward:
 
     def update(self) -> dict[str, torch.Tensor]:
         """Run one visible off-policy mutation sequence."""
+        self.replay.assert_no_errors()
         if self._update_in_progress:
             raise RuntimeError("A forward-backward update is already in progress.")
         self._update_in_progress = True
@@ -1414,11 +1427,140 @@ class ForwardBackward:
 
 
 def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
-    """Construct one forward-backward learner from ordinary RSL-RL sections."""
+    """Construct one forward-backward learner from canonical runner sections."""
+    seed = cfg["seed"]
+    if type(seed) is not int:
+        raise TypeError("Forward-backward runner seed must be an integer.")
     model_cfg = dict(cfg["model"])
     replay_cfg = dict(cfg["replay"])
     expert_cfg = dict(cfg["expert"])
     algorithm_cfg = dict(cfg["algorithm"])
+    for section_name, section, derived_names in (
+        ("model", model_cfg, ("value_heads",)),
+        (
+            "replay",
+            replay_cfg,
+            (
+                "reward_channels",
+                "environment_reward_name",
+                "auxiliary_evidence_names",
+                "auxiliary_evidence_observation_group",
+            ),
+        ),
+        ("expert", expert_cfg, ()),
+        ("algorithm", algorithm_cfg, ("value_cfg",)),
+    ):
+        present = tuple(name for name in derived_names if name in section)
+        if present:
+            raise ValueError(f"{section_name} fields {present} are derived from value_helpers.")
+        if "seed" in section:
+            raise ValueError(f"{section_name} seed is owned by the runner root.")
+
+    helper_values = cfg["value_helpers"]
+    if not isinstance(helper_values, (tuple, list)) or not helper_values:
+        raise TypeError("value_helpers must be a nonempty sequence of mappings.")
+    value_heads: list[dict[str, object]] = []
+    reward_channels: list[ForwardBackwardRewardChannel] = []
+    value_cfg: dict[str, ForwardBackward.ValueCfg] = {}
+    helper_names: set[str] = set()
+    channels_by_name: dict[str, ForwardBackwardRewardChannel] = {}
+    environment_reward_name: str | None = None
+    auxiliary_evidence_names: list[str] = []
+    helper_learning_rate = algorithm_cfg.get("learning_rate", 1.0e-4)
+    for helper_value in helper_values:
+        if not isinstance(helper_value, Mapping):
+            raise TypeError("Each value helper must be a mapping.")
+        helper = dict(helper_value)
+        helper_name = helper.pop("name")
+        route = helper.pop("route")
+        term_values = helper.pop("terms")
+        if not isinstance(helper_name, str) or not helper_name or helper_name in helper_names:
+            raise ValueError("Value helper names must be nonempty and unique.")
+        if not isinstance(term_values, (tuple, list)) or not term_values:
+            raise TypeError("Value helper terms must be a nonempty sequence of mappings.")
+        helper_names.add(helper_name)
+
+        channel_names: list[str] = []
+        coefficients: list[float] = []
+        for term_value in term_values:
+            if not isinstance(term_value, Mapping):
+                raise TypeError("Each value-helper term must be a mapping.")
+            term = dict(term_value)
+            name = term.pop("name")
+            coefficient = term.pop("coefficient")
+            source = term.pop("source")
+            timing = term.pop("timing")
+            if not isinstance(name, str) or not name or name in channel_names:
+                raise ValueError("Reward term names must be nonempty and unique within a helper.")
+            if source == "environment" and timing != "transition":
+                raise ValueError("Environment rewards must describe a completed transition.")
+            if source == "stored_evidence" and timing != "transition":
+                raise ValueError("Stored evidence must describe a completed transition.")
+            channel = ForwardBackwardRewardChannel(
+                name=name,
+                provider_name=name,
+                source=source,
+                timing=timing,
+                context_dependent=term.pop("context_dependent"),
+                sign=term.pop("sign"),
+            )
+            if term:
+                raise ValueError(f"Unknown value-helper term fields: {tuple(term)}.")
+            existing_channel = channels_by_name.get(name)
+            if existing_channel is None:
+                if source == "environment":
+                    if environment_reward_name is not None:
+                        raise ValueError("At most one environment reward term may be configured.")
+                    environment_reward_name = name
+                elif source == "stored_evidence":
+                    auxiliary_evidence_names.append(name)
+                channels_by_name[name] = channel
+                reward_channels.append(channel)
+            elif existing_channel != channel:
+                raise ValueError("Shared reward terms must have identical channel semantics.")
+            channel_names.append(name)
+            coefficients.append(coefficient)
+
+        reward_composition = helper.pop("reward_composition")
+        if reward_composition not in ("vector", "scalar"):
+            raise ValueError(f"Unsupported reward composition: {reward_composition!r}.")
+        spec: dict[str, object] = {
+            "name": helper_name,
+            "kind": "critic",
+            "route": route,
+            "reward_channels": channel_names,
+            "ensemble_size": 2,
+            "has_target": True,
+        }
+        if reward_composition == "scalar":
+            spec["reward_composition"] = reward_composition
+        value_heads.append({"spec": spec})
+
+        normalize_rewards = helper.pop("normalize_rewards", False)
+        normalization_decay = helper.pop("reward_normalization_decay", None)
+        normalization_epsilon = helper.pop("reward_normalization_epsilon", None)
+        objective: dict[str, object] = {
+            "learning_rate": helper_learning_rate,
+            "pessimism": helper.pop("pessimism"),
+            "actor_coefficient": helper.pop("actor_coefficient"),
+            "reward_coefficients": tuple(coefficients),
+            "target_tau": helper.pop("target_tau"),
+        }
+        if normalize_rewards:
+            if normalization_decay is None or normalization_epsilon is None:
+                raise ValueError("Normalized value helpers require decay and epsilon.")
+            objective.update(
+                normalize_rewards=True,
+                reward_normalization_decay=normalization_decay,
+                reward_normalization_epsilon=normalization_epsilon,
+            )
+        elif normalization_decay is not None or normalization_epsilon is not None:
+            raise ValueError("Unnormalized value helpers cannot declare normalization parameters.")
+        if helper:
+            raise ValueError(f"Unknown value-helper fields: {tuple(helper)}.")
+        value_cfg[helper_name] = ForwardBackward.ValueCfg(**objective)
+
+    model_cfg["value_heads"] = value_heads
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
     capacity_transitions = replay_cfg.pop("capacity_transitions")
     if isinstance(capacity_transitions, bool) or not isinstance(capacity_transitions, int) or capacity_transitions < 1:
@@ -1436,26 +1578,18 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     if history_layout is not None:
         online_history = _ForwardBackwardOnlineHistory(history_layout, observations)
         observations = online_history.decorate_current(observations)
-    model = model_class.from_config(
-        observations,
-        cfg["obs_groups"],
-        env.num_actions,
-        model_cfg,
-    )
+    model = model_class.from_config(observations, cfg["obs_groups"], env.num_actions, model_cfg)
 
-    reward_schema = ForwardBackwardRewardSchema(
-        tuple(ForwardBackwardRewardChannel(**dict(channel)) for channel in replay_cfg.pop("reward_channels"))
-    )
+    reward_schema = ForwardBackwardRewardSchema(tuple(reward_channels))
     autoreset_mode = ForwardBackwardAutoresetMode(replay_cfg.pop("autoreset_mode"))
-    auxiliary_evidence_names = tuple(replay_cfg.pop("auxiliary_evidence_names"))
-    auxiliary_evidence_observation_group = replay_cfg.pop("auxiliary_evidence_observation_group")
+    auxiliary_evidence_observation_group = "transition" if auxiliary_evidence_names else None
     transition_schema = ForwardBackwardTransitionSchema(
         observation_schema_hash=model.observation_schema.schema_hash,
         reward_schema_hash=reward_schema.schema_hash,
         action_width=env.num_actions,
         context_width=model.context_dim,
-        environment_reward_name=replay_cfg.pop("environment_reward_name"),
-        auxiliary_evidence_names=auxiliary_evidence_names,
+        environment_reward_name=environment_reward_name,
+        auxiliary_evidence_names=tuple(auxiliary_evidence_names),
         autoreset_mode=autoreset_mode,
     )
     replay = replay_class(
@@ -1466,6 +1600,7 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         reward_schema=reward_schema,
         device=device,
         history_layout=history_layout,
+        seed=seed,
         **replay_cfg,
     )
     if not isinstance(replay, ForwardBackwardReplay):
@@ -1478,20 +1613,19 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     )
 
     provider = resolve_callable(expert_cfg.pop("provider"))
-    expert = provider(env, model.observation_schema, device, **expert_cfg)
+    expert = provider(env, model.observation_schema, device, seed=seed, **expert_cfg)
     if not isinstance(expert, ForwardBackwardExpertBuffer):
         raise TypeError("The expert provider must return ForwardBackwardExpertBuffer.")
 
     algorithm_class = resolve_callable(algorithm_cfg.pop("class_name"))
-    value_cfg = {
-        name: ForwardBackward.ValueCfg(**dict(value)) for name, value in algorithm_cfg.pop("value_cfg").items()
-    }
     manifest = {
         "config": {
             "algorithm": _checkpoint_config(cfg["algorithm"]),
             "model": _checkpoint_config(cfg["model"]),
             "obs_groups": _checkpoint_config(cfg["obs_groups"]),
             "replay": _checkpoint_config(cfg["replay"]),
+            "seed": seed,
+            "value_helpers": _checkpoint_config(helper_values),
         },
         "expert_schema_hash": expert.schema.schema_hash,
         "observation_schema_hash": model.observation_schema.schema_hash,
@@ -1509,6 +1643,7 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         device=device,
         online_history=online_history,
         multi_gpu_cfg=cfg.get("multi_gpu"),
+        seed=seed,
         **algorithm_cfg,
     )
     if not isinstance(algorithm, ForwardBackward):

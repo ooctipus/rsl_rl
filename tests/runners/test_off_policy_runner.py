@@ -17,7 +17,6 @@ import pytest
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models.forward_backward_model import ForwardBackwardModel, ForwardBackwardObservationSchema
-from rsl_rl.runners.lifecycle import RunnerLifecycleExtension
 from rsl_rl.runners.off_policy_runner import OffPolicyRunner
 from rsl_rl.storage.forward_backward_expert import ForwardBackwardExpertBuffer, ForwardBackwardExpertSchema
 from rsl_rl.storage.forward_backward_replay import ForwardBackwardReplay
@@ -117,45 +116,13 @@ class NamedEvidenceDummyEnv(ForwardBackwardDummyEnv):
         return observations, rewards, dones, extras
 
 
-class RecordingLifecycleExtension(RunnerLifecycleExtension):
-    """Record exact events and return deterministic reset observations."""
-
-    def __init__(
-        self,
-        env: VecEnv,
-        algorithm: object,
-        log_dir: str | None,
-        device: str,
-    ) -> None:
-        """Initialize the base resources and empty event history."""
-        super().__init__(env, algorithm, log_dir, device)
-        self.transitions: list[int] = []
-
-    def on_transition(self, transition: int) -> TensorDict:
-        """Record one event, reset the fixture, and return its observations."""
-        self.transitions.append(transition)
-        self.env.state.fill_(float(transition))
-        self.env.episode_length_buf.zero_()
-        return self.env.get_observations()
-
-    def state_dict(self) -> dict[str, object]:
-        """Return the exact recorded event history."""
-        return {"transitions": tuple(self.transitions)}
-
-    def load_state_dict(self, state: dict[str, object]) -> None:
-        """Restore the exact recorded event history."""
-        transitions = state["transitions"]
-        if not isinstance(transitions, tuple) or not all(isinstance(value, int) for value in transitions):
-            raise TypeError("Lifecycle transition state must be a tuple of integers.")
-        self.transitions = list(transitions)
-
-
 def _expert_provider(
     env: VecEnv,
     observation_schema: ForwardBackwardObservationSchema,
     device: str,
     *,
     window_lengths: tuple[int, ...],
+    seed: int,
 ) -> ForwardBackwardExpertBuffer:
     """Return one deterministic two-clip corpus on the learner device."""
     del env
@@ -179,20 +146,19 @@ def _expert_provider(
         offsets,
         priorities,
         schema,
-        seed=17,
+        seed=seed,
         clip_ids=("clip_0", "clip_1"),
         clip_length_values=(16, 16),
     )
 
 
-def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int = 0) -> dict:
-    """Return a tiny strict configuration using every Phase 1F section."""
+def _make_cfg(*, rollout_expert_fraction: float = 0.0) -> dict:
+    """Return a tiny canonical forward-backward runner configuration."""
     network = {"hidden_dim": 16, "hidden_layers": 1, "embedding_layers": 2}
-    value_network = {"hidden_dim": 16, "hidden_layers": 1, "embedding_layers": 2}
     return {
+        "seed": 23,
         "num_steps_per_env": 2,
         "num_updates_per_iteration": 1,
-        "random_action_steps": random_action_steps,
         "save_interval": 100,
         "obs_groups": {
             "actor": ["state"],
@@ -209,66 +175,12 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
             "forward_cfg": network,
             "backward_hidden_dims": [16],
             "discriminator_hidden_dims": [16],
-            "value_heads": [
-                {
-                    "spec": {
-                        "name": "discriminator",
-                        "kind": "critic",
-                        "route": "critic_discriminator",
-                        "reward_channels": ["discriminator"],
-                        "ensemble_size": 2,
-                        "has_target": True,
-                    },
-                    "network": value_network,
-                },
-                {
-                    "spec": {
-                        "name": "auxiliary",
-                        "kind": "critic",
-                        "route": "critic_auxiliary",
-                        "reward_channels": ["effort"],
-                        "ensemble_size": 2,
-                        "has_target": True,
-                    },
-                    "network": value_network,
-                },
-            ],
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
             "capacity_transitions": 8 * NUM_ENVS,
             "terminal_capacity_per_env": 4,
             "autoreset_mode": "same_step",
-            "environment_reward_name": "environment",
-            "auxiliary_evidence_names": ["effort"],
-            "auxiliary_evidence_observation_group": "transition",
-            "reward_channels": [
-                {
-                    "name": "environment",
-                    "provider_name": "environment",
-                    "source": "environment",
-                    "timing": "transition",
-                    "context_dependent": False,
-                    "sign": 1,
-                },
-                {
-                    "name": "discriminator",
-                    "provider_name": "discriminator",
-                    "source": "recomputed",
-                    "timing": "next_state",
-                    "context_dependent": True,
-                    "sign": 1,
-                },
-                {
-                    "name": "effort",
-                    "provider_name": "effort",
-                    "source": "stored_evidence",
-                    "timing": "transition",
-                    "context_dependent": False,
-                    "sign": -1,
-                },
-            ],
-            "seed": 19,
         },
         "expert": {"provider": _expert_provider, "window_lengths": (2, 6)},
         "algorithm": {
@@ -277,20 +189,56 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
             "expert_sequence_length": 2,
             "context_buffer_capacity": 16,
             "discriminator_gradient_penalty_coefficient": 0.0,
+            "random_action_transitions": 0,
             "rollout_context_refresh_steps": 2,
             "rollout_expert_fraction": rollout_expert_fraction,
             "rollout_expert_steps": 4,
             "rollout_expert_context_steps": 3,
-            "value_cfg": {
-                "discriminator": {"actor_coefficient": 0.05},
-                "auxiliary": {
-                    "actor_coefficient": 0.02,
-                    "reward_coefficients": [0.1],
-                    "normalize_rewards": True,
-                },
-            },
-            "seed": 23,
         },
+        "value_helpers": [
+            {
+                "name": "discriminator",
+                "route": "critic_discriminator",
+                "terms": [
+                    {
+                        "name": "discriminator",
+                        "coefficient": 1.0,
+                        "source": "recomputed",
+                        "timing": "next_state",
+                        "context_dependent": True,
+                        "sign": 1,
+                    }
+                ],
+                "reward_composition": "vector",
+                "pessimism": 0.5,
+                "actor_coefficient": 0.05,
+                "normalize_rewards": False,
+                "reward_normalization_decay": None,
+                "reward_normalization_epsilon": None,
+                "target_tau": 0.005,
+            },
+            {
+                "name": "auxiliary",
+                "route": "critic_auxiliary",
+                "terms": [
+                    {
+                        "name": "effort",
+                        "coefficient": 0.1,
+                        "source": "stored_evidence",
+                        "timing": "transition",
+                        "context_dependent": False,
+                        "sign": -1,
+                    }
+                ],
+                "reward_composition": "vector",
+                "pessimism": 0.5,
+                "actor_coefficient": 0.02,
+                "normalize_rewards": True,
+                "reward_normalization_decay": 0.99,
+                "reward_normalization_epsilon": 1.0e-8,
+                "target_tau": 0.005,
+            },
+        ],
         "torch_compile_mode": None,
     }
 
@@ -298,26 +246,14 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0, random_action_steps: int 
 def _make_named_evidence_cfg() -> dict:
     """Return the tiny config with a two-channel named evidence schema."""
     cfg = _make_cfg()
-    cfg["replay"]["auxiliary_evidence_names"] = ["effort", "impact"]
-    cfg["replay"]["reward_channels"].append({
+    cfg["value_helpers"][1]["terms"].append({
         "name": "impact",
-        "provider_name": "impact",
+        "coefficient": 0.2,
         "source": "stored_evidence",
         "timing": "transition",
         "context_dependent": False,
         "sign": -1,
     })
-    cfg["model"]["value_heads"][1]["spec"]["reward_channels"] = ["effort", "impact"]
-    cfg["algorithm"]["value_cfg"]["auxiliary"]["reward_coefficients"] = [0.1, 0.2]
-    return cfg
-
-
-def _make_lifecycle_cfg(transition_interval: int = 2 * NUM_ENVS) -> dict:
-    cfg = _make_cfg()
-    cfg["lifecycle_extension"] = {
-        "class_name": RecordingLifecycleExtension,
-        "transition_interval": transition_interval,
-    }
     return cfg
 
 
@@ -335,28 +271,39 @@ def _make_history_cfg() -> dict:
     return cfg
 
 
-class ObservedOffPolicyRunner(OffPolicyRunner):
-    """Record the exact runner-loop boundaries exposed to specialized subclasses."""
+class UpdatingOffPolicyRunner(OffPolicyRunner):
+    """Replace collection observations at the ordinary update boundary."""
 
-    boundary_events: list[tuple]
-
-    def _observe_iteration_start(self, iteration: int, start_transitions: int) -> None:
-        """Record the boundary immediately before collection."""
-        self.boundary_events.append(("start", iteration, start_transitions))
-
-    def _observe_iteration_learning_complete(self, iteration: int, end_transitions: int) -> None:
-        """Record the boundary after updates and before metric materialization."""
-        self.boundary_events.append(("learning_complete", iteration, end_transitions))
-
-    def _observe_iteration_complete(
+    def _update(
         self,
-        iteration: int,
-        end_transitions: int,
-        collect_time: float,
-        learn_time: float,
+        observations: TensorDict,
+    ) -> tuple[TensorDict, list[dict[str, torch.Tensor]]]:
+        observations, metrics = super()._update(observations)
+        observations = observations.clone()
+        observations["state"].fill_(float(self.collected_transitions))
+        return observations, metrics
+
+
+class StatefulOffPolicyRunner(OffPolicyRunner):
+    """Extend ordinary runner checkpoints with one fixture-owned value."""
+
+    fixture_state = 0
+
+    def state_dict(self) -> dict[str, object]:
+        """Add fixture-owned state to the ordinary checkpoint."""
+        state = super().state_dict()
+        state["fixture_state"] = self.fixture_state
+        return state
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, object],
+        load_cfg: dict | None = None,
+        strict: bool = True,
     ) -> None:
-        """Record existing decomposition timers before logging and checkpointing."""
-        self.boundary_events.append(("complete", iteration, end_transitions, collect_time, learn_time))
+        """Restore ordinary and fixture-owned checkpoint state."""
+        super().load_state_dict(state_dict, load_cfg, strict)
+        self.fixture_state = int(state_dict["fixture_state"])
 
 
 def _collect(runner: OffPolicyRunner, steps: int) -> None:
@@ -368,7 +315,7 @@ def _collect(runner: OffPolicyRunner, steps: int) -> None:
         runner.alg.process_env_step(obs, rewards, dones, extras)
 
 
-def test_runner_constructs_collects_and_updates_through_public_lifecycle() -> None:
+def test_runner_constructs_collects_and_updates() -> None:
     """The generic runner should resolve the algorithm and mutate it after replay is ready."""
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
     actor_before = copy.deepcopy(runner.alg.model.actor_network.state_dict())
@@ -393,33 +340,20 @@ def test_constructor_derives_time_major_rows_from_transition_capacity() -> None:
     assert runner.alg.replay.capacity_steps * runner.env.num_envs == 8 * NUM_ENVS
 
 
-@pytest.mark.parametrize(
-    ("group", "error"),
-    (
-        (None, "non-empty string"),
-        ("state", "non-model observation group"),
-        ("missing", "was not returned by the environment"),
-    ),
-)
-def test_constructor_rejects_invalid_auxiliary_evidence_observation_group(
-    group: str | None,
-    error: str,
-) -> None:
-    """Evidence should be bound once to an existing non-policy observation group."""
-    cfg = _make_cfg()
-    cfg["replay"]["auxiliary_evidence_observation_group"] = group
+def test_constructor_derives_auxiliary_evidence_route_from_helper_terms() -> None:
+    """Stored transition terms should select the fixed transition observation group."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
 
-    with pytest.raises(ValueError, match=error):
-        OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
+    assert runner.alg._auxiliary_evidence_observation_group == "transition"
+    assert runner.alg.replay.transition_schema.auxiliary_evidence_names == ("effort",)
 
 
 def test_constructor_rejects_auxiliary_evidence_width_mismatch() -> None:
     """The configured channel order should exactly determine the observation width."""
     cfg = _make_cfg()
-    cfg["replay"]["auxiliary_evidence_names"].append("impact")
-    cfg["replay"]["reward_channels"].append({
+    cfg["value_helpers"][1]["terms"].append({
         "name": "impact",
-        "provider_name": "impact",
+        "coefficient": 0.2,
         "source": "stored_evidence",
         "timing": "transition",
         "context_dependent": False,
@@ -459,84 +393,16 @@ def test_constructor_rejects_invalid_transition_capacity(
         OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
 
 
-def test_lifecycle_extension_runs_at_zero_each_interval_and_final() -> None:
-    """Lifecycle work should use completed transitions independently of save hooks."""
-    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
-    acted_from: list[torch.Tensor] = []
-    original_act = runner.alg.act
-
-    def record_act(observations: TensorDict) -> torch.Tensor:
-        """Record collection input before delegating to the real algorithm."""
-        acted_from.append(observations["state"].clone())
-        return original_act(observations)
-
-    runner.alg.act = record_act
-    runner.learn(2)
-
-    extension = runner.lifecycle_extension
-    assert isinstance(extension, RecordingLifecycleExtension)
-    assert extension.transitions == [0, 2 * NUM_ENVS, 4 * NUM_ENVS]
-    assert runner._lifecycle_last_transition == runner.collected_transitions == 4 * NUM_ENVS
-    torch.testing.assert_close(acted_from[2], torch.full_like(acted_from[2], 2 * NUM_ENVS))
-
-
 def test_one_vector_step_advances_transition_clock_by_exactly_num_envs() -> None:
     """One physical vector step must contribute one transition per environment."""
-    cfg = _make_lifecycle_cfg(NUM_ENVS)
+    cfg = _make_cfg()
     cfg["num_steps_per_env"] = 1
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
 
     runner.learn(1)
 
-    extension = runner.lifecycle_extension
-    assert isinstance(extension, RecordingLifecycleExtension)
     assert runner.alg.replay.total_steps == 1
     assert runner.collected_transitions == NUM_ENVS
-    assert extension.transitions == [0, NUM_ENVS]
-
-
-def test_lifecycle_extension_rejects_unreachable_transition_cadence() -> None:
-    """An interval must land on an exact completed collection boundary."""
-    with pytest.raises(ValueError, match="positive multiple of one collection block"):
-        OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(NUM_ENVS), log_dir=None, device="cpu")
-
-
-def test_lifecycle_extension_checkpoint_before_first_event_replays_zero_once() -> None:
-    """A pre-learning checkpoint should preserve the pending transition-zero event."""
-    fresh = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
-    restored = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
-
-    with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
-        fresh.save(checkpoint.name)
-        restored.load(checkpoint.name)
-
-    extension = restored.lifecycle_extension
-    assert isinstance(extension, RecordingLifecycleExtension)
-    assert extension.transitions == []
-
-    restored.learn(1)
-
-    assert extension.transitions == [0, 2 * NUM_ENVS]
-
-
-def test_lifecycle_extension_checkpoint_resumes_without_replaying_event_zero() -> None:
-    """Extension state and cadence should resume at the exact next transition event."""
-    expected = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
-    restored = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_lifecycle_cfg(), log_dir=None, device="cpu")
-    expected.learn(1)
-
-    with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
-        expected.save(checkpoint.name)
-        restored.load(checkpoint.name)
-
-    restored_extension = restored.lifecycle_extension
-    assert isinstance(restored_extension, RecordingLifecycleExtension)
-    assert restored_extension.transitions == [0, 2 * NUM_ENVS]
-
-    restored.learn(1)
-
-    assert restored_extension.transitions == [0, 2 * NUM_ENVS, 4 * NUM_ENVS]
-    assert restored._lifecycle_last_transition == 4 * NUM_ENVS
 
 
 def test_collection_does_not_leak_inference_tensors_into_environment_state() -> None:
@@ -550,35 +416,11 @@ def test_collection_does_not_leak_inference_tensors_into_environment_state() -> 
     env.last_actions.zero_()
 
 
-def test_runner_uses_random_seed_phase_and_delays_updates_one_iteration() -> None:
-    """Uniform source actions should precede actor behavior and the first update."""
-    runner = OffPolicyRunner(
-        ForwardBackwardDummyEnv(),
-        _make_cfg(random_action_steps=2 * NUM_ENVS),
-        log_dir=None,
-        device="cpu",
-    )
-    random_calls = 0
-    original = runner.alg.act_random
-
-    def count_random_actions(obs: TensorDict) -> torch.Tensor:
-        nonlocal random_calls
-        random_calls += 1
-        return original(obs)
-
-    runner.alg.act_random = count_random_actions
-    runner.learn(3)
-
-    assert random_calls == 2
-    assert runner.collected_transitions == 6 * NUM_ENVS
-    assert runner.alg.update_step == 1
-
-
 def test_runner_training_summary_persists_exact_updates_and_finite_metric_keys() -> None:
     """The completion boundary should expose counters and every emitted learner metric."""
     runner = OffPolicyRunner(
         ForwardBackwardDummyEnv(),
-        _make_cfg(random_action_steps=2 * NUM_ENVS),
+        _make_cfg(),
         log_dir=None,
         device="cpu",
     )
@@ -588,7 +430,7 @@ def test_runner_training_summary_persists_exact_updates_and_finite_metric_keys()
     summary = runner.training_summary()
     assert summary["completed_iterations"] == 3
     assert summary["collected_transitions"] == 6 * NUM_ENVS
-    assert summary["update_calls"] == runner.alg.update_step == 1
+    assert summary["update_calls"] == runner.alg.update_step == 3
     assert summary["all_metrics_finite"] is True
     assert set(summary["metric_names"]) == set(summary["last_metrics"])
     assert summary["metric_names"]
@@ -946,91 +788,30 @@ def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
     }
 
 
-def test_runner_exposes_exact_iteration_boundaries() -> None:
-    """Hooks should bracket unchanged collection/update work and precede logging."""
-    runner = ObservedOffPolicyRunner(
-        ForwardBackwardDummyEnv(),
-        _make_cfg(),
-        log_dir=None,
-        device="cpu",
-    )
-    runner.boundary_events = []
-    act = runner.alg.act
-    mean_metrics = runner._mean_metrics
+def test_update_boundary_can_replace_collection_observations() -> None:
+    """A specialized runner can resume collection from observations returned by update."""
+    runner = UpdatingOffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    acted_from: list[torch.Tensor] = []
+    original_act = runner.alg.act
 
-    def record_act(obs: TensorDict) -> torch.Tensor:
-        runner.boundary_events.append(("act", runner.collected_transitions))
-        return act(obs)
-
-    def record_update() -> dict[str, torch.Tensor]:
-        runner.boundary_events.append(("update", runner.collected_transitions))
-        return {"loss": torch.tensor(1.0)}
-
-    def record_mean_metrics(metrics: list[dict[str, torch.Tensor]]) -> dict[str, float]:
-        runner.boundary_events.append(("mean_metrics", runner.collected_transitions))
-        return mean_metrics(metrics)
-
-    def record_log(**kwargs: object) -> None:
-        runner.boundary_events.append(("log", kwargs["it"], runner.collected_transitions))
+    def record_act(observations: TensorDict) -> torch.Tensor:
+        acted_from.append(observations["state"].clone())
+        return original_act(observations)
 
     runner.alg.act = record_act
-    runner.alg.update = record_update
-    runner._mean_metrics = record_mean_metrics
-    runner.logger.log = record_log
+    runner.learn(2)
 
-    runner.learn(1)
-
-    assert [event[0] for event in runner.boundary_events] == [
-        "start",
-        "act",
-        "act",
-        "update",
-        "learning_complete",
-        "mean_metrics",
-        "complete",
-        "log",
-    ]
-    assert runner.boundary_events[0] == ("start", 0, 0)
-    assert runner.boundary_events[4] == ("learning_complete", 0, 2 * NUM_ENVS)
-    complete = runner.boundary_events[6]
-    assert complete[:3] == ("complete", 0, 2 * NUM_ENVS)
-    assert complete[3] >= 0.0
-    assert complete[4] >= 0.0
+    torch.testing.assert_close(acted_from[2], torch.full_like(acted_from[2], 2 * NUM_ENVS))
 
 
-def test_default_iteration_observer_is_state_and_rng_inert() -> None:
-    """The default hooks should not mutate runner state or any owned RNG stream."""
-    runner = OffPolicyRunner(
-        ForwardBackwardDummyEnv(),
-        _make_cfg(),
-        log_dir=None,
-        device="cpu",
-    )
-    torch_rng = torch.get_rng_state().clone()
-    owned_rngs = tuple(
-        generator.get_state().clone()
-        for generator in (
-            runner.alg.generator,
-            runner.alg.behavior_generator,
-            runner.alg.replay.generator,
-            runner.alg.expert.generator,
-        )
-    )
-    state = (runner.current_learning_iteration, runner.collected_transitions)
+def test_subclass_state_round_trips_through_runner_checkpoint() -> None:
+    """Specialized runner state should extend the ordinary checkpoint contract."""
+    saved = StatefulOffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    restored = StatefulOffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    saved.fixture_state = 41
 
-    runner._observe_iteration_start(0, 0)
-    runner._observe_iteration_learning_complete(0, 2 * NUM_ENVS)
-    runner._observe_iteration_complete(0, 2 * NUM_ENVS, 0.1, 0.2)
+    with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
+        saved.save(checkpoint.name)
+        restored.load(checkpoint.name)
 
-    assert torch.equal(torch.get_rng_state(), torch_rng)
-    for generator, expected in zip(
-        (
-            runner.alg.generator,
-            runner.alg.behavior_generator,
-            runner.alg.replay.generator,
-            runner.alg.expert.generator,
-        ),
-        owned_rngs,
-    ):
-        assert torch.equal(generator.get_state(), expected)
-    assert (runner.current_learning_iteration, runner.collected_transitions) == state
+    assert restored.fixture_state == 41

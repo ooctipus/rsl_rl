@@ -15,6 +15,7 @@ def metamotivo_config(expert_provider: Callable) -> dict:
     """Return the frozen MetaMotivo HumEnv FB-CPR configuration."""
     dual = {"hidden_dim": 1024, "hidden_layers": 2, "embedding_layers": 2}
     return {
+        "seed": 0,
         "num_steps_per_env": 1,
         "num_updates_per_iteration": 1,
         "save_interval": 100_000,
@@ -41,46 +42,12 @@ def metamotivo_config(expert_provider: Callable) -> dict:
             "normalization_type": "exponential",
             "normalization_eps": 1e-5,
             "normalization_momentum": 0.01,
-            "value_heads": [
-                {
-                    "spec": {
-                        "name": "discriminator",
-                        "kind": "critic",
-                        "route": "critic_discriminator",
-                        "reward_channels": ["discriminator"],
-                        "ensemble_size": 2,
-                        "has_target": True,
-                    },
-                    "network": dual,
-                }
-            ],
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
             "capacity_transitions": 2_000_000,
             "terminal_capacity_per_env": 16,
             "autoreset_mode": "same_step",
-            "environment_reward_name": "environment",
-            "auxiliary_evidence_names": [],
-            "auxiliary_evidence_observation_group": None,
-            "reward_channels": [
-                {
-                    "name": "environment",
-                    "provider_name": "environment",
-                    "source": "environment",
-                    "timing": "transition",
-                    "context_dependent": False,
-                    "sign": 1,
-                },
-                {
-                    "name": "discriminator",
-                    "provider_name": "discriminator",
-                    "source": "recomputed",
-                    "timing": "next_state",
-                    "context_dependent": True,
-                    "sign": 1,
-                },
-            ],
         },
         "expert": {"provider": expert_provider, "window_lengths": (8,)},
         "algorithm": {
@@ -99,8 +66,29 @@ def metamotivo_config(expert_provider: Callable) -> dict:
             "context_expert_fraction": 0.6,
             "relabel_fraction": 0.8,
             "rollout_context_refresh_steps": 150,
-            "value_cfg": {"discriminator": {"learning_rate": 1e-4, "actor_coefficient": 0.01}},
+            "random_action_range": (-1.0, 1.0),
+            "random_action_transitions": 50_000,
         },
+        "value_helpers": (
+            {
+                "name": "discriminator",
+                "route": "critic_discriminator",
+                "reward_composition": "vector",
+                "terms": (
+                    {
+                        "name": "discriminator",
+                        "coefficient": 1.0,
+                        "source": "recomputed",
+                        "timing": "next_state",
+                        "context_dependent": True,
+                        "sign": 1,
+                    },
+                ),
+                "pessimism": 0.5,
+                "actor_coefficient": 0.01,
+                "target_tau": 0.005,
+            },
+        ),
         "torch_compile_mode": None,
     }
 
@@ -132,36 +120,8 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
         "critic_discriminator": forward_route,
         "critic_auxiliary": forward_route,
     }
-    reward_channels = [
-        {
-            "name": "environment",
-            "provider_name": "environment",
-            "source": "environment",
-            "timing": "transition",
-            "context_dependent": False,
-            "sign": 1,
-        },
-        {
-            "name": "discriminator",
-            "provider_name": "discriminator",
-            "source": "recomputed",
-            "timing": "next_state",
-            "context_dependent": True,
-            "sign": 1,
-        },
-    ]
-    reward_channels.extend(
-        {
-            "name": name,
-            "provider_name": name,
-            "source": "stored_evidence",
-            "timing": "transition",
-            "context_dependent": False,
-            "sign": -1,
-        }
-        for name in evidence
-    )
     return {
+        "seed": 4728,
         "num_steps_per_env": 1,
         "num_updates_per_iteration": 1,
         "save_interval": 5_000,
@@ -183,41 +143,12 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "normalization_eps": 1e-5,
             "normalization_momentum": 0.01,
             "normalization_groups": [{"name": "state", "fields": state}],
-            "value_heads": [
-                {
-                    "spec": {
-                        "name": "discriminator",
-                        "kind": "critic",
-                        "route": "critic_discriminator",
-                        "reward_channels": ["discriminator"],
-                        "ensemble_size": 2,
-                        "has_target": True,
-                    },
-                    "network": value,
-                },
-                {
-                    "spec": {
-                        "name": "auxiliary",
-                        "kind": "critic",
-                        "route": "critic_auxiliary",
-                        "reward_channels": list(evidence),
-                        "reward_composition": "scalar",
-                        "ensemble_size": 2,
-                        "has_target": True,
-                    },
-                    "network": value,
-                },
-            ],
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
             "capacity_transitions": 5_120_000,
             "terminal_capacity_per_env": 16,
             "autoreset_mode": "same_step",
-            "environment_reward_name": "environment",
-            "auxiliary_evidence_names": list(evidence),
-            "auxiliary_evidence_observation_group": "transition",
-            "reward_channels": reward_channels,
             "history_layout": {
                 "history_field": "history_actor",
                 "history_length": 4,
@@ -249,21 +180,52 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             "rollout_context_refresh_steps": 100,
             "rollout_expert_fraction": 0.5,
             "random_action_range": (-5.0, 5.0),
+            "random_action_transitions": 10_240,
             "rollout_expert_steps": 250,
             "rollout_expert_context_steps": 8,
-            "value_cfg": {
-                "discriminator": {
-                    "learning_rate": 3e-4,
-                    "actor_coefficient": 0.05,
-                },
-                "auxiliary": {
-                    "learning_rate": 3e-4,
-                    "actor_coefficient": 0.02,
-                    "reward_coefficients": magnitudes,
-                    "normalize_rewards": True,
-                },
-            },
         },
+        "value_helpers": (
+            {
+                "name": "discriminator",
+                "route": "critic_discriminator",
+                "reward_composition": "vector",
+                "terms": (
+                    {
+                        "name": "discriminator",
+                        "coefficient": 1.0,
+                        "source": "recomputed",
+                        "timing": "next_state",
+                        "context_dependent": True,
+                        "sign": 1,
+                    },
+                ),
+                "pessimism": 0.5,
+                "actor_coefficient": 0.05,
+                "target_tau": 0.005,
+            },
+            {
+                "name": "auxiliary",
+                "route": "critic_auxiliary",
+                "terms": tuple(
+                    {
+                        "name": name,
+                        "coefficient": coefficient,
+                        "source": "stored_evidence",
+                        "timing": "transition",
+                        "context_dependent": False,
+                        "sign": -1,
+                    }
+                    for name, coefficient in zip(evidence, magnitudes, strict=True)
+                ),
+                "reward_composition": "scalar",
+                "pessimism": 0.5,
+                "actor_coefficient": 0.02,
+                "normalize_rewards": True,
+                "reward_normalization_decay": 0.99,
+                "reward_normalization_epsilon": 1e-8,
+                "target_tau": 0.005,
+            },
+        ),
         "torch_compile_mode": "reduce-overhead",
     }
 

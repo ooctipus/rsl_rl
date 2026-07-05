@@ -47,6 +47,10 @@ def test_metamotivo_preset_freezes_humenv_reference_choices() -> None:
     assert cfg["algorithm"]["relabel_fraction"] == 0.8
     assert cfg["replay"]["capacity_transitions"] == 2_000_000
     assert "capacity_steps" not in cfg["replay"]
+    assert "value_heads" not in cfg["model"]
+    assert "reward_channels" not in cfg["replay"]
+    assert "value_cfg" not in cfg["algorithm"]
+    assert cfg["value_helpers"][0]["reward_composition"] == "vector"
 
 
 def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
@@ -84,8 +88,8 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
     assert cfg["algorithm"]["rollout_expert_steps"] == 250
     assert cfg["algorithm"]["rollout_expert_context_steps"] == 8
     assert cfg["algorithm"]["random_action_range"] == (-5.0, 5.0)
-    assert cfg["model"]["value_heads"][1]["spec"]["reward_composition"] == "scalar"
-    assert cfg["algorithm"]["value_cfg"]["auxiliary"]["reward_coefficients"] == (
+    assert cfg["value_helpers"][1]["reward_composition"] == "scalar"
+    assert tuple(term["coefficient"] for term in cfg["value_helpers"][1]["terms"]) == (
         0.0,
         0.1,
         10.0,

@@ -31,6 +31,7 @@ from rsl_rl.algorithms.forward_backward import (
     FORWARD_BACKWARD_CHECKPOINT_VERSION,
     ForwardBackward,
     ForwardBackwardCheckpointHeader,
+    _checkpoint_config,
     _ForwardBackwardOnlineHistory,
 )
 from rsl_rl.algorithms.ppo import PPO
@@ -88,6 +89,7 @@ def _value_spec_data(spec: ForwardBackwardValueSpec) -> dict[str, object]:
         "kind": spec.kind,
         "name": spec.name,
         "reward_channels": spec.reward_channels,
+        "reward_composition": spec.reward_composition,
         "route": spec.route,
     }
 
@@ -125,6 +127,8 @@ def _make_learner(
     normalization_type: Literal["empirical", "exponential"] = "empirical",
     auxiliary_composition: Literal["vector", "scalar"] = "vector",
     random_action_range: tuple[float, float] | None = None,
+    random_action_transitions: int = 0,
+    prefill_steps: int = 5,
     include_environment_reward: bool = True,
 ) -> ForwardBackward:
     """Create a small deterministic learner with live replay and expert data."""
@@ -147,7 +151,9 @@ def _make_learner(
         reward_schema = ForwardBackwardRewardSchema(
             tuple(channel for channel in reward_schema.channels if channel.source != "environment")
         )
-    states = [torch.randn(num_envs, state_width, generator=generator) + step for step in range(6)]
+    states = [
+        torch.randn(num_envs, state_width, generator=generator) + step for step in range(max(6, prefill_steps + 1))
+    ]
     observations = TensorDict({"state": states[0]}, batch_size=[num_envs])
     network = ForwardBackwardDualNetworkCfg(hidden_dim=16, hidden_layers=1, embedding_layers=2)
     value_heads = [
@@ -212,7 +218,7 @@ def _make_learner(
         seed=41,
     )
     false = torch.zeros(num_envs, 1, dtype=torch.bool)
-    for step in range(5):
+    for step in range(prefill_steps):
         replay.add(
             ForwardBackwardTransitionBatch(
                 observations=TensorDict({"state": states[step]}, batch_size=[num_envs]),
@@ -290,6 +296,7 @@ def _make_learner(
         discriminator_gradient_penalty_coefficient=0.1,
         seed=47,
         random_action_range=random_action_range,
+        random_action_transitions=random_action_transitions,
         multi_gpu_cfg=multi_gpu_cfg,
     )
 
@@ -388,6 +395,233 @@ def test_algorithm_constructor_rejects_unknown_config_fields() -> None:
     """An algorithm typo should fail through Python's explicit constructor semantics."""
     with pytest.raises(TypeError, match="learnig_rate"):
         ForwardBackward(learnig_rate=1.0e-4)  # type: ignore[call-arg]
+
+
+def test_algorithm_owns_random_warmup_and_released_update_boundary() -> None:
+    """Policy behavior starts at warm-up, while updates start after its following row."""
+    before = _make_learner(
+        random_action_range=(20.0, 21.0),
+        random_action_transitions=8,
+        prefill_steps=0,
+    )
+    at_boundary = _make_learner(
+        random_action_range=(20.0, 21.0),
+        random_action_transitions=8,
+        prefill_steps=2,
+    )
+    following_row = _make_learner(
+        random_action_range=(20.0, 21.0),
+        random_action_transitions=8,
+        prefill_steps=3,
+    )
+    after_following_row = _make_learner(
+        random_action_range=(20.0, 21.0),
+        random_action_transitions=8,
+        prefill_steps=4,
+    )
+    observations = TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4])
+
+    random_actions = before.act(observations)
+    policy_actions = at_boundary.act(observations)
+
+    assert torch.all((random_actions >= 20.0) & (random_actions < 21.0))
+    assert torch.all(policy_actions.abs() <= 1.0)
+    assert before.ready_to_update is False
+    assert at_boundary.replay.total_steps * at_boundary.replay.num_envs == 8
+    assert at_boundary.ready_to_update is False
+    assert following_row.replay.total_steps * following_row.replay.num_envs == 12
+    assert following_row.ready_to_update is False
+    assert after_following_row.replay.total_steps * after_following_row.replay.num_envs == 16
+    assert after_following_row.ready_to_update is True
+
+    wrapped = _make_learner(
+        random_action_range=(20.0, 21.0),
+        random_action_transitions=24,
+        prefill_steps=8,
+    )
+    assert wrapped.replay.num_transitions == 20
+    assert wrapped.replay.total_steps * wrapped.replay.num_envs == 32
+    assert wrapped.ready_to_update is True
+
+
+def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
+    """The runtime composition root should derive every helper consumer from one declaration."""
+
+    class Env:
+        num_envs = 4
+        num_actions = 2
+
+    def provider(
+        env: object,
+        observation_schema: ForwardBackwardObservationSchema,
+        device: str,
+        *,
+        window_lengths: tuple[int, ...],
+        seed: int,
+    ) -> ForwardBackwardExpertBuffer:
+        del env
+        width = observation_schema.route_width("backward")
+        schema = ForwardBackwardExpertSchema(
+            dataset_id="canonical-helper",
+            data_hash="canonical-data",
+            feature_schema_hash=observation_schema.schema_hash,
+            clip_offsets_hash="two-clips",
+            expert_feature_width=width,
+            num_frames=16,
+            num_clips=2,
+            window_lengths=window_lengths,
+        )
+        return ForwardBackwardExpertBuffer(
+            torch.zeros(16, width, device=device),
+            torch.tensor([0, 8, 16], device=device),
+            torch.ones(2, device=device),
+            schema,
+            seed=seed,
+            clip_ids=("first", "second"),
+            clip_length_values=(8, 8),
+        )
+
+    network = {"hidden_dim": 16, "hidden_layers": 1, "embedding_layers": 2}
+    config = {
+        "seed": 73,
+        "obs_groups": {
+            "actor": ["state"],
+            "forward": ["state"],
+            "backward": ["state"],
+            "discriminator": ["state"],
+            "critic_discriminator": ["state"],
+        },
+        "model": {
+            "class_name": "rsl_rl.models.forward_backward_model:ForwardBackwardModel",
+            "context_dim": 4,
+            "actor_cfg": network,
+            "forward_cfg": network,
+            "backward_hidden_dims": [16],
+            "discriminator_hidden_dims": [16],
+        },
+        "replay": {
+            "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
+            "capacity_transitions": 32,
+            "terminal_capacity_per_env": 4,
+            "autoreset_mode": "same_step",
+        },
+        "expert": {"provider": provider, "window_lengths": (2,)},
+        "algorithm": {
+            "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
+            "batch_size": 8,
+            "expert_sequence_length": 2,
+            "learning_rate": 3.0e-4,
+            "context_buffer_capacity": 16,
+            "discriminator_gradient_penalty_coefficient": 0.0,
+            "random_action_transitions": 0,
+        },
+        "value_helpers": (
+            {
+                "name": "discriminator",
+                "route": "critic_discriminator",
+                "reward_composition": "vector",
+                "terms": (
+                    {
+                        "name": "discriminator",
+                        "coefficient": 1.0,
+                        "source": "recomputed",
+                        "timing": "next_state",
+                        "context_dependent": True,
+                        "sign": 1,
+                    },
+                ),
+                "pessimism": 0.5,
+                "actor_coefficient": 0.05,
+                "target_tau": 0.005,
+            },
+            {
+                "name": "shared_discriminator",
+                "route": "critic_discriminator",
+                "reward_composition": "vector",
+                "terms": (
+                    {
+                        "name": "discriminator",
+                        "coefficient": 0.5,
+                        "source": "recomputed",
+                        "timing": "next_state",
+                        "context_dependent": True,
+                        "sign": 1,
+                    },
+                ),
+                "pessimism": 0.25,
+                "actor_coefficient": 0.02,
+                "target_tau": 0.01,
+            },
+        ),
+        "torch_compile_mode": None,
+    }
+    original = copy.deepcopy(config)
+
+    learner = ForwardBackward.construct_algorithm(
+        TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]),
+        Env(),
+        config,
+        "cpu",
+    )
+
+    assert config == original
+    assert learner.replay.reward_schema.channel_names == ("discriminator",)
+    assert learner.replay.transition_schema.environment_reward_name is None
+    assert learner.replay.transition_schema.auxiliary_evidence_names == ()
+    assert tuple(learner.model.value_networks) == ("discriminator", "shared_discriminator")
+    assert learner.model.value_specs[0].reward_composition == "vector"
+    assert learner.value_cfg["discriminator"].learning_rate == 3.0e-4
+    assert learner.value_cfg["discriminator"].reward_coefficients == (1.0,)
+    assert learner.value_cfg["shared_discriminator"].reward_coefficients == (0.5,)
+    assert learner.replay.generator.initial_seed() == 73
+    assert learner.expert.generator.initial_seed() == 73
+    assert learner.generator.initial_seed() == 73
+    expected_header = ForwardBackwardCheckpointHeader.from_manifest({
+        "config": {
+            "algorithm": _checkpoint_config(config["algorithm"]),
+            "model": _checkpoint_config(config["model"]),
+            "obs_groups": _checkpoint_config(config["obs_groups"]),
+            "replay": _checkpoint_config(config["replay"]),
+            "seed": 73,
+            "value_helpers": _checkpoint_config(config["value_helpers"]),
+        },
+        "expert_schema_hash": learner.expert.schema.schema_hash,
+        "observation_schema_hash": learner.model.observation_schema.schema_hash,
+        "reward_schema_hash": learner.replay.reward_schema.schema_hash,
+        "transition_schema_hash": learner.replay.transition_schema.schema_hash,
+        "value_specs": tuple(_value_spec_data(spec) for spec in learner.model.value_specs),
+    })
+    assert learner.checkpoint_header == expected_header
+
+    invalid = copy.deepcopy(config)
+    invalid["value_helpers"][0]["reward_composition"] = None
+    with pytest.raises(ValueError, match="Unsupported reward composition"):
+        ForwardBackward.construct_algorithm(
+            TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]),
+            Env(),
+            invalid,
+            "cpu",
+        )
+
+    invalid = copy.deepcopy(config)
+    invalid["replay"]["auxiliary_evidence_observation_group"] = None
+    with pytest.raises(ValueError, match="derived from value_helpers"):
+        ForwardBackward.construct_algorithm(
+            TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]),
+            Env(),
+            invalid,
+            "cpu",
+        )
+
+    invalid = copy.deepcopy(config)
+    invalid["expert"]["seed"] = 74
+    with pytest.raises(ValueError, match="expert seed is owned by the runner root"):
+        ForwardBackward.construct_algorithm(
+            TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]),
+            Env(),
+            invalid,
+            "cpu",
+        )
 
 
 def test_multi_gpu_fails_until_synchronization_is_implemented() -> None:
@@ -883,7 +1117,6 @@ def test_phase_1g_publishes_only_explicit_forward_backward_boundaries() -> None:
         "DistillationRunner",
         "OffPolicyRunner",
         "OnPolicyRunner",
-        "RunnerLifecycleExtension",
     ]
     assert rsl_rl.storage.__all__ == ["ForwardBackwardExpertBuffer", "ForwardBackwardReplay", "RolloutStorage"]
     assert "SuccessorFeatures" in rsl_rl.extensions.__all__
