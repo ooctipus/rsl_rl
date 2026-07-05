@@ -374,35 +374,35 @@ class ForwardBackward:
         if not isinstance(optimization, Mapping):
             raise TypeError("Forward-backward optimization must be a mapping.")
         optimization = dict(optimization)
-        learning_rate = optimization.pop("learning_rate", 1e-4)
-        backward_learning_rate = optimization.pop("backward_learning_rate", 1e-5)
-        discriminator_learning_rate = optimization.pop("discriminator_learning_rate", 1e-5)
-        optimizer = optimization.pop("optimizer", "adam")
-        weight_decay = optimization.pop("weight_decay", 0.0)
-        discriminator_weight_decay = optimization.pop("discriminator_weight_decay", 0.0)
-        max_grad_norm = optimization.pop("max_grad_norm", None)
+        learning_rate = optimization.pop("learning_rate")
+        backward_learning_rate = optimization.pop("backward_learning_rate")
+        discriminator_learning_rate = optimization.pop("discriminator_learning_rate")
+        optimizer = optimization.pop("optimizer")
+        weight_decay = optimization.pop("weight_decay")
+        discriminator_weight_decay = optimization.pop("discriminator_weight_decay")
+        max_grad_norm = optimization.pop("max_grad_norm")
         if optimization:
             raise ValueError(f"Unknown forward-backward optimization fields: {tuple(optimization)}.")
 
         if not isinstance(context, Mapping):
             raise TypeError("Forward-backward context policy must be a mapping.")
         context = dict(context)
-        context_goal_fraction = context.pop("goal_fraction", 0.2)
-        context_expert_fraction = context.pop("expert_fraction", 0.6)
-        relabel_fraction = context.pop("relabel_fraction", 0.8)
-        context_buffer_capacity = context.pop("buffer_capacity", 10_000)
-        rollout_context_refresh_steps = context.pop("refresh_steps", 100)
-        rollout_expert_fraction = context.pop("rollout_expert_fraction", 0.0)
-        rollout_expert_steps = context.pop("rollout_expert_steps", 250)
-        rollout_expert_context_steps = context.pop("rollout_expert_context_steps", 8)
+        context_goal_fraction = context.pop("goal_fraction")
+        context_expert_fraction = context.pop("expert_fraction")
+        relabel_fraction = context.pop("relabel_fraction")
+        context_buffer_capacity = context.pop("buffer_capacity")
+        rollout_context_refresh_steps = context.pop("refresh_steps")
+        rollout_expert_fraction = context.pop("rollout_expert_fraction")
+        rollout_expert_steps = context.pop("rollout_expert_steps")
+        rollout_expert_context_steps = context.pop("rollout_expert_context_steps")
         if context:
             raise ValueError(f"Unknown forward-backward context fields: {tuple(context)}.")
 
         if not isinstance(exploration, Mapping):
             raise TypeError("Forward-backward exploration policy must be a mapping.")
         exploration = dict(exploration)
-        random_action_range = exploration.pop("random_action_range", None)
-        random_action_transitions = exploration.pop("random_action_transitions", 0)
+        random_action_range = exploration.pop("random_action_range")
+        random_action_transitions = exploration.pop("random_action_transitions")
         if exploration:
             raise ValueError(f"Unknown forward-backward exploration fields: {tuple(exploration)}.")
 

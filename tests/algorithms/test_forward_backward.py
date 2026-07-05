@@ -128,6 +128,9 @@ def _make_learner(
     auxiliary_composition: Literal["vector", "scalar"] = "vector",
     random_action_range: tuple[float, float] | None = None,
     random_action_transitions: int = 0,
+    optimization: dict[str, object] | None = None,
+    context: dict[str, object] | None = None,
+    exploration: dict[str, object] | None = None,
     prefill_steps: int = 5,
     include_environment_reward: bool = True,
 ) -> ForwardBackward:
@@ -281,18 +284,41 @@ def _make_learner(
             reward_coefficients=(0.1, 0.4),
             normalize_rewards=True,
         )
+    if optimization is None:
+        optimization = {
+            "learning_rate": 1.0e-4,
+            "backward_learning_rate": 1.0e-5,
+            "discriminator_learning_rate": 1.0e-5,
+            "optimizer": "adam",
+            "weight_decay": 0.0,
+            "discriminator_weight_decay": 0.0,
+            "max_grad_norm": None,
+        }
+    if context is None:
+        context = {
+            "goal_fraction": 0.2,
+            "expert_fraction": 0.6,
+            "relabel_fraction": 0.8,
+            "buffer_capacity": 16,
+            "refresh_steps": 100,
+            "rollout_expert_fraction": 0.0,
+            "rollout_expert_steps": 250,
+            "rollout_expert_context_steps": 8,
+        }
+    if exploration is None:
+        exploration = {
+            "random_action_range": random_action_range,
+            "random_action_transitions": random_action_transitions,
+        }
     return ForwardBackward(
         model,
         replay,
         expert,
         ForwardBackwardCheckpointHeader.from_manifest(manifest),
         auxiliary_evidence_observation_group="transition",
-        optimization={},
-        context={"buffer_capacity": 16},
-        exploration={
-            "random_action_range": random_action_range,
-            "random_action_transitions": random_action_transitions,
-        },
+        optimization=optimization,
+        context=context,
+        exploration=exploration,
         batch_size=8,
         expert_sequence_length=2,
         value_cfg=value_cfg,
@@ -302,6 +328,61 @@ def _make_learner(
         seed=47,
         multi_gpu_cfg=multi_gpu_cfg,
     )
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    (
+        ("optimization", "learning_rate"),
+        ("optimization", "backward_learning_rate"),
+        ("optimization", "discriminator_learning_rate"),
+        ("optimization", "optimizer"),
+        ("optimization", "weight_decay"),
+        ("optimization", "discriminator_weight_decay"),
+        ("optimization", "max_grad_norm"),
+        ("context", "goal_fraction"),
+        ("context", "expert_fraction"),
+        ("context", "relabel_fraction"),
+        ("context", "buffer_capacity"),
+        ("context", "refresh_steps"),
+        ("context", "rollout_expert_fraction"),
+        ("context", "rollout_expert_steps"),
+        ("context", "rollout_expert_context_steps"),
+        ("exploration", "random_action_range"),
+        ("exploration", "random_action_transitions"),
+    ),
+)
+def test_grouped_policy_requires_every_declared_member(section: str, field: str) -> None:
+    """Incomplete grouped policies must not recover hidden algorithm defaults."""
+    records = {
+        "optimization": {
+            "learning_rate": 1.0e-4,
+            "backward_learning_rate": 1.0e-5,
+            "discriminator_learning_rate": 1.0e-5,
+            "optimizer": "adam",
+            "weight_decay": 0.0,
+            "discriminator_weight_decay": 0.0,
+            "max_grad_norm": None,
+        },
+        "context": {
+            "goal_fraction": 0.2,
+            "expert_fraction": 0.6,
+            "relabel_fraction": 0.8,
+            "buffer_capacity": 16,
+            "refresh_steps": 100,
+            "rollout_expert_fraction": 0.0,
+            "rollout_expert_steps": 250,
+            "rollout_expert_context_steps": 8,
+        },
+        "exploration": {
+            "random_action_range": None,
+            "random_action_transitions": 0,
+        },
+    }
+    del records[section][field]
+
+    with pytest.raises(KeyError, match=field):
+        _make_learner(**{section: records[section]})
 
 
 def _evaluation_history_layout() -> ForwardBackwardHistoryLayout:
@@ -522,9 +603,29 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
             "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
             "batch_size": 8,
             "expert_sequence_length": 2,
-            "optimization": {"learning_rate": 3.0e-4},
-            "context": {"buffer_capacity": 16},
-            "exploration": {"random_action_transitions": 0},
+            "optimization": {
+                "learning_rate": 3.0e-4,
+                "backward_learning_rate": 1.0e-5,
+                "discriminator_learning_rate": 1.0e-5,
+                "optimizer": "adam",
+                "weight_decay": 0.0,
+                "discriminator_weight_decay": 0.0,
+                "max_grad_norm": None,
+            },
+            "context": {
+                "goal_fraction": 0.2,
+                "expert_fraction": 0.6,
+                "relabel_fraction": 0.8,
+                "buffer_capacity": 16,
+                "refresh_steps": 100,
+                "rollout_expert_fraction": 0.0,
+                "rollout_expert_steps": 250,
+                "rollout_expert_context_steps": 8,
+            },
+            "exploration": {
+                "random_action_range": None,
+                "random_action_transitions": 0,
+            },
             "discriminator_gradient_penalty_coefficient": 0.0,
         },
         "value_helpers": (

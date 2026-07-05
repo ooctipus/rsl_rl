@@ -66,6 +66,10 @@ def metamotivo_config(expert_provider: Callable) -> dict:
                 "learning_rate": 1e-4,
                 "backward_learning_rate": 1e-5,
                 "discriminator_learning_rate": 1e-5,
+                "optimizer": "adam",
+                "weight_decay": 0.0,
+                "discriminator_weight_decay": 0.0,
+                "max_grad_norm": None,
             },
             "context": {
                 "goal_fraction": 0.2,
@@ -196,6 +200,10 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
                 "learning_rate": 3e-4,
                 "backward_learning_rate": 1e-5,
                 "discriminator_learning_rate": 1e-5,
+                "optimizer": "adam",
+                "weight_decay": 0.0,
+                "discriminator_weight_decay": 0.0,
+                "max_grad_norm": None,
             },
             "context": {
                 "goal_fraction": 0.2,
