@@ -17,10 +17,11 @@ def _provider(
     observation_schema: object,
     device: str,
     *,
+    clock: dict[str, object],
     window_lengths: tuple[int, ...],
 ) -> None:
     """Raise if a static configuration test tries to load expert data."""
-    del env, observation_schema, device, window_lengths
+    del env, observation_schema, device, clock, window_lengths
     raise AssertionError("Static preset tests must not load an expert corpus.")
 
 
@@ -42,15 +43,16 @@ def test_metamotivo_preset_freezes_humenv_reference_choices() -> None:
     assert cfg["algorithm"]["batch_size"] == 1024
     assert cfg["algorithm"]["fb_pessimism"] == 0.0
     assert cfg["algorithm"]["expert_sequence_length"] == 8
-    assert cfg["algorithm"]["context_goal_fraction"] == 0.2
-    assert cfg["algorithm"]["context_expert_fraction"] == 0.6
-    assert cfg["algorithm"]["relabel_fraction"] == 0.8
-    assert cfg["replay"]["capacity_transitions"] == 2_000_000
-    assert "capacity_steps" not in cfg["replay"]
+    assert cfg["algorithm"]["context"]["goal_fraction"] == 0.2
+    assert cfg["algorithm"]["context"]["expert_fraction"] == 0.6
+    assert cfg["algorithm"]["context"]["relabel_fraction"] == 0.8
+    assert cfg["replay"]["policy"]["capacity_transitions"] == 2_000_000
+    assert "capacity_steps" not in cfg["replay"]["policy"]
     assert "value_heads" not in cfg["model"]
     assert "reward_channels" not in cfg["replay"]
     assert "value_cfg" not in cfg["algorithm"]
     assert cfg["value_helpers"][0]["reward_composition"] == "vector"
+    assert cfg["value_helpers"][0]["learning_rate"] == 1e-4
 
 
 def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
@@ -80,14 +82,16 @@ def test_bfm_preset_freezes_released_topology_and_compact_replay() -> None:
         }
     ]
     assert cfg["model"]["distribution_cfg"]["noise_clip"] == 0.3
-    assert cfg["replay"]["capacity_transitions"] == 5_120_000
-    assert "capacity_steps" not in cfg["replay"]
+    assert cfg["replay"]["policy"]["capacity_transitions"] == 5_120_000
+    assert "capacity_steps" not in cfg["replay"]["policy"]
     assert cfg["algorithm"]["fb_pessimism"] == 0.0
     assert cfg["replay"]["history_layout"]["history_length"] == 4
-    assert cfg["algorithm"]["rollout_expert_fraction"] == 0.5
-    assert cfg["algorithm"]["rollout_expert_steps"] == 250
-    assert cfg["algorithm"]["rollout_expert_context_steps"] == 8
-    assert cfg["algorithm"]["random_action_range"] == (-5.0, 5.0)
+    assert cfg["algorithm"]["context"]["rollout_expert_fraction"] == 0.5
+    assert cfg["algorithm"]["context"]["rollout_expert_steps"] == 250
+    assert cfg["algorithm"]["context"]["rollout_expert_context_steps"] == 8
+    assert cfg["algorithm"]["exploration"]["random_action_range"] == (-5.0, 5.0)
+    assert cfg["value_helpers"][0]["learning_rate"] == 3e-4
+    assert cfg["value_helpers"][1]["learning_rate"] == 3e-4
     assert cfg["value_helpers"][1]["reward_composition"] == "scalar"
     assert tuple(term["coefficient"] for term in cfg["value_helpers"][1]["terms"]) == (
         0.0,

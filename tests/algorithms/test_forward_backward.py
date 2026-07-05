@@ -287,16 +287,19 @@ def _make_learner(
         expert,
         ForwardBackwardCheckpointHeader.from_manifest(manifest),
         auxiliary_evidence_observation_group="transition",
+        optimization={},
+        context={"buffer_capacity": 16},
+        exploration={
+            "random_action_range": random_action_range,
+            "random_action_transitions": random_action_transitions,
+        },
         batch_size=8,
         expert_sequence_length=2,
         value_cfg=value_cfg,
-        context_buffer_capacity=16,
         implied_value_coefficient=0.1,
         implied_reward_ridge=0.1,
         discriminator_gradient_penalty_coefficient=0.1,
         seed=47,
-        random_action_range=random_action_range,
-        random_action_transitions=random_action_transitions,
         multi_gpu_cfg=multi_gpu_cfg,
     )
 
@@ -456,10 +459,12 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
         observation_schema: ForwardBackwardObservationSchema,
         device: str,
         *,
+        clock: dict[str, object],
         window_lengths: tuple[int, ...],
         seed: int,
     ) -> ForwardBackwardExpertBuffer:
         del env
+        assert clock == {"sampling_mode": "source_rows", "sampling_step_seconds": None}
         width = observation_schema.route_width("backward")
         schema = ForwardBackwardExpertSchema(
             dataset_id="canonical-helper",
@@ -501,23 +506,31 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_transitions": 32,
-            "terminal_capacity_per_env": 4,
+            "policy": {
+                "capacity_transitions": 32,
+                "terminal_capacity_per_env": 4,
+                "sampling": "transition_uniform",
+            },
             "autoreset_mode": "same_step",
         },
-        "expert": {"provider": provider, "window_lengths": (2,)},
+        "expert": {
+            "provider": provider,
+            "clock": {"sampling_mode": "source_rows", "sampling_step_seconds": None},
+            "window_lengths": (2,),
+        },
         "algorithm": {
             "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
             "batch_size": 8,
             "expert_sequence_length": 2,
-            "learning_rate": 3.0e-4,
-            "context_buffer_capacity": 16,
+            "optimization": {"learning_rate": 3.0e-4},
+            "context": {"buffer_capacity": 16},
+            "exploration": {"random_action_transitions": 0},
             "discriminator_gradient_penalty_coefficient": 0.0,
-            "random_action_transitions": 0,
         },
         "value_helpers": (
             {
                 "name": "discriminator",
+                "learning_rate": 3.0e-4,
                 "route": "critic_discriminator",
                 "reward_composition": "vector",
                 "terms": (
@@ -536,6 +549,7 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
             },
             {
                 "name": "shared_discriminator",
+                "learning_rate": 3.0e-4,
                 "route": "critic_discriminator",
                 "reward_composition": "vector",
                 "terms": (
@@ -571,6 +585,10 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
     assert tuple(learner.model.value_networks) == ("discriminator", "shared_discriminator")
     assert learner.model.value_specs[0].reward_composition == "vector"
     assert learner.value_cfg["discriminator"].learning_rate == 3.0e-4
+    assert learner.actor_optimizer.param_groups[0]["lr"] == 3.0e-4
+    assert learner.context_buffer.shape == (16, 4)
+    assert learner.rollout_context_refresh_steps == 100
+    assert learner.random_action_transitions == 0
     assert learner.value_cfg["discriminator"].reward_coefficients == (1.0,)
     assert learner.value_cfg["shared_discriminator"].reward_coefficients == (0.5,)
     assert learner.replay.generator.initial_seed() == 73
@@ -1115,6 +1133,7 @@ def test_phase_1g_publishes_only_explicit_forward_backward_boundaries() -> None:
     ]
     assert rsl_rl.runners.__all__ == [
         "DistillationRunner",
+        "ForwardBackwardRunner",
         "OffPolicyRunner",
         "OnPolicyRunner",
     ]

@@ -349,42 +349,63 @@ class ForwardBackward:
         *,
         online_history: _ForwardBackwardOnlineHistory | None = None,
         auxiliary_evidence_observation_group: str | None,
+        optimization: Mapping[str, object],
+        context: Mapping[str, object],
+        exploration: Mapping[str, object],
         batch_size: int = 1024,
         expert_sequence_length: int = 8,
         gamma: float = 0.98,
-        learning_rate: float = 1e-4,
-        backward_learning_rate: float = 1e-5,
-        discriminator_learning_rate: float = 1e-5,
         value_cfg: Mapping[str, ValueCfg] | None = None,
-        optimizer: str = "adam",
-        weight_decay: float = 0.0,
-        discriminator_weight_decay: float = 0.0,
         fb_pessimism: float = 0.0,
         actor_pessimism: float = 0.5,
         orthogonality_coefficient: float = 1.0,
         implied_value_coefficient: float = 0.0,
         implied_reward_ridge: float = 0.0,
         discriminator_gradient_penalty_coefficient: float = 10.0,
-        context_goal_fraction: float = 0.2,
-        context_expert_fraction: float = 0.6,
-        relabel_fraction: float = 0.8,
-        context_buffer_capacity: int = 10_000,
         fb_target_tau: float = 0.01,
         scale_actor_helpers: bool = True,
-        max_grad_norm: float | None = None,
-        random_action_range: tuple[float, float] | None = None,
-        random_action_transitions: int = 0,
         seed: int = 0,
-        rollout_context_refresh_steps: int = 100,
-        rollout_expert_fraction: float = 0.0,
-        rollout_expert_steps: int = 250,
-        rollout_expert_context_steps: int = 8,
         device: str | torch.device = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
         """Create the learner and assign every trainable module to one optimizer."""
         if multi_gpu_cfg is not None:
             raise NotImplementedError("Forward-backward multi-GPU synchronization is not implemented.")
+        if not isinstance(optimization, Mapping):
+            raise TypeError("Forward-backward optimization must be a mapping.")
+        optimization = dict(optimization)
+        learning_rate = optimization.pop("learning_rate", 1e-4)
+        backward_learning_rate = optimization.pop("backward_learning_rate", 1e-5)
+        discriminator_learning_rate = optimization.pop("discriminator_learning_rate", 1e-5)
+        optimizer = optimization.pop("optimizer", "adam")
+        weight_decay = optimization.pop("weight_decay", 0.0)
+        discriminator_weight_decay = optimization.pop("discriminator_weight_decay", 0.0)
+        max_grad_norm = optimization.pop("max_grad_norm", None)
+        if optimization:
+            raise ValueError(f"Unknown forward-backward optimization fields: {tuple(optimization)}.")
+
+        if not isinstance(context, Mapping):
+            raise TypeError("Forward-backward context policy must be a mapping.")
+        context = dict(context)
+        context_goal_fraction = context.pop("goal_fraction", 0.2)
+        context_expert_fraction = context.pop("expert_fraction", 0.6)
+        relabel_fraction = context.pop("relabel_fraction", 0.8)
+        context_buffer_capacity = context.pop("buffer_capacity", 10_000)
+        rollout_context_refresh_steps = context.pop("refresh_steps", 100)
+        rollout_expert_fraction = context.pop("rollout_expert_fraction", 0.0)
+        rollout_expert_steps = context.pop("rollout_expert_steps", 250)
+        rollout_expert_context_steps = context.pop("rollout_expert_context_steps", 8)
+        if context:
+            raise ValueError(f"Unknown forward-backward context fields: {tuple(context)}.")
+
+        if not isinstance(exploration, Mapping):
+            raise TypeError("Forward-backward exploration policy must be a mapping.")
+        exploration = dict(exploration)
+        random_action_range = exploration.pop("random_action_range", None)
+        random_action_transitions = exploration.pop("random_action_transitions", 0)
+        if exploration:
+            raise ValueError(f"Unknown forward-backward exploration fields: {tuple(exploration)}.")
+
         if batch_size < 2 or expert_sequence_length < 1 or batch_size % expert_sequence_length:
             raise ValueError("batch_size must be at least two and divisible by expert_sequence_length.")
         if expert_sequence_length not in expert.schema.window_lengths:
@@ -1466,12 +1487,12 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     channels_by_name: dict[str, ForwardBackwardRewardChannel] = {}
     environment_reward_name: str | None = None
     auxiliary_evidence_names: list[str] = []
-    helper_learning_rate = algorithm_cfg.get("learning_rate", 1.0e-4)
     for helper_value in helper_values:
         if not isinstance(helper_value, Mapping):
             raise TypeError("Each value helper must be a mapping.")
         helper = dict(helper_value)
         helper_name = helper.pop("name")
+        helper_learning_rate = helper.pop("learning_rate")
         route = helper.pop("route")
         term_values = helper.pop("terms")
         if not isinstance(helper_name, str) or not helper_name or helper_name in helper_names:
@@ -1561,7 +1582,15 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         value_cfg[helper_name] = ForwardBackward.ValueCfg(**objective)
 
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
-    capacity_transitions = replay_cfg.pop("capacity_transitions")
+    replay_policy = replay_cfg.pop("policy")
+    if not isinstance(replay_policy, Mapping):
+        raise TypeError("Forward-backward replay policy must be a mapping.")
+    replay_policy = dict(replay_policy)
+    capacity_transitions = replay_policy.pop("capacity_transitions")
+    terminal_capacity_per_env = replay_policy.pop("terminal_capacity_per_env")
+    sampling = replay_policy.pop("sampling")
+    if replay_policy:
+        raise ValueError(f"Unknown forward-backward replay policy fields: {tuple(replay_policy)}.")
     if isinstance(capacity_transitions, bool) or not isinstance(capacity_transitions, int) or capacity_transitions < 1:
         raise ValueError("Replay capacity_transitions must be a positive integer.")
     capacity_steps, remainder = divmod(capacity_transitions, env.num_envs)
@@ -1605,6 +1634,8 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         reward_schema=reward_schema,
         device=device,
         history_layout=history_layout,
+        terminal_capacity_per_env=terminal_capacity_per_env,
+        sampling=sampling,
         seed=seed,
         **replay_cfg,
     )

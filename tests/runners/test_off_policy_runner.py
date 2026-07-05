@@ -121,11 +121,13 @@ def _expert_provider(
     observation_schema: ForwardBackwardObservationSchema,
     device: str,
     *,
+    clock: dict[str, object],
     window_lengths: tuple[int, ...],
     seed: int,
 ) -> ForwardBackwardExpertBuffer:
     """Return one deterministic two-clip corpus on the learner device."""
     del env
+    assert clock == {"sampling_mode": "source_rows", "sampling_step_seconds": None}
     frame_count = 32
     width = observation_schema.route_width("backward")
     frames = torch.arange(frame_count * width, device=device, dtype=torch.float32).reshape(frame_count, width) / 100
@@ -178,26 +180,37 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0) -> dict:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_transitions": 8 * NUM_ENVS,
-            "terminal_capacity_per_env": 4,
+            "policy": {
+                "capacity_transitions": 8 * NUM_ENVS,
+                "terminal_capacity_per_env": 4,
+                "sampling": "transition_uniform",
+            },
             "autoreset_mode": "same_step",
         },
-        "expert": {"provider": _expert_provider, "window_lengths": (2, 6)},
+        "expert": {
+            "provider": _expert_provider,
+            "clock": {"sampling_mode": "source_rows", "sampling_step_seconds": None},
+            "window_lengths": (2, 6),
+        },
         "algorithm": {
             "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
             "batch_size": 8,
             "expert_sequence_length": 2,
-            "context_buffer_capacity": 16,
+            "optimization": {},
+            "context": {
+                "buffer_capacity": 16,
+                "refresh_steps": 2,
+                "rollout_expert_fraction": rollout_expert_fraction,
+                "rollout_expert_steps": 4,
+                "rollout_expert_context_steps": 3,
+            },
+            "exploration": {"random_action_transitions": 0},
             "discriminator_gradient_penalty_coefficient": 0.0,
-            "random_action_transitions": 0,
-            "rollout_context_refresh_steps": 2,
-            "rollout_expert_fraction": rollout_expert_fraction,
-            "rollout_expert_steps": 4,
-            "rollout_expert_context_steps": 3,
         },
         "value_helpers": [
             {
                 "name": "discriminator",
+                "learning_rate": 1.0e-4,
                 "route": "critic_discriminator",
                 "terms": [
                     {
@@ -219,6 +232,7 @@ def _make_cfg(*, rollout_expert_fraction: float = 0.0) -> dict:
             },
             {
                 "name": "auxiliary",
+                "learning_rate": 1.0e-4,
                 "route": "critic_auxiliary",
                 "terms": [
                     {
@@ -333,11 +347,12 @@ def test_runner_constructs_collects_and_updates() -> None:
 def test_constructor_derives_time_major_rows_from_transition_capacity() -> None:
     """High-level capacity should count transitions while replay stores vector steps."""
     cfg = _make_cfg()
-    assert "capacity_steps" not in cfg["replay"]
+    assert "capacity_steps" not in cfg["replay"]["policy"]
     runner = OffPolicyRunner(ForwardBackwardDummyEnv(), cfg, log_dir=None, device="cpu")
 
     assert runner.alg.replay.capacity_steps == 8
     assert runner.alg.replay.capacity_steps * runner.env.num_envs == 8 * NUM_ENVS
+    assert runner.alg.replay.sampling is ForwardBackwardReplay.Sampling.TRANSITION_UNIFORM
 
 
 def test_constructor_derives_auxiliary_evidence_route_from_helper_terms() -> None:
@@ -379,7 +394,7 @@ def test_constructor_rejects_invalid_transition_capacity(
 ) -> None:
     """Invalid transition counts should fail before replay storage is allocated."""
     cfg = _make_cfg()
-    cfg["replay"]["capacity_transitions"] = capacity_transitions
+    cfg["replay"]["policy"]["capacity_transitions"] = capacity_transitions
     monkeypatch.setattr(
         ForwardBackwardReplay, "__init__", lambda *_args, **_kwargs: pytest.fail("replay storage was allocated")
     )

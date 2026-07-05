@@ -45,33 +45,51 @@ def metamotivo_config(expert_provider: Callable) -> dict:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_transitions": 2_000_000,
-            "terminal_capacity_per_env": 16,
+            "policy": {
+                "capacity_transitions": 2_000_000,
+                "terminal_capacity_per_env": 16,
+                "sampling": "transition_uniform",
+            },
             "autoreset_mode": "same_step",
         },
-        "expert": {"provider": expert_provider, "window_lengths": (8,)},
+        "expert": {
+            "provider": expert_provider,
+            "clock": {"sampling_mode": "source_rows", "sampling_step_seconds": None},
+            "window_lengths": (8,),
+        },
         "algorithm": {
             "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
             "batch_size": 1024,
             "expert_sequence_length": 8,
             "gamma": 0.98,
-            "learning_rate": 1e-4,
-            "backward_learning_rate": 1e-5,
-            "discriminator_learning_rate": 1e-5,
+            "optimization": {
+                "learning_rate": 1e-4,
+                "backward_learning_rate": 1e-5,
+                "discriminator_learning_rate": 1e-5,
+            },
+            "context": {
+                "goal_fraction": 0.2,
+                "expert_fraction": 0.6,
+                "relabel_fraction": 0.8,
+                "buffer_capacity": 10_000,
+                "refresh_steps": 150,
+                "rollout_expert_fraction": 0.0,
+                "rollout_expert_steps": 250,
+                "rollout_expert_context_steps": 8,
+            },
+            "exploration": {
+                "random_action_range": (-1.0, 1.0),
+                "random_action_transitions": 50_000,
+            },
             "fb_pessimism": 0.0,
             "orthogonality_coefficient": 100.0,
             "implied_value_coefficient": 0.1,
             "discriminator_gradient_penalty_coefficient": 10.0,
-            "context_goal_fraction": 0.2,
-            "context_expert_fraction": 0.6,
-            "relabel_fraction": 0.8,
-            "rollout_context_refresh_steps": 150,
-            "random_action_range": (-1.0, 1.0),
-            "random_action_transitions": 50_000,
         },
         "value_helpers": (
             {
                 "name": "discriminator",
+                "learning_rate": 1e-4,
                 "route": "critic_discriminator",
                 "reward_composition": "vector",
                 "terms": (
@@ -146,8 +164,11 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
         },
         "replay": {
             "class_name": "rsl_rl.storage.forward_backward_replay:ForwardBackwardReplay",
-            "capacity_transitions": 5_120_000,
-            "terminal_capacity_per_env": 16,
+            "policy": {
+                "capacity_transitions": 5_120_000,
+                "terminal_capacity_per_env": 16,
+                "sampling": "transition_uniform",
+            },
             "autoreset_mode": "same_step",
             "history_layout": {
                 "history_field": "history_actor",
@@ -161,32 +182,43 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
                 ],
             },
         },
-        "expert": {"provider": expert_provider, "window_lengths": (8, 257)},
+        "expert": {
+            "provider": expert_provider,
+            "clock": {"sampling_mode": "uniform_before_source_end", "sampling_step_seconds": 0.02},
+            "window_lengths": (8, 257),
+        },
         "algorithm": {
             "class_name": "rsl_rl.algorithms.forward_backward:ForwardBackward",
             "batch_size": 1024,
             "expert_sequence_length": 8,
             "gamma": 0.98,
-            "learning_rate": 3e-4,
-            "backward_learning_rate": 1e-5,
-            "discriminator_learning_rate": 1e-5,
+            "optimization": {
+                "learning_rate": 3e-4,
+                "backward_learning_rate": 1e-5,
+                "discriminator_learning_rate": 1e-5,
+            },
+            "context": {
+                "goal_fraction": 0.2,
+                "expert_fraction": 0.6,
+                "relabel_fraction": 0.8,
+                "buffer_capacity": 8_192,
+                "refresh_steps": 100,
+                "rollout_expert_fraction": 0.5,
+                "rollout_expert_steps": 250,
+                "rollout_expert_context_steps": 8,
+            },
+            "exploration": {
+                "random_action_range": (-5.0, 5.0),
+                "random_action_transitions": 10_240,
+            },
             "fb_pessimism": 0.0,
             "orthogonality_coefficient": 100.0,
             "discriminator_gradient_penalty_coefficient": 10.0,
-            "context_goal_fraction": 0.2,
-            "context_expert_fraction": 0.6,
-            "relabel_fraction": 0.8,
-            "context_buffer_capacity": 8_192,
-            "rollout_context_refresh_steps": 100,
-            "rollout_expert_fraction": 0.5,
-            "random_action_range": (-5.0, 5.0),
-            "random_action_transitions": 10_240,
-            "rollout_expert_steps": 250,
-            "rollout_expert_context_steps": 8,
         },
         "value_helpers": (
             {
                 "name": "discriminator",
+                "learning_rate": 3e-4,
                 "route": "critic_discriminator",
                 "reward_composition": "vector",
                 "terms": (
@@ -205,6 +237,7 @@ def bfm_zero_native_config(expert_provider: Callable) -> dict:
             },
             {
                 "name": "auxiliary",
+                "learning_rate": 3e-4,
                 "route": "critic_auxiliary",
                 "terms": tuple(
                     {
