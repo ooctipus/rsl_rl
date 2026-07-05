@@ -1459,7 +1459,7 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     helper_values = cfg["value_helpers"]
     if not isinstance(helper_values, (tuple, list)) or not helper_values:
         raise TypeError("value_helpers must be a nonempty sequence of mappings.")
-    value_heads: list[dict[str, object]] = []
+    value_specs: list[ForwardBackwardValueSpec] = []
     reward_channels: list[ForwardBackwardRewardChannel] = []
     value_cfg: dict[str, ForwardBackward.ValueCfg] = {}
     helper_names: set[str] = set()
@@ -1524,17 +1524,17 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         reward_composition = helper.pop("reward_composition")
         if reward_composition not in ("vector", "scalar"):
             raise ValueError(f"Unsupported reward composition: {reward_composition!r}.")
-        spec: dict[str, object] = {
-            "name": helper_name,
-            "kind": "critic",
-            "route": route,
-            "reward_channels": channel_names,
-            "ensemble_size": 2,
-            "has_target": True,
-        }
-        if reward_composition == "scalar":
-            spec["reward_composition"] = reward_composition
-        value_heads.append({"spec": spec})
+        value_specs.append(
+            ForwardBackwardValueSpec(
+                name=helper_name,
+                kind="critic",
+                route=route,
+                reward_channels=tuple(channel_names),
+                ensemble_size=2,
+                has_target=True,
+                reward_composition=reward_composition,
+            )
+        )
 
         normalize_rewards = helper.pop("normalize_rewards", False)
         normalization_decay = helper.pop("reward_normalization_decay", None)
@@ -1560,7 +1560,6 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
             raise ValueError(f"Unknown value-helper fields: {tuple(helper)}.")
         value_cfg[helper_name] = ForwardBackward.ValueCfg(**objective)
 
-    model_cfg["value_heads"] = value_heads
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
     capacity_transitions = replay_cfg.pop("capacity_transitions")
     if isinstance(capacity_transitions, bool) or not isinstance(capacity_transitions, int) or capacity_transitions < 1:
@@ -1578,7 +1577,13 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     if history_layout is not None:
         online_history = _ForwardBackwardOnlineHistory(history_layout, observations)
         observations = online_history.decorate_current(observations)
-    model = model_class.from_config(observations, cfg["obs_groups"], env.num_actions, model_cfg)
+    model = model_class.from_config(
+        observations,
+        cfg["obs_groups"],
+        env.num_actions,
+        model_cfg,
+        value_specs=value_specs,
+    )
 
     reward_schema = ForwardBackwardRewardSchema(tuple(reward_channels))
     autoreset_mode = ForwardBackwardAutoresetMode(replay_cfg.pop("autoreset_mode"))

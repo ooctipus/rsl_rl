@@ -672,22 +672,17 @@ def test_model_from_config_reuses_forward_architecture_for_unspecified_value_hea
         "forward_cfg": {"hidden_dim": 16, "hidden_layers": 2, "embedding_layers": 3},
         "backward_hidden_dims": [8, 8],
         "normalization_type": "none",
-        "value_heads": [
-            {
-                "spec": {
-                    "name": "discriminator",
-                    "kind": "critic",
-                    "route": "critic_discriminator",
-                    "reward_channels": ["discriminator"],
-                    "ensemble_size": 2,
-                    "has_target": True,
-                },
-                "network": None,
-            }
-        ],
     }
+    value_spec = ForwardBackwardValueSpec(
+        name="discriminator",
+        kind="critic",
+        route="critic_discriminator",
+        reward_channels=("discriminator",),
+        ensemble_size=2,
+        has_target=True,
+    )
 
-    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config)
+    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config, value_specs=(value_spec,))
     value_network = model.value_networks["discriminator"]
     forward_parameters = {id(parameter) for parameter in model.forward_network.parameters()}
     value_parameters = {id(parameter) for parameter in value_network.parameters()}

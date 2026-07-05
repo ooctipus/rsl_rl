@@ -426,30 +426,24 @@ class ForwardBackwardModel(torch.nn.Module):
         obs_groups: Mapping[str, Sequence[str]],
         action_dim: int,
         config: Mapping[str, object],
+        *,
+        value_specs: Sequence[ForwardBackwardValueSpec] = (),
     ) -> ForwardBackwardModel:
-        """Build a training or inference model from one ordinary config section."""
+        """Build a training or inference model from config and typed value semantics."""
         options = dict(config)
         configured_class = resolve_callable(options.pop("class_name", cls))
         if configured_class is not cls:
             raise TypeError(f"Configured model class must be {cls.__name__}, got {configured_class!r}.")
         actor_cfg = ForwardBackwardDualNetworkCfg(**dict(options.pop("actor_cfg")))
         forward_cfg = ForwardBackwardDualNetworkCfg(**dict(options.pop("forward_cfg")))
-        value_heads = []
-        for value in options.pop("value_heads", ()):
-            value_options = dict(value)
-            spec = ForwardBackwardValueSpec(**dict(value_options.pop("spec")))
-            network_options = value_options.pop("network", None)
-            network = forward_cfg if network_options is None else ForwardBackwardDualNetworkCfg(**dict(network_options))
-            if value_options:
-                raise ValueError(f"Unknown value-head configuration: {tuple(value_options)}.")
-            value_heads.append(ForwardBackwardValueHeadCfg(spec, network))
+        value_heads = tuple(ForwardBackwardValueHeadCfg(spec, forward_cfg) for spec in value_specs)
         return cls(
             observations,
             obs_groups,
             action_dim,
             actor_cfg=actor_cfg,
             forward_cfg=forward_cfg,
-            value_heads=tuple(value_heads),
+            value_heads=value_heads,
             **options,
         )
 
