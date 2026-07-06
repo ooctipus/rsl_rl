@@ -23,23 +23,9 @@ from rsl_rl.modules.mlp import MLPBlock, MLPEnsembleLinear
 from rsl_rl.modules.reward_channels import ForwardBackwardValueSpec, get_forward_backward_schema_hash
 from rsl_rl.utils import resolve_callable
 
-ForwardBackwardRouteName = Literal[
-    "actor",
-    "forward",
-    "backward",
-    "discriminator",
-    "critic_discriminator",
-    "critic_auxiliary",
-]
+ForwardBackwardRouteName = str
 
-_ROUTE_ORDER: tuple[ForwardBackwardRouteName, ...] = (
-    "actor",
-    "forward",
-    "backward",
-    "discriminator",
-    "critic_discriminator",
-    "critic_auxiliary",
-)
+_CORE_ROUTE_ORDER: tuple[ForwardBackwardRouteName, ...] = ("actor", "forward", "backward", "discriminator")
 
 
 @dataclass(frozen=True)
@@ -68,12 +54,15 @@ class ForwardBackwardObservationSchema:
         route_names = tuple(name for name, _fields in raw_routes)
         if len(route_names) != len(set(route_names)):
             raise ValueError("Observation route names must be unique.")
-        unknown_routes = set(route_names).difference(_ROUTE_ORDER)
-        if unknown_routes:
-            raise ValueError(f"Unknown observation routes: {tuple(sorted(unknown_routes))}.")
+        if any(not isinstance(name, str) or not name for name in route_names):
+            raise ValueError("Observation route names must be nonempty strings.")
 
         route_by_name = dict(raw_routes)
-        routes = tuple((name, route_by_name[name]) for name in _ROUTE_ORDER if name in route_by_name)
+        core_routes = tuple((name, route_by_name[name]) for name in _CORE_ROUTE_ORDER if name in route_by_name)
+        value_routes = tuple(
+            (name, route_by_name[name]) for name in sorted(set(route_names).difference(_CORE_ROUTE_ORDER))
+        )
+        routes = core_routes + value_routes
         if not routes:
             raise ValueError("At least one observation route is required.")
         for name, route_fields in routes:
@@ -478,8 +467,18 @@ class ForwardBackwardModel(torch.nn.Module):
             raise ValueError(f"Unknown initialization_type: {initialization_type!r}.")
         self.observation_schema = ForwardBackwardObservationSchema.from_observations(observations, obs_groups)
         self.observation_schema.assert_valid(observations)
-        for route in ("actor", "forward", "backward"):
-            self.observation_schema.route(cast(ForwardBackwardRouteName, route))
+        consumed_routes = {"actor", "forward", "backward"}
+        if discriminator_hidden_dims is not None:
+            consumed_routes.add("discriminator")
+        consumed_routes.update(head.spec.route for head in value_heads)
+        configured_routes = {name for name, _fields in self.observation_schema.routes}
+        missing_routes = consumed_routes.difference(configured_routes)
+        unused_routes = configured_routes.difference(consumed_routes)
+        if missing_routes or unused_routes:
+            raise ValueError(
+                "Observation routes must match model consumers exactly; "
+                f"missing={tuple(sorted(missing_routes))}, unused={tuple(sorted(unused_routes))}."
+            )
 
         self.action_dim = action_dim
         self.context_dim = context_dim

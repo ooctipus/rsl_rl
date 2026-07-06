@@ -33,6 +33,7 @@ from rsl_rl.algorithms.forward_backward import (
     ForwardBackwardCheckpointHeader,
     _checkpoint_config,
     _ForwardBackwardOnlineHistory,
+    forward_backward_model_from_config,
 )
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models.forward_backward_model import (
@@ -146,8 +147,6 @@ def _make_learner(
         "forward": ("state",),
         "backward": ("state",),
         "discriminator": ("state",),
-        "critic_discriminator": ("state",),
-        "critic_auxiliary": ("state",),
     }
     reward_schema = make_reward_schema()
     if not include_environment_reward:
@@ -187,6 +186,7 @@ def _make_learner(
                 network,
             )
         )
+    routes.update({head.spec.route: ("state",) for head in value_heads})
     model = ForwardBackwardModel(
         observations,
         routes,
@@ -678,8 +678,16 @@ def test_runtime_materializes_canonical_helpers_and_root_seed_once() -> None:
         config,
         "cpu",
     )
+    evaluation_model = forward_backward_model_from_config(
+        TensorDict({"state": torch.zeros(4, 6)}, batch_size=[4]),
+        config["obs_groups"],
+        Env.num_actions,
+        config["model"],
+        config["value_helpers"],
+    )
 
     assert config == original
+    assert tuple(evaluation_model.state_dict()) == tuple(learner.model.state_dict())
     assert learner.replay.reward_schema.channel_names == ("discriminator",)
     assert learner.replay.transition_schema.environment_reward_name is None
     assert learner.replay.transition_schema.auxiliary_evidence_names == ()

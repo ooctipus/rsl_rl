@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from tensordict import TensorDict, TensorDictBase
 
 from rsl_rl.env import VecEnv
-from rsl_rl.models.forward_backward_model import ForwardBackwardModel
+from rsl_rl.models.forward_backward_model import ForwardBackwardModel, ForwardBackwardObservationSchema
 from rsl_rl.modules.forward_backward import (
     actor_direct_loss,
     backward_implied_reward,
@@ -1447,37 +1447,19 @@ class ForwardBackward:
         self._update_actor = torch.compile(self._update_actor, mode=mode)
 
 
-def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
-    """Construct one forward-backward learner from canonical runner sections."""
-    seed = cfg["seed"]
-    if type(seed) is not int:
-        raise TypeError("Forward-backward runner seed must be an integer.")
-    model_cfg = dict(cfg["model"])
-    replay_cfg = dict(cfg["replay"])
-    expert_cfg = dict(cfg["expert"])
-    algorithm_cfg = dict(cfg["algorithm"])
-    for section_name, section, derived_names in (
-        ("model", model_cfg, ("value_heads",)),
-        (
-            "replay",
-            replay_cfg,
-            (
-                "reward_channels",
-                "environment_reward_name",
-                "auxiliary_evidence_names",
-                "auxiliary_evidence_observation_group",
-            ),
-        ),
-        ("expert", expert_cfg, ()),
-        ("algorithm", algorithm_cfg, ("value_cfg",)),
-    ):
-        present = tuple(name for name in derived_names if name in section)
-        if present:
-            raise ValueError(f"{section_name} fields {present} are derived from value_helpers.")
-        if "seed" in section:
-            raise ValueError(f"{section_name} seed is owned by the runner root.")
+@dataclass(frozen=True)
+class _ForwardBackwardValueConfiguration:
+    """Runtime views derived from one ordered value-helper declaration."""
 
-    helper_values = cfg["value_helpers"]
+    specs: tuple[ForwardBackwardValueSpec, ...]
+    reward_channels: tuple[ForwardBackwardRewardChannel, ...]
+    objectives: dict[str, ForwardBackward.ValueCfg]
+    environment_reward_name: str | None
+    auxiliary_evidence_names: tuple[str, ...]
+
+
+def _forward_backward_values_from_config(helper_values: object) -> _ForwardBackwardValueConfiguration:
+    """Derive model, replay, and objective views from value helpers once."""
     if not isinstance(helper_values, (tuple, list)) or not helper_values:
         raise TypeError("value_helpers must be a nonempty sequence of mappings.")
     value_specs: list[ForwardBackwardValueSpec] = []
@@ -1581,6 +1563,99 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
             raise ValueError(f"Unknown value-helper fields: {tuple(helper)}.")
         value_cfg[helper_name] = ForwardBackward.ValueCfg(**objective)
 
+    return _ForwardBackwardValueConfiguration(
+        specs=tuple(value_specs),
+        reward_channels=tuple(reward_channels),
+        objectives=value_cfg,
+        environment_reward_name=environment_reward_name,
+        auxiliary_evidence_names=tuple(auxiliary_evidence_names),
+    )
+
+
+def _forward_backward_model_from_config(
+    observations: TensorDictBase,
+    obs_groups: Mapping[str, list[str]],
+    num_actions: int,
+    model_cfg: Mapping[str, object],
+    value_specs: tuple[ForwardBackwardValueSpec, ...],
+) -> ForwardBackwardModel:
+    """Construct the shared training/evaluation model from resolved runtime views."""
+    model_cfg = dict(model_cfg)
+    if "value_heads" in model_cfg:
+        raise ValueError("model field 'value_heads' is derived from value_helpers.")
+    model_class = resolve_callable(model_cfg["class_name"])
+    if not isinstance(model_class, type) or not issubclass(model_class, ForwardBackwardModel):
+        raise TypeError("The configured model class must derive from ForwardBackwardModel.")
+    return model_class.from_config(observations, obs_groups, num_actions, model_cfg, value_specs=value_specs)
+
+
+def forward_backward_model_from_config(
+    observations: TensorDictBase,
+    obs_groups: Mapping[str, list[str]],
+    num_actions: int,
+    model_cfg: Mapping[str, object],
+    value_helpers: object,
+) -> ForwardBackwardModel:
+    """Construct the exact forward-backward model topology used by the runner."""
+    values = _forward_backward_values_from_config(value_helpers)
+    return _forward_backward_model_from_config(observations, obs_groups, num_actions, model_cfg, values.specs)
+
+
+def forward_backward_expert_from_config(
+    env: VecEnv,
+    observation_schema: ForwardBackwardObservationSchema,
+    device: str,
+    expert_cfg: Mapping[str, object],
+    seed: int,
+) -> ForwardBackwardExpertBuffer:
+    """Construct the exact expert corpus used by the forward-backward runner."""
+    expert_cfg = dict(expert_cfg)
+    if "seed" in expert_cfg:
+        raise ValueError("expert seed is owned by the runner root.")
+    provider = resolve_callable(expert_cfg.pop("provider"))
+    expert = provider(env, observation_schema, device, seed=seed, **expert_cfg)
+    if not isinstance(expert, ForwardBackwardExpertBuffer):
+        raise TypeError("The expert provider must return ForwardBackwardExpertBuffer.")
+    return expert
+
+
+def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> ForwardBackward:
+    """Construct one forward-backward learner from canonical runner sections."""
+    seed = cfg["seed"]
+    if type(seed) is not int:
+        raise TypeError("Forward-backward runner seed must be an integer.")
+    model_cfg = dict(cfg["model"])
+    replay_cfg = dict(cfg["replay"])
+    expert_cfg = dict(cfg["expert"])
+    algorithm_cfg = dict(cfg["algorithm"])
+    for section_name, section, derived_names in (
+        ("model", model_cfg, ("value_heads",)),
+        (
+            "replay",
+            replay_cfg,
+            (
+                "reward_channels",
+                "environment_reward_name",
+                "auxiliary_evidence_names",
+                "auxiliary_evidence_observation_group",
+            ),
+        ),
+        ("expert", expert_cfg, ()),
+        ("algorithm", algorithm_cfg, ("value_cfg",)),
+    ):
+        present = tuple(name for name in derived_names if name in section)
+        if present:
+            raise ValueError(f"{section_name} fields {present} are derived from value_helpers.")
+        if "seed" in section:
+            raise ValueError(f"{section_name} seed is owned by the runner root.")
+
+    helper_values = cfg["value_helpers"]
+    value_config = _forward_backward_values_from_config(helper_values)
+    value_specs = value_config.specs
+    reward_channels = value_config.reward_channels
+    value_cfg = value_config.objectives
+    environment_reward_name = value_config.environment_reward_name
+    auxiliary_evidence_names = value_config.auxiliary_evidence_names
     replay_class = resolve_callable(replay_cfg.pop("class_name"))
     replay_policy = replay_cfg.pop("policy")
     if not isinstance(replay_policy, Mapping):
@@ -1597,21 +1672,18 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
     if remainder:
         raise ValueError("Replay capacity_transitions must be divisible by env.num_envs.")
 
-    model_class = resolve_callable(model_cfg["class_name"])
     history_layout = _make_history_layout(replay_cfg.pop("history_layout", None))
     online_history = None
-    if not isinstance(model_class, type) or not issubclass(model_class, ForwardBackwardModel):
-        raise TypeError("The configured model class must derive from ForwardBackwardModel.")
     observations = obs.to(device)
     if history_layout is not None:
         online_history = _ForwardBackwardOnlineHistory(history_layout, observations)
         observations = online_history.decorate_current(observations)
-    model = model_class.from_config(
+    model = _forward_backward_model_from_config(
         observations,
         cfg["obs_groups"],
         env.num_actions,
         model_cfg,
-        value_specs=value_specs,
+        value_specs,
     )
 
     reward_schema = ForwardBackwardRewardSchema(tuple(reward_channels))
@@ -1648,10 +1720,7 @@ def _construct_forward_backward(obs: TensorDict, env: VecEnv, cfg: dict, device:
         replay,
     )
 
-    provider = resolve_callable(expert_cfg.pop("provider"))
-    expert = provider(env, model.observation_schema, device, seed=seed, **expert_cfg)
-    if not isinstance(expert, ForwardBackwardExpertBuffer):
-        raise TypeError("The expert provider must return ForwardBackwardExpertBuffer.")
+    expert = forward_backward_expert_from_config(env, model.observation_schema, device, expert_cfg, seed)
 
     algorithm_class = resolve_callable(algorithm_cfg.pop("class_name"))
     manifest = {

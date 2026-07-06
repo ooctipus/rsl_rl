@@ -70,6 +70,11 @@ def _make_model(
     distribution_cfg: dict[str, object] | None = None,
     initialization_type: Literal["default", "orthogonal"] = "default",
 ) -> ForwardBackwardModel:
+    consumed_routes = {"actor", "forward", "backward"}
+    if discriminator_hidden_dims is not None:
+        consumed_routes.add("discriminator")
+    consumed_routes.update(head.spec.route for head in value_heads)
+    routes = {name: fields for name, fields in routes.items() if name in consumed_routes}
     return ForwardBackwardModel(
         observations,
         routes,
@@ -143,8 +148,8 @@ def test_bfm_routes_have_exact_width_and_checkpoint_order() -> None:
         ("forward", ("state", "privileged_state", "last_action", "history_actor")),
         ("backward", ("state", "privileged_state")),
         ("discriminator", ("state", "privileged_state")),
-        ("critic_discriminator", ("state", "privileged_state", "last_action", "history_actor")),
         ("critic_auxiliary", ("state", "privileged_state", "last_action", "history_actor")),
+        ("critic_discriminator", ("state", "privileged_state", "last_action", "history_actor")),
     )
     assert tuple(schema.route_width(name) for name, _ in schema.routes) == (465, 928, 527, 527, 928, 928)
 
@@ -255,10 +260,21 @@ def test_model_surface_exposes_phase_1c_component_methods() -> None:
     }.issubset(ForwardBackwardModel.__dict__)
 
 
-def test_unknown_route_and_field_fail_at_construction_boundary() -> None:
-    """Configuration typos should fail once when the model is built."""
-    with pytest.raises(ValueError, match="Unknown observation routes"):
-        _make_schema(META_FIELD_WIDTHS, {"typo": ("state",)})
+def test_unconsumed_route_and_unknown_field_fail_at_construction_boundary() -> None:
+    """Configuration typos should fail once at their owning construction boundary."""
+    observations = TensorDict({"state": torch.randn(2, 358)}, batch_size=[2])
+    routes = {name: ("state",) for name in ("actor", "forward", "backward", "typo")}
+    with pytest.raises(ValueError, match=r"unused=\('typo',\)"):
+        ForwardBackwardModel(
+            observations,
+            routes,
+            action_dim=2,
+            context_dim=4,
+            actor_cfg=_dual(),
+            forward_cfg=_dual(),
+            backward_hidden_dims=_hidden_dims(),
+            normalization_type="none",
+        )
     with pytest.raises(ValueError, match="unknown fields"):
         _make_schema(META_FIELD_WIDTHS, {"actor": ("missing",)})
 
@@ -655,7 +671,12 @@ def test_model_from_config_is_shared_by_training_and_inference() -> None:
         "normalization_momentum": 0.01,
     }
 
-    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config)
+    model = ForwardBackwardModel.from_config(
+        observations,
+        {name: META_ROUTES[name] for name in ("actor", "forward", "backward")},
+        2,
+        config,
+    )
 
     assert model.observation_schema.route_width("actor") == 358
     assert model.action_dim == 2
@@ -682,7 +703,13 @@ def test_model_from_config_reuses_forward_architecture_for_unspecified_value_hea
         has_target=True,
     )
 
-    model = ForwardBackwardModel.from_config(observations, META_ROUTES, 2, config, value_specs=(value_spec,))
+    model = ForwardBackwardModel.from_config(
+        observations,
+        {name: META_ROUTES[name] for name in ("actor", "forward", "backward", value_spec.route)},
+        2,
+        config,
+        value_specs=(value_spec,),
+    )
     value_network = model.value_networks["discriminator"]
     forward_parameters = {id(parameter) for parameter in model.forward_network.parameters()}
     value_parameters = {id(parameter) for parameter in value_network.parameters()}
