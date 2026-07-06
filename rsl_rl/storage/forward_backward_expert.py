@@ -125,6 +125,7 @@ class ForwardBackwardExpertBuffer:
 
         self.frames = frames
         self.clip_offsets = clip_offsets
+        self.base_priorities = priorities.clone()
         self.priorities = priorities
         self.schema = schema
         self.device = frames.device
@@ -199,23 +200,30 @@ class ForwardBackwardExpertBuffer:
         )
 
     def state_dict(self) -> dict[str, object]:
-        """Capture only mutable sampling state; corpus tensors are immutable inputs."""
+        """Capture mutable sampling state and immutable base-priority identity."""
         return {
             "schema_hash": self.schema.schema_hash,
             "clip_ids": self.clip_ids,
             "clip_length_values": self.clip_length_values,
+            "base_priorities": self.base_priorities.clone(),
             "priorities": self.priorities.clone(),
             "generator_state": self.generator.get_state(),
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
-        """Restore the exact next sample under the same corpus identity."""
+        """Restore the exact next sample under the same corpus and base-priority identity."""
         if state["schema_hash"] != self.schema.schema_hash:
             raise ValueError("Expert sampler state does not match the corpus schema.")
         if state.get("clip_ids") != self.clip_ids:
             raise ValueError("Expert sampler clip ids do not match the corpus.")
         if state.get("clip_length_values") != self.clip_length_values:
             raise ValueError("Expert sampler clip lengths do not match the corpus.")
+        base_priorities = state.get("base_priorities")
+        if not isinstance(base_priorities, torch.Tensor):
+            raise TypeError("Expert base_priorities state must be a tensor.")
+        base_priorities = base_priorities.to(device=self.device)
+        if not torch.equal(base_priorities, self.base_priorities):
+            raise ValueError("Expert sampler base priorities do not match the corpus.")
         priorities = state["priorities"]
         if not isinstance(priorities, torch.Tensor):
             raise TypeError("Expert priorities state must be a tensor.")

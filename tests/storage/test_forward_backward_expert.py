@@ -264,6 +264,16 @@ def test_expert_priority_event_updates_all_windows_and_checkpoint_state() -> Non
     assert torch.all(restored.sample(128, 5).clip_ids == 1)
 
 
+def test_expert_priority_event_preserves_immutable_base_priorities() -> None:
+    """Dynamic sampling updates must not overwrite the corpus sampling base."""
+    buffer = _make_buffer()
+    base_priorities = buffer.priorities.clone()
+
+    buffer.set_priorities(torch.tensor([0.0, 1.0, 0.0]))
+
+    torch.testing.assert_close(buffer.base_priorities, base_priorities)
+
+
 @pytest.mark.parametrize(
     "priorities",
     (
