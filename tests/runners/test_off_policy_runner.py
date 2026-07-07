@@ -817,6 +817,32 @@ def test_runner_checkpoint_restores_environment_and_iteration_exactly() -> None:
     }
 
 
+def test_runner_checkpoint_save_failure_preserves_existing_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed checkpoint write should preserve the prior checkpoint and remove its temporary file."""
+    runner = OffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"complete checkpoint")
+    save_paths: list[Path] = []
+
+    def fail_save(_state: object, path: str) -> None:
+        save_path = Path(path)
+        save_paths.append(save_path)
+        save_path.write_bytes(b"partial checkpoint")
+        raise RuntimeError("simulated checkpoint failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+
+    with pytest.raises(RuntimeError, match="simulated checkpoint failure"):
+        runner.save(str(checkpoint))
+
+    assert checkpoint.read_bytes() == b"complete checkpoint"
+    assert save_paths[0].parent == checkpoint.parent
+    assert save_paths[0] != checkpoint
+    assert list(tmp_path.iterdir()) == [checkpoint]
+
+
 def test_update_boundary_can_replace_collection_observations() -> None:
     """A specialized runner can resume collection from observations returned by update."""
     runner = UpdatingOffPolicyRunner(ForwardBackwardDummyEnv(), _make_cfg(), log_dir=None, device="cpu")

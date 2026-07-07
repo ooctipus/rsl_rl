@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
+import tempfile
 import time
 import torch
 from tensordict import TensorDictBase
@@ -16,6 +18,25 @@ from tensordict import TensorDictBase
 from rsl_rl.env import VecEnv
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 from rsl_rl.utils import check_nan
+
+
+def _atomic_torch_save(value: object, path: str) -> None:
+    """Write a Torch object without exposing a partial destination file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+    )
+    try:
+        os.close(descriptor)
+        torch.save(value, temporary_path)
+        with open(temporary_path, "rb") as temporary_file:
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temporary_path)
 
 
 class OffPolicyRunner(OnPolicyRunner):
@@ -154,7 +175,7 @@ class OffPolicyRunner(OnPolicyRunner):
         """Save the complete runner state."""
         state = self.state_dict()
         state["infos"] = infos
-        torch.save(state, path)
+        _atomic_torch_save(state, path)
         self.logger.save_model(path, self.current_learning_iteration)
 
     def load(
