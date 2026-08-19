@@ -14,7 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import distributed_mean_var, set_deferred_normalization, synchronize_normalization
+from rsl_rl.modules import commit_normalization, distributed_mean_var
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -88,8 +88,6 @@ class PPO:
         # simply alias ``self.actor`` / ``self.critic``.
         self._raw_actor = self.actor
         self._raw_critic = self.critic
-        set_deferred_normalization((self.actor, self.critic, self.rnd))
-
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(
             chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
@@ -130,12 +128,11 @@ class PPO:
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        """Record one environment step and update the normalizers."""
-        # Update the normalizers
-        self.actor.update_normalization(obs)
-        self.critic.update_normalization(obs)
+        """Record one environment step and its normalization moments."""
+        self.actor.accumulate_normalization(obs)
+        self.critic.accumulate_normalization(obs)
         if self.rnd:
-            self.rnd.update_normalization(obs)
+            self.rnd.accumulate_normalization(obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
@@ -347,7 +344,7 @@ class PPO:
             losses /= self.gpu_world_size
             loss_dict = dict(zip(loss_dict, losses.tolist()))
 
-        synchronize_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
+        commit_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
 
         # Clear the storage
         self.storage.clear()
@@ -454,11 +451,11 @@ class PPO:
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
         # Establish one shared normalization frame before collecting the first rollout.
-        alg.actor.update_normalization(obs)
-        alg.critic.update_normalization(obs)
+        alg.actor.accumulate_normalization(obs)
+        alg.critic.accumulate_normalization(obs)
         if alg.rnd:
-            alg.rnd.update_normalization(obs)
-        synchronize_normalization((alg.actor, alg.critic, alg.rnd), alg.is_multi_gpu)
+            alg.rnd.accumulate_normalization(obs)
+        commit_normalization((alg.actor, alg.critic, alg.rnd), alg.is_multi_gpu)
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))

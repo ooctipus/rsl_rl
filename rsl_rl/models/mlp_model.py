@@ -176,6 +176,13 @@ class MLPModel(nn.Module):
             # Update the normalizer parameters
             self.obs_normalizer.update(mlp_obs)  # type: ignore
 
+    def accumulate_normalization(self, obs: TensorDict) -> None:
+        """Accumulate observation statistics without changing the active normalization frame."""
+        if self.obs_normalization:
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups]
+            mlp_obs = torch.cat(obs_list, dim=-1)
+            self.obs_normalizer.accumulate(mlp_obs)  # type: ignore
+
     def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
         """Select active observation groups and compute observation dimension."""
         active_obs_groups = obs_groups[obs_set]

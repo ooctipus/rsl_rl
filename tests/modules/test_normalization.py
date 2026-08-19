@@ -12,20 +12,18 @@ from pathlib import Path
 from rsl_rl.modules.normalization import (
     EmpiricalDiscountedVariationNormalization,
     EmpiricalNormalization,
+    commit_normalization,
     distributed_mean_var,
-    set_deferred_normalization,
-    synchronize_normalization,
 )
 
 
-def _synchronize_normalization_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
+def _commit_normalization_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
     torch.distributed.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     norm = EmpiricalNormalization(shape=2)
     module = torch.nn.Sequential(norm)
-    set_deferred_normalization((module,))
     data = torch.tensor([[1.0, 2.0], [3.0, 4.0]]) if rank == 0 else torch.tensor([[7.0, 10.0]])
-    norm.update(data)
-    synchronize_normalization((module,), distributed=True)
+    norm.accumulate(data)
+    commit_normalization((module,), distributed=True)
     torch.save((norm.mean, norm.std, norm.count), Path(output_dir) / f"rank_{rank}.pt")
     torch.distributed.destroy_process_group()
 
@@ -114,20 +112,19 @@ class TestEmpiricalNormalization:
         assert not torch.any(torch.isnan(norm._mean))
         assert not torch.any(torch.isnan(norm._std))
 
-    def test_deferred_updates_commit_once(self) -> None:
-        """Deferred batches should leave live statistics frozen until synchronization."""
+    def test_accumulated_updates_commit_once(self) -> None:
+        """Accumulated batches should leave live statistics frozen until committed."""
         norm = EmpiricalNormalization(shape=2)
         module = torch.nn.Sequential(norm)
-        set_deferred_normalization((module,))
         first = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         second = torch.tensor([[5.0, 8.0]])
 
-        norm.update(first)
-        norm.update(second)
+        norm.accumulate(first)
+        norm.accumulate(second)
 
         torch.testing.assert_close(norm.mean, torch.zeros(2))
         assert norm.count == 0
-        synchronize_normalization((module,))
+        commit_normalization((module,))
         expected = torch.cat((first, second))
         torch.testing.assert_close(norm.mean, expected.mean(0))
         torch.testing.assert_close(norm.std, expected.std(0, unbiased=False))
@@ -137,10 +134,13 @@ class TestEmpiricalNormalization:
     def test_pending_moments_are_not_checkpointed(self) -> None:
         """A checkpoint should contain committed statistics only."""
         norm = EmpiricalNormalization(shape=2)
-        norm.set_deferred_updates()
-        norm.update(torch.ones(3, 2))
+        norm.accumulate(torch.ones(3, 2))
 
         assert not any("pending" in key for key in norm.state_dict())
+
+    def test_accumulation_is_explicit(self) -> None:
+        """Normalizers should not carry a hidden deferred-update mode."""
+        assert not hasattr(EmpiricalNormalization(shape=2), "set_deferred_updates")
 
 
 def test_distributed_mean_var_matches_torch_locally() -> None:
@@ -156,7 +156,7 @@ def test_distributed_mean_var_matches_torch_locally() -> None:
 def test_deferred_normalization_merges_all_workers(tmp_path: Path) -> None:
     """Every worker should commit identical moments from unequal local batches."""
     init_file = tmp_path / "process_group"
-    mp.spawn(_synchronize_normalization_worker, args=(2, str(init_file), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_commit_normalization_worker, args=(2, str(init_file), str(tmp_path)), nprocs=2, join=True)
     expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [7.0, 10.0]])
 
     for rank in range(2):

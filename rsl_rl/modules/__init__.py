@@ -11,9 +11,8 @@ from .mlp import MLP
 from .normalization import (
     EmpiricalDiscountedVariationNormalization,
     EmpiricalNormalization,
+    commit_normalization,
     distributed_mean_var,
-    set_deferred_normalization,
-    synchronize_normalization,
 )
 from .rnn import RNN, HiddenState
 
@@ -28,7 +27,6 @@ __all__ = [
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "commit_normalization",
     "distributed_mean_var",
-    "set_deferred_normalization",
-    "synchronize_normalization",
 ]

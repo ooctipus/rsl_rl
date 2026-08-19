@@ -35,7 +35,6 @@ class EmpiricalNormalization(nn.Module):
         self.register_buffer("_pending_mean", torch.zeros(shape).unsqueeze(0), persistent=False)
         self.register_buffer("_pending_m2", torch.zeros(shape).unsqueeze(0), persistent=False)
         self.register_buffer("_pending_count", torch.tensor(0, dtype=torch.long), persistent=False)
-        self._defer_updates = False
 
     @property
     def mean(self) -> torch.Tensor:
@@ -56,22 +55,26 @@ class EmpiricalNormalization(nn.Module):
         """Learn input values without computing the output values of them."""
         if not self.training:
             return
-        observed = self.count + self._pending_count if self._defer_updates else self.count
-        if self.until is not None and observed >= self.until:
+        if self.until is not None and self.count >= self.until:
             return
 
         count_x = x.shape[0]
         mean_x = torch.mean(x, dim=0, keepdim=True)
         m2_x = torch.var(x, dim=0, unbiased=False, keepdim=True) * count_x
-        if self._defer_updates:
-            self._merge_pending(mean_x, m2_x, count_x)
-        else:
-            self._merge_running(mean_x, m2_x, count_x)
+        self._merge_running(mean_x, m2_x, count_x)
 
     @torch.jit.unused
-    def set_deferred_updates(self, enabled: bool = True) -> None:
-        """Defer updates until the owning learner synchronizes a rollout."""
-        self._defer_updates = enabled
+    def accumulate(self, x: torch.Tensor) -> None:
+        """Accumulate input moments without changing the active normalization frame."""
+        if not self.training:
+            return
+        if self.until is not None and self.count + self._pending_count >= self.until:
+            return
+
+        count_x = x.shape[0]
+        mean_x = torch.mean(x, dim=0, keepdim=True)
+        m2_x = torch.var(x, dim=0, unbiased=False, keepdim=True) * count_x
+        self._merge_pending(mean_x, m2_x, count_x)
 
     def _merge_pending(self, mean: torch.Tensor, m2: torch.Tensor, count: int | torch.Tensor) -> None:
         count_t = torch.as_tensor(count, device=self.count.device, dtype=self.count.dtype)
@@ -109,18 +112,9 @@ class EmpiricalNormalization(nn.Module):
         return y * (self._std + self.eps) + self._mean
 
 
-def set_deferred_normalization(modules: tuple[nn.Module | None, ...]) -> None:
-    """Make normalization statistics update only at learner synchronization boundaries."""
-    for module in modules:
-        if module is not None:
-            for child in module.modules():
-                if isinstance(child, EmpiricalNormalization):
-                    child.set_deferred_updates()
-
-
 @torch.no_grad()
-def synchronize_normalization(modules: tuple[nn.Module | None, ...], distributed: bool = False) -> None:
-    """Merge every deferred normalizer using one collective."""
+def commit_normalization(modules: tuple[nn.Module | None, ...], distributed: bool = False) -> None:
+    """Commit accumulated moments from every normalizer using one collective."""
     normalizers: list[EmpiricalNormalization] = []
     seen: set[int] = set()
     for module in modules:
@@ -219,6 +213,19 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             # Update moments from discounted rewards
             self.emp_norm.update(avg)
 
+        return self._normalize(rew)
+
+    @torch.jit.unused
+    def accumulate(self, rew: torch.Tensor) -> torch.Tensor:
+        """Normalize rewards while accumulating moments for a later commit."""
+        if self.training:
+            avg = self.disc_avg.update(rew)
+            self.emp_norm.accumulate(avg)
+
+        return self._normalize(rew)
+
+    def _normalize(self, rew: torch.Tensor) -> torch.Tensor:
+        """Normalize rewards using the active empirical standard deviation."""
         # Normalize rewards with the empirical std
         if self.emp_norm._std > 0:  # type: ignore
             return rew / self.emp_norm._std  # type: ignore

@@ -12,7 +12,7 @@ from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import set_deferred_normalization, synchronize_normalization
+from rsl_rl.modules import commit_normalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -66,8 +66,6 @@ class Distillation:
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
-        set_deferred_normalization((self.student,))
-
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore
 
@@ -106,9 +104,8 @@ class Distillation:
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        """Record one environment step and update the normalizers."""
-        # Update the normalizers
-        self.student.update_normalization(obs)
+        """Record one environment step and its normalization moments."""
+        self.student.accumulate_normalization(obs)
         # Record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
@@ -166,7 +163,7 @@ class Distillation:
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
-        synchronize_normalization((self.student,), self.is_multi_gpu)
+        commit_normalization((self.student,), self.is_multi_gpu)
 
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
@@ -275,8 +272,8 @@ class Distillation:
             student, teacher, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"]
         )
 
-        alg.student.update_normalization(obs)
-        synchronize_normalization((alg.student,), alg.is_multi_gpu)
+        alg.student.accumulate_normalization(obs)
+        commit_normalization((alg.student,), alg.is_multi_gpu)
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))

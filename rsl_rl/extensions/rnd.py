@@ -136,7 +136,10 @@ class RandomNetworkDistillation(nn.Module):
         # Compute the intrinsic reward as the distance between the embeddings
         intrinsic_reward = torch.linalg.norm(target_embedding - predictor_embedding, dim=1)
         # Normalize intrinsic reward
-        intrinsic_reward = self.reward_normalizer(intrinsic_reward)
+        if self.reward_normalization:
+            intrinsic_reward = self.reward_normalizer.accumulate(intrinsic_reward)  # type: ignore
+        else:
+            intrinsic_reward = self.reward_normalizer(intrinsic_reward)
         # Check the weight schedule
         if self.weight_scheduler is not None:
             self.weight = self.weight_scheduler(step=self.update_counter, **self.weight_scheduler_params)
@@ -187,6 +190,12 @@ class RandomNetworkDistillation(nn.Module):
         if self.state_normalization:
             rnd_state = self.get_rnd_state(obs)
             self.state_normalizer.update(rnd_state)  # type: ignore
+
+    def accumulate_normalization(self, obs: TensorDict) -> None:
+        """Accumulate state-normalization statistics for a later commit."""
+        if self.state_normalization:
+            rnd_state = self.get_rnd_state(obs)
+            self.state_normalizer.accumulate(rnd_state)  # type: ignore
 
     def _constant_weight_schedule(self, step: int, **kwargs: dict[str, Any]) -> float:
         """Keep the intrinsic reward weight constant."""
