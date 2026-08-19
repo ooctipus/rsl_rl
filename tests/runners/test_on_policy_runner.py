@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import copy
 import tempfile
+from unittest.mock import patch
+
 import torch
 from tensordict import TensorDict
 
+from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
@@ -158,6 +161,15 @@ class TestRunnerConstruction:
 
         assert runner.alg.actor.obs_normalizer.count == NUM_ENVS
         assert runner.alg.critic.obs_normalizer.count == NUM_ENVS
+
+    def test_runner_constructs_algorithm_on_learner_device(self) -> None:
+        """Move initial environment observations before constructing the learner."""
+        cfg = _make_train_cfg()
+        cfg["algorithm"]["rnd_cfg"] = None
+        with patch.object(PPO, "construct_algorithm", return_value=object()) as construct_algorithm:
+            OnPolicyRunner(DummyEnv(device="cpu"), cfg, log_dir=None, device="meta")
+
+        assert construct_algorithm.call_args.args[0].device == torch.device("meta")
 
 
 class TestLearnLoop:
