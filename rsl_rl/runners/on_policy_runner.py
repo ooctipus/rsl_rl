@@ -33,7 +33,7 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # Query observations from the environment for algorithm construction
-        obs = self.env.get_observations()
+        obs = self.env.get_observations().to(self.device)
 
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
