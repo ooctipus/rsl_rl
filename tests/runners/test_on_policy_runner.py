@@ -33,7 +33,6 @@ class DummyEnv(VecEnv):
         self.device = device
         self.cfg = {}
         self._include_image = include_image
-        self.synchronizations = 0
 
     def get_observations(self) -> TensorDict:  # noqa: D102
         data: dict = {"policy": torch.randn(self.num_envs, OBS_DIM, device=self.device)}
@@ -49,9 +48,6 @@ class DummyEnv(VecEnv):
         rewards = torch.randn(self.num_envs, device=self.device)
         extras = {"time_outs": torch.zeros(self.num_envs, device=self.device)}
         return obs, rewards, dones, extras
-
-    def synchronize_training_state(self) -> None:  # noqa: D102
-        self.synchronizations += 1
 
 
 def _make_train_cfg(model_type: str = "mlp") -> dict:
@@ -152,6 +148,17 @@ class TestRunnerConstruction:
         runner = _build_runner()
         assert runner.current_learning_iteration == 0
 
+    def test_runner_bootstraps_observation_normalization(self) -> None:
+        """Initialize one fixed normalization frame before the first rollout."""
+        cfg = _make_train_cfg()
+        cfg["actor"]["obs_normalization"] = True
+        cfg["critic"]["obs_normalization"] = True
+
+        runner = OnPolicyRunner(DummyEnv(), cfg, log_dir=None, device="cpu")
+
+        assert runner.alg.actor.obs_normalizer.count == NUM_ENVS
+        assert runner.alg.critic.obs_normalizer.count == NUM_ENVS
+
 
 class TestLearnLoop:
     """Tests that the learn loop runs and updates parameters."""
@@ -174,14 +181,6 @@ class TestLearnLoop:
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
-
-    def test_learn_synchronizes_environment_once_per_rollout(self) -> None:
-        """Environment training state should synchronize once per learning iteration."""
-        runner = _build_runner()
-
-        runner.learn(num_learning_iterations=3)
-
-        assert runner.env.synchronizations == 3
 
 
 class TestSaveLoad:

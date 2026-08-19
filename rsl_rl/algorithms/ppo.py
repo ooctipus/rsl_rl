@@ -185,7 +185,6 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.advantages = st.returns - st.values
-        synchronize_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             mean, var = distributed_mean_var(st.advantages, self.is_multi_gpu, unbiased=True)
@@ -348,6 +347,8 @@ class PPO:
             losses /= self.gpu_world_size
             loss_dict = dict(zip(loss_dict, losses.tolist()))
 
+        synchronize_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
+
         # Clear the storage
         self.storage.clear()
 
@@ -451,6 +452,13 @@ class PPO:
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+
+        # Establish one shared normalization frame before collecting the first rollout.
+        alg.actor.update_normalization(obs)
+        alg.critic.update_normalization(obs)
+        if alg.rnd:
+            alg.rnd.update_normalization(obs)
+        synchronize_normalization((alg.actor, alg.critic, alg.rnd), alg.is_multi_gpu)
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))

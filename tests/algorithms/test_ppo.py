@@ -197,6 +197,44 @@ class TestGAEComputation:
         assert abs(adv.std().item() - 1.0) < 0.1, "Advantages should be unit-std"
 
 
+class TestObservationNormalization:
+    """Tests for the rollout normalization transaction."""
+
+    def test_pending_statistics_commit_after_optimization(self) -> None:
+        """Keep the normalization frame fixed while a collected rollout is optimized."""
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+        actor = _make_actor(obs, obs_groups, NUM_ACTIONS, obs_normalization=True)
+        critic = _make_critic(obs, obs_groups, obs_normalization=True)
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        ppo = PPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1, schedule="fixed")
+
+        observations = []
+        for step in range(NUM_STEPS):
+            step_obs = TensorDict({"policy": torch.randn(NUM_ENVS, OBS_DIM) + float(step + 1)}, batch_size=[NUM_ENVS])
+            observations.append(step_obs["policy"])
+            ppo.act(step_obs)
+            ppo.process_env_step(step_obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+
+        ppo.compute_returns(step_obs)
+
+        assert ppo.actor.obs_normalizer.count == 0
+        torch.testing.assert_close(ppo.actor.obs_normalizer.mean, torch.zeros(OBS_DIM))
+
+        update_counts = []
+        handle = ppo.actor.obs_normalizer.register_forward_pre_hook(
+            lambda normalizer, inputs: update_counts.append(int(normalizer.count))
+        )
+        ppo.update()
+        handle.remove()
+
+        expected = torch.cat(observations)
+        assert update_counts and not any(update_counts)
+        assert ppo.actor.obs_normalizer.count == expected.shape[0]
+        torch.testing.assert_close(ppo.actor.obs_normalizer.mean, expected.mean(dim=0))
+        torch.testing.assert_close(ppo.critic.obs_normalizer.mean, expected.mean(dim=0))
+
+
 class TestTimeoutBootstrapping:
     """Tests for timeout bootstrapping in ``process_env_step``."""
 

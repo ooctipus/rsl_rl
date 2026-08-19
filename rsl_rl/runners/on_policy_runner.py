@@ -113,7 +113,6 @@ class OnPolicyRunner:
                 collect_time = stop - start
                 start = stop
 
-                self.env.synchronize_training_state()
                 # Compute returns
                 self.alg.compute_returns(obs)
 

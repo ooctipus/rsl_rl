@@ -119,8 +119,8 @@ class Distillation:
         self.teacher.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """Synchronize student normalization after a rollout."""
-        synchronize_normalization((self.student,), self.is_multi_gpu)
+        """No-op since distillation does not use return targets."""
+        pass
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -166,6 +166,7 @@ class Distillation:
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
+        synchronize_normalization((self.student,), self.is_multi_gpu)
 
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
@@ -273,6 +274,9 @@ class Distillation:
         alg: Distillation = alg_class(
             student, teacher, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"]
         )
+
+        alg.student.update_normalization(obs)
+        synchronize_normalization((alg.student,), alg.is_multi_gpu)
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
