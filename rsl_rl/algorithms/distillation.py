@@ -12,6 +12,7 @@ from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import set_deferred_normalization, synchronize_normalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -65,6 +66,7 @@ class Distillation:
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
+        set_deferred_normalization((self.student,))
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore
@@ -117,9 +119,8 @@ class Distillation:
         self.teacher.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """No-op since distillation does not use return targets."""
-        # Not needed for distillation
-        pass
+        """Synchronize student normalization after a rollout."""
+        synchronize_normalization((self.student,), self.is_multi_gpu)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -168,6 +169,10 @@ class Distillation:
 
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
+        if self.is_multi_gpu:
+            behavior_loss = torch.tensor(mean_behavior_loss, device=self.device)
+            torch.distributed.all_reduce(behavior_loss)
+            loss_dict["behavior"] = behavior_loss.item() / self.gpu_world_size
 
         return loss_dict
 

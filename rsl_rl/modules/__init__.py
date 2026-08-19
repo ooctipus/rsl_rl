@@ -8,7 +8,13 @@
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    distributed_mean_var,
+    set_deferred_normalization,
+    synchronize_normalization,
+)
 from .rnn import RNN, HiddenState
 
 __all__ = [
@@ -22,4 +28,7 @@ __all__ = [
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "distributed_mean_var",
+    "set_deferred_normalization",
+    "synchronize_normalization",
 ]

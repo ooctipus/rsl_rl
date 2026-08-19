@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import distributed_mean_var, set_deferred_normalization, synchronize_normalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -87,6 +88,7 @@ class PPO:
         # simply alias ``self.actor`` / ``self.critic``.
         self._raw_actor = self.actor
         self._raw_critic = self.critic
+        set_deferred_normalization((self.actor, self.critic, self.rnd))
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(
@@ -183,9 +185,11 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.advantages = st.returns - st.values
+        synchronize_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            mean, var = distributed_mean_var(st.advantages, self.is_multi_gpu, unbiased=True)
+            st.advantages = (st.advantages - mean) / (torch.sqrt(var) + 1e-8)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -210,7 +214,8 @@ class PPO:
             # Check if we should normalize advantages per mini-batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+                    mean, var = distributed_mean_var(batch.advantages, self.is_multi_gpu, unbiased=True)
+                    batch.advantages = (batch.advantages - mean) / (torch.sqrt(var) + 1e-8)  # type: ignore
 
             # Perform symmetric augmentation if enabled
             if self.symmetry:
@@ -337,6 +342,11 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.is_multi_gpu:
+            losses = torch.tensor(list(loss_dict.values()), device=self.device)
+            torch.distributed.all_reduce(losses)
+            losses /= self.gpu_world_size
+            loss_dict = dict(zip(loss_dict, losses.tolist()))
 
         # Clear the storage
         self.storage.clear()

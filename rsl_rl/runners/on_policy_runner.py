@@ -37,7 +37,19 @@ class OnPolicyRunner:
 
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+        seed = self.cfg.get("seed")
+        if seed is None:
+            self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+        else:
+            device = torch.device(self.device)
+            cuda_devices = []
+            if device.type == "cuda":
+                cuda_devices.append(device.index if device.index is not None else torch.cuda.current_device())
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.random.default_generator.manual_seed(int(seed))
+                if cuda_devices:
+                    torch.cuda.manual_seed(int(seed))
+                self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger
         self.logger = Logger(
@@ -101,6 +113,7 @@ class OnPolicyRunner:
                 collect_time = stop - start
                 start = stop
 
+                self.env.synchronize_training_state()
                 # Compute returns
                 self.alg.compute_returns(obs)
 

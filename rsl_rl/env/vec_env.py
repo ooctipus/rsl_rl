@@ -50,6 +50,10 @@ class VecEnv(ABC):
         """
         raise NotImplementedError
 
+    def synchronize_training_state(self) -> None:
+        """Synchronize environment-owned training state after a rollout."""
+        pass
+
     @abstractmethod
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         """Apply input action to the environment.

@@ -33,6 +33,7 @@ class DummyEnv(VecEnv):
         self.device = device
         self.cfg = {}
         self._include_image = include_image
+        self.synchronizations = 0
 
     def get_observations(self) -> TensorDict:  # noqa: D102
         data: dict = {"policy": torch.randn(self.num_envs, OBS_DIM, device=self.device)}
@@ -48,6 +49,9 @@ class DummyEnv(VecEnv):
         rewards = torch.randn(self.num_envs, device=self.device)
         extras = {"time_outs": torch.zeros(self.num_envs, device=self.device)}
         return obs, rewards, dones, extras
+
+    def synchronize_training_state(self) -> None:  # noqa: D102
+        self.synchronizations += 1
 
 
 def _make_train_cfg(model_type: str = "mlp") -> dict:
@@ -170,6 +174,14 @@ class TestLearnLoop:
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
+
+    def test_learn_synchronizes_environment_once_per_rollout(self) -> None:
+        """Environment training state should synchronize once per learning iteration."""
+        runner = _build_runner()
+
+        runner.learn(num_learning_iterations=3)
+
+        assert runner.env.synchronizations == 3
 
 
 class TestSaveLoad:
@@ -301,6 +313,20 @@ class TestDeterministicTraining:
         run_b = self._seeded_train(seed=99)
         any_different = any(not torch.equal(run_a[k], run_b[k]) for k in run_a)
         assert any_different, "Different seeds should produce different parameters"
+
+    def test_model_seed_is_independent_of_environment_rng_consumption(self) -> None:
+        """Model initialization should depend on the runner seed, not earlier environment draws."""
+        states = []
+        for ambient_seed, draws in ((7, 3), (91, 101)):
+            torch.manual_seed(ambient_seed)
+            torch.rand(draws)
+            cfg = _make_train_cfg()
+            cfg["seed"] = 42
+            runner = OnPolicyRunner(DummyEnv(), cfg, log_dir=None, device="cpu")
+            states.append({key: value.clone() for key, value in runner.alg.actor.state_dict().items()})
+
+        for key in states[0]:
+            assert torch.equal(states[0][key], states[1][key]), f"Actor state '{key}' depends on ambient RNG"
 
 
 class TestRNNRunner:
