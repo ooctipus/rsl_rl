@@ -224,6 +224,23 @@ class TestTimeoutBootstrapping:
         stored_reward_env1 = ppo.storage.rewards[0, 1, 0].item()
         assert abs(stored_reward_env1 - 1.0) < 1e-5
 
+    def test_environment_outcomes_are_resolved_before_the_transition_is_stored(self) -> None:
+        """Let the curriculum consume pre-reset endpoint data on every environment step."""
+        ppo, obs = _build_ppo()
+        ppo.act(obs)
+
+        class _CurriculumHook:
+            calls = 0
+
+            def update_success_targets(self) -> None:
+                self.calls += 1
+
+        hook = _CurriculumHook()
+        ppo.state_curriculum = hook  # type: ignore[assignment]
+        ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+
+        assert hook.calls == 1
+
 
 class TestNormalizationUpdates:
     """Tests for observation-normalization update timing."""

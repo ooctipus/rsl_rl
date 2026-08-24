@@ -27,10 +27,10 @@ class StateCurriculumProvider(Protocol):
     """Fixed reset-state features, or ``None`` when success estimation is disabled."""
 
     success_rate: torch.Tensor
-    """Empirical completed-episode success rate per state, shape ``[num_states]``."""
+    """Mean eventual-success target per state, shape ``[num_states]``."""
 
     success_size: torch.Tensor
-    """Number of completed outcomes represented by each success rate, shape ``[num_states]``."""
+    """Number of targets represented by each success rate, shape ``[num_states]``."""
 
     value_shift: torch.Tensor
     """Sampled-start critic drift written in place, shape ``[num_states]``.
@@ -42,6 +42,21 @@ class StateCurriculumProvider(Protocol):
 
     estimated_success_rate: torch.Tensor
     """Model-prior and empirical success estimate written in place, shape ``[num_states]``."""
+
+    outcome_state_ids: torch.Tensor
+    """Reset-bank rows awaiting targets, shape ``[num_envs]``; ``-1`` marks no outcome."""
+
+    outcome_next_features: torch.Tensor
+    """Physical endpoint features, shape ``[num_envs, feature_dim]``."""
+
+    outcome_hard_targets: torch.Tensor
+    """Ground-truth success targets for semantic terminations, shape ``[num_envs]``."""
+
+    outcome_grounded: torch.Tensor
+    """Whether each pending target comes from a semantic task termination, shape ``[num_envs]``."""
+
+    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor) -> None:
+        """Commit pending targets to their original reset rows."""
 
 
 class _SuccessEstimator(nn.Module):
@@ -149,6 +164,25 @@ class StateCurriculum:
         self._start_value[step].copy_(values.squeeze(-1))
 
     @torch.no_grad()
+    def update_success_targets(self) -> None:
+        """Bootstrap pure timeouts from their endpoint state and commit pending outcomes."""
+        if self._success_estimator is None:
+            return
+        assert self._provider is not None
+        env_ids = (self._provider.outcome_state_ids >= 0).nonzero().flatten()
+        if env_ids.numel() == 0:
+            return
+
+        targets = self._provider.outcome_hard_targets[env_ids].clone()
+        bootstrap = ~self._provider.outcome_grounded[env_ids]
+        bootstrap_env_ids = env_ids[bootstrap]
+        if bootstrap_env_ids.numel() > 0:
+            targets[bootstrap] = self._success_estimator(
+                self._provider.outcome_next_features[bootstrap_env_ids]
+            ).sigmoid()
+        self._provider.record_success_targets(env_ids, targets)
+
+    @torch.no_grad()
     def update_value_shift(self, critic: nn.Module) -> None:
         """Update priorities only from sampled episode starts seen by the current PPO update."""
         if not self._value_shift_enabled:
@@ -176,7 +210,7 @@ class StateCurriculum:
         self._start_state.fill_(-1)
 
     def update_success_estimator(self) -> float | None:
-        """Fit empirical completed-episode rates and refresh full-bank predictions."""
+        """Fit recorded success targets and refresh full-bank predictions."""
         if self._success_estimator is None:
             return None
         assert self._provider is not None and self._success_optimizer is not None
@@ -290,9 +324,9 @@ class StateCurriculum:
             stop = min(start + self._success_eval_batch_size, len(features))
             model_rate = self._success_estimator(features[start:stop]).sigmoid()
             count = self._provider.success_size[start:stop].to(dtype=model_rate.dtype)
-            empirical_rate = torch.where(count > 0, self._provider.success_rate[start:stop], 0.0)
+            observed_rate = torch.where(count > 0, self._provider.success_rate[start:stop], 0.0)
             estimates[start:stop].copy_(
-                (count * empirical_rate + self._success_prior_count * model_rate) / (count + self._success_prior_count)
+                (count * observed_rate + self._success_prior_count * model_rate) / (count + self._success_prior_count)
             )
 
     def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: torch.Tensor) -> None:
@@ -348,3 +382,33 @@ class StateCurriculum:
             raise ValueError(f"State-curriculum features are on {features.device}, expected {self.device}.")
         if provider.success_size.dtype != torch.long:
             raise ValueError("State-curriculum success_size must use torch.long counts.")
+
+        outcome_vectors = {
+            "outcome_state_ids": provider.outcome_state_ids,
+            "outcome_hard_targets": provider.outcome_hard_targets,
+            "outcome_grounded": provider.outcome_grounded,
+        }
+        for name, value in outcome_vectors.items():
+            if value.shape != (self._storage.num_envs,):
+                raise ValueError(
+                    f"State-curriculum {name} must have shape ({self._storage.num_envs},), got {tuple(value.shape)}."
+                )
+            if value.device != self.device:
+                raise ValueError(f"State-curriculum {name} is on {value.device}, expected {self.device}.")
+        if provider.outcome_state_ids.dtype != torch.long:
+            raise ValueError("State-curriculum outcome_state_ids must use torch.long indices.")
+        if not provider.outcome_hard_targets.is_floating_point():
+            raise ValueError("State-curriculum outcome_hard_targets must use a floating-point dtype.")
+        if provider.outcome_grounded.dtype != torch.bool:
+            raise ValueError("State-curriculum outcome_grounded must use torch.bool values.")
+        expected = (self._storage.num_envs, features.shape[1])
+        if provider.outcome_next_features.shape != expected:
+            raise ValueError(
+                f"State-curriculum outcome_next_features must have shape {expected}, "
+                f"got {tuple(provider.outcome_next_features.shape)}."
+            )
+        if (
+            provider.outcome_next_features.device != self.device
+            or not provider.outcome_next_features.is_floating_point()
+        ):
+            raise ValueError("State-curriculum outcome_next_features must be floating-point on the learner device.")

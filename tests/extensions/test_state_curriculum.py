@@ -30,6 +30,18 @@ class _Provider:
         self.success_size = torch.zeros(num_states, dtype=torch.long)
         self.value_shift = torch.zeros(num_states)
         self.estimated_success_rate = torch.empty(num_states)
+        feature_dim = features.shape[1] if features is not None else 0
+        self.outcome_state_ids = torch.full((num_envs,), -1, dtype=torch.long)
+        self.outcome_next_features = torch.empty((num_envs, feature_dim))
+        self.outcome_hard_targets = torch.zeros(num_envs)
+        self.outcome_grounded = torch.zeros(num_envs, dtype=torch.bool)
+        self.recorded_state_ids = torch.empty(0, dtype=torch.long)
+        self.recorded_targets = torch.empty(0)
+
+    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor) -> None:
+        self.recorded_state_ids = self.outcome_state_ids[env_ids].clone()
+        self.recorded_targets = targets.clone()
+        self.outcome_state_ids[env_ids] = -1
 
 
 class _Critic(nn.Module):
@@ -165,8 +177,8 @@ def test_success_estimator_learns_empirical_rates_and_restores_checkpoint() -> N
     torch.testing.assert_close(restored_provider.estimated_success_rate, provider.estimated_success_rate)
 
 
-def test_success_estimate_blends_one_model_prior_outcome_with_empirical_history() -> None:
-    """Use the model for unseen rows and let exact completed outcomes dominate as evidence grows."""
+def test_success_estimate_blends_model_prior_with_recorded_targets() -> None:
+    """Use the model for unseen rows and let recorded targets dominate as evidence grows."""
     provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=1)
     curriculum = StateCurriculum(
         _make_storage(num_envs=1, num_steps=1),
@@ -181,6 +193,28 @@ def test_success_estimate_blends_one_model_prior_outcome_with_empirical_history(
     provider.success_size.copy_(torch.tensor([1, 50]))
     curriculum.load(copy.deepcopy(curriculum.save()))
     torch.testing.assert_close(provider.estimated_success_rate, torch.tensor([0.25, 50.5 / 51.0]))
+
+
+def test_success_targets_mix_ground_truth_with_detached_timeout_estimates() -> None:
+    """Keep semantic outcomes exact and bootstrap only pure fixed-horizon timeouts."""
+    provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=4)
+    provider.outcome_state_ids.copy_(torch.tensor([1, 0, 1, -1]))
+    provider.outcome_next_features.copy_(torch.tensor([[-2.0], [-1.0], [2.0], [0.0]]))
+    provider.outcome_hard_targets.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    provider.outcome_grounded.copy_(torch.tensor([True, True, False, False]))
+    curriculum = StateCurriculum(
+        _make_storage(num_envs=4, num_steps=1),
+        "cpu",
+        distributed=False,
+        success_estimator_cfg={"hidden_dims": [4]},
+    )
+    curriculum.bind(provider, torch.zeros(4, dtype=torch.long), _Critic(1.0))
+
+    curriculum.update_success_targets()
+
+    torch.testing.assert_close(provider.recorded_state_ids, torch.tensor([1, 0, 1]))
+    torch.testing.assert_close(provider.recorded_targets, torch.tensor([1.0, 0.0, 0.5]))
+    torch.testing.assert_close(provider.outcome_state_ids, torch.full((4,), -1, dtype=torch.long))
 
 
 def test_distributed_estimator_parameters_and_normalization_match(tmp_path: Path) -> None:
