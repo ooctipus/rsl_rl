@@ -9,6 +9,10 @@ from __future__ import annotations
 import torch
 from abc import ABC, abstractmethod
 from tensordict import TensorDict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rsl_rl.extensions import StateCurriculumProvider
 
 
 class VecEnv(ABC):
@@ -49,6 +53,14 @@ class VecEnv(ABC):
             The observations from the environment.
         """
         raise NotImplementedError
+
+    def get_state_curriculum(self) -> StateCurriculumProvider | None:
+        """Return reset-bank state used by optional learner curricula.
+
+        Environments only need to implement this method when PPO's
+        ``state_curriculum_cfg`` is enabled.
+        """
+        return None
 
     @abstractmethod
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:

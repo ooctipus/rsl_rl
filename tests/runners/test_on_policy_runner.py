@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import copy
 import tempfile
-from unittest.mock import patch
-
 import torch
 from tensordict import TensorDict
+from unittest.mock import patch
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
@@ -146,6 +145,10 @@ class TestRunnerConstruction:
         assert runner.alg.actor is not None
         assert runner.alg.critic is not None
 
+    def test_environment_state_curriculum_is_optional(self) -> None:
+        """Base environments should not need to implement the optional curriculum provider."""
+        assert DummyEnv().get_state_curriculum() is None
+
     def test_runner_sets_initial_iteration(self) -> None:
         """Initial learning iteration should be zero."""
         runner = _build_runner()
@@ -167,6 +170,15 @@ class TestLearnLoop:
         """A short learn call should complete without raising."""
         runner = _build_runner()
         runner.learn(num_learning_iterations=2)
+
+    def test_random_initial_episode_lengths_preserve_the_environment_buffer(self) -> None:
+        """Extensions holding the episode-length tensor should keep a live reference."""
+        runner = _build_runner()
+        data_ptr = runner.env.episode_length_buf.data_ptr()
+
+        runner.learn(num_learning_iterations=1, init_at_random_ep_len=True)
+
+        assert runner.env.episode_length_buf.data_ptr() == data_ptr
 
     def test_learn_updates_parameters(self) -> None:
         """Actor parameters should change after a learning iteration."""
