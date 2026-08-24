@@ -153,7 +153,7 @@ class PPO:
     ) -> None:
         """Record one environment step."""
         if self.state_curriculum is not None:
-            self.state_curriculum.update_success_targets()
+            self.state_curriculum.collect_success_outcomes()
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()

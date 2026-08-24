@@ -26,24 +26,15 @@ class _Provider:
         assert num_states is not None
         self.sampled_state = torch.zeros(num_envs, dtype=torch.long)
         self.state_features = features
-        self.success_rate = torch.zeros(num_states)
-        self.success_size = torch.zeros(num_states, dtype=torch.long)
         self.value_shift = torch.zeros(num_states)
-        self.estimated_success_rate = torch.empty(num_states)
+        self.estimated_success_rate = torch.empty(num_states) if features is not None else None
+        self.mean_success_target = torch.zeros(())
+        self.success_target_grounded_fraction = torch.zeros(())
         feature_dim = features.shape[1] if features is not None else 0
         self.outcome_state_ids = torch.full((num_envs,), -1, dtype=torch.long)
-        self.outcome_next_features = torch.empty((num_envs, feature_dim))
+        self.outcome_next_features = torch.zeros((num_envs, feature_dim))
         self.outcome_hard_targets = torch.zeros(num_envs)
         self.outcome_grounded = torch.zeros(num_envs, dtype=torch.bool)
-        self.recorded_state_ids = torch.empty(0, dtype=torch.long)
-        self.recorded_targets = torch.empty(0)
-        self.recorded_valid = torch.empty(0, dtype=torch.bool)
-
-    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) -> None:
-        self.recorded_state_ids = self.outcome_state_ids[env_ids].clone()
-        self.recorded_targets = targets.clone()
-        self.recorded_valid = valid.clone()
-        self.outcome_state_ids[env_ids] = -1
 
 
 class _Critic(nn.Module):
@@ -65,13 +56,18 @@ def _make_storage(num_envs: int = 2, num_steps: int = 2) -> RolloutStorage:
 def _distributed_estimator_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
     torch.distributed.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     torch.manual_seed(7)
-    features = torch.tensor([[-2.0], [-1.0]]) if rank == 0 else torch.tensor([[1.0], [2.0]])
-    provider = _Provider(features, num_envs=1)
-    provider.success_rate.copy_(torch.tensor([0.0, 0.25]) if rank == 0 else torch.tensor([0.75, 1.0]))
+    features = torch.tensor([[-3.0], [-2.0], [-1.0], [1.0], [2.0], [3.0]])[2 * rank : 2 * rank + 2]
+    provider = _Provider(features, num_envs=3)
     if rank == 0:
-        provider.success_size.fill_(8)
+        provider.outcome_state_ids.copy_(torch.tensor([0, 1, 0]))
+        provider.outcome_hard_targets.fill_(1.0)
+        provider.outcome_grounded.fill_(True)
+    elif rank == 1:
+        provider.outcome_state_ids[0] = 0
+        provider.outcome_hard_targets[0] = 0.0
+        provider.outcome_grounded[0] = True
     curriculum = StateCurriculum(
-        _make_storage(num_envs=1, num_steps=1),
+        _make_storage(num_envs=3, num_steps=1),
         "cpu",
         distributed=True,
         success_estimator_cfg={
@@ -82,11 +78,20 @@ def _distributed_estimator_worker(rank: int, world_size: int, init_file: str, ou
             "evaluation_batch_size": 2,
         },
     )
-    curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
+    curriculum.bind(provider, torch.zeros(3, dtype=torch.long), _Critic(1.0))
+    curriculum.collect_success_outcomes()
     loss = curriculum.update_success_estimator()
     assert loss is not None
     state = curriculum.save()["success_estimator_state_dict"]
-    torch.save({"state": state, "loss": torch.tensor(loss)}, Path(output_dir) / f"rank_{rank}.pt")
+    torch.save(
+        {
+            "state": state,
+            "loss": torch.tensor(loss),
+            "mean_success_target": provider.mean_success_target,
+            "grounded_fraction": provider.success_target_grounded_fraction,
+        },
+        Path(output_dir) / f"rank_{rank}.pt",
+    )
     torch.distributed.destroy_process_group()
 
 
@@ -128,11 +133,11 @@ def test_enabled_curriculum_requires_an_environment_provider() -> None:
         curriculum.bind(None, torch.zeros(2, dtype=torch.long), _Critic(1.0))
 
 
-def test_success_estimator_learns_empirical_rates_and_restores_checkpoint() -> None:
-    """Train from full-episode bank statistics and restore model, optimizer, and normalization state."""
+def test_success_estimator_learns_rollout_outcomes_and_restores_checkpoint() -> None:
+    """Train directly from rollout outcomes and restore model, optimizer, and normalization state."""
     torch.manual_seed(3)
     features = torch.tensor([[-2.0], [-1.0], [1.0], [2.0]])
-    provider = _Provider(features, num_envs=1)
+    provider = _Provider(features, num_envs=4)
     cfg = {
         "hidden_dims": [16],
         "learning_rate": 2.0e-2,
@@ -141,37 +146,45 @@ def test_success_estimator_learns_empirical_rates_and_restores_checkpoint() -> N
         "evaluation_batch_size": 2,
     }
     curriculum = StateCurriculum(
-        _make_storage(num_envs=1, num_steps=1),
+        _make_storage(num_envs=4, num_steps=1),
         "cpu",
         distributed=False,
         success_estimator_cfg=cfg,
     )
     prediction_storage = provider.estimated_success_rate.data_ptr()
-    curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
+    curriculum.bind(provider, torch.zeros(4, dtype=torch.long), _Critic(1.0))
 
     torch.testing.assert_close(provider.estimated_success_rate, torch.full((4,), 0.5))
-    provider.success_rate.copy_(torch.tensor([0.0, 0.0, 1.0, 1.0]))
-    provider.success_size.fill_(20)
+    provider.outcome_state_ids.copy_(torch.arange(4))
+    provider.outcome_hard_targets.copy_(torch.tensor([0.0, 0.0, 1.0, 1.0]))
+    provider.outcome_grounded.fill_(True)
+    curriculum.collect_success_outcomes()
     assert curriculum.update_success_estimator() is not None
     assert provider.estimated_success_rate[:2].max() < provider.estimated_success_rate[2:].min()
     assert provider.estimated_success_rate.data_ptr() == prediction_storage
+    assert curriculum._success_state_ids is not None
+    torch.testing.assert_close(curriculum._success_state_ids, torch.full((1, 4), -1, dtype=torch.long))
 
     checkpoint = copy.deepcopy(curriculum.save())
-    restored_provider = _Provider(features.clone(), num_envs=1)
+    restored_provider = _Provider(features.clone(), num_envs=4)
     restored = StateCurriculum(
-        _make_storage(num_envs=1, num_steps=1),
+        _make_storage(num_envs=4, num_steps=1),
         "cpu",
         distributed=False,
         success_estimator_cfg=cfg,
     )
-    restored.bind(restored_provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
+    restored.bind(restored_provider, torch.zeros(4, dtype=torch.long), _Critic(1.0))
     restored.load({})
     torch.testing.assert_close(restored_provider.estimated_success_rate, torch.full((4,), 0.5))
 
-    restored_provider.success_rate.copy_(provider.success_rate)
-    restored_provider.success_size.copy_(provider.success_size)
     restored.load(checkpoint)
     torch.testing.assert_close(restored_provider.estimated_success_rate, provider.estimated_success_rate)
+    for outcome_provider in (provider, restored_provider):
+        outcome_provider.outcome_state_ids.copy_(torch.arange(4))
+        outcome_provider.outcome_hard_targets.copy_(torch.tensor([0.0, 0.0, 1.0, 1.0]))
+        outcome_provider.outcome_grounded.fill_(True)
+    curriculum.collect_success_outcomes()
+    restored.collect_success_outcomes()
     torch.manual_seed(11)
     curriculum.update_success_estimator()
     torch.manual_seed(11)
@@ -179,25 +192,29 @@ def test_success_estimator_learns_empirical_rates_and_restores_checkpoint() -> N
     torch.testing.assert_close(restored_provider.estimated_success_rate, provider.estimated_success_rate)
 
 
-def test_success_estimate_blends_model_prior_with_recorded_targets() -> None:
-    """Use the model for unseen rows and let recorded targets dominate as evidence grows."""
+def test_success_estimate_is_the_raw_model_prediction() -> None:
+    """Write model probabilities directly without blending per-row outcome history."""
     provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=1)
     curriculum = StateCurriculum(
         _make_storage(num_envs=1, num_steps=1),
         "cpu",
         distributed=False,
-        success_estimator_cfg={"hidden_dims": [4], "prior_count": 1.0},
+        success_estimator_cfg={"hidden_dims": [4]},
     )
     curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
     torch.testing.assert_close(provider.estimated_success_rate, torch.full((2,), 0.5))
 
-    provider.success_rate.copy_(torch.tensor([0.0, 1.0]))
-    provider.success_size.copy_(torch.tensor([1, 50]))
+    estimator = curriculum._success_estimator
+    assert estimator is not None
+    output = next(module for module in reversed(estimator.mlp) if isinstance(module, nn.Linear))
+    with torch.no_grad():
+        output.weight.zero_()
+        output.bias.fill_(torch.logit(torch.tensor(0.8)))
     curriculum.load(copy.deepcopy(curriculum.save()))
-    torch.testing.assert_close(provider.estimated_success_rate, torch.tensor([0.25, 50.5 / 51.0]))
+    torch.testing.assert_close(provider.estimated_success_rate, torch.full((2,), 0.8))
 
 
-def test_success_targets_mix_ground_truth_with_detached_timeout_estimates() -> None:
+def test_success_outcomes_mix_ground_truth_with_detached_timeout_estimates() -> None:
     """Keep semantic outcomes exact and bootstrap only pure fixed-horizon timeouts."""
     provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=4)
     provider.outcome_state_ids.copy_(torch.tensor([1, 0, 1, -1]))
@@ -212,67 +229,102 @@ def test_success_targets_mix_ground_truth_with_detached_timeout_estimates() -> N
     )
     curriculum.bind(provider, torch.zeros(4, dtype=torch.long), _Critic(1.0))
 
-    curriculum.update_success_targets()
+    class _EndpointEstimator(nn.Module):
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return features[:, 0]
 
-    torch.testing.assert_close(provider.recorded_state_ids, torch.tensor([1, 0, 1]))
-    torch.testing.assert_close(provider.recorded_targets, torch.tensor([1.0, 0.0, 0.5]))
-    torch.testing.assert_close(provider.recorded_valid, torch.ones(3, dtype=torch.bool))
+    curriculum._success_estimator = _EndpointEstimator()
+
+    curriculum.collect_success_outcomes()
+    curriculum.collect_success_outcomes()
+
+    assert curriculum._success_state_ids is not None
+    assert curriculum._success_targets is not None and curriculum._success_grounded is not None
+    torch.testing.assert_close(curriculum._success_state_ids[0], torch.tensor([1, 0, 1, -1]))
+    expected = torch.tensor([1.0, 0.0, torch.sigmoid(torch.tensor(2.0))])
+    torch.testing.assert_close(curriculum._success_targets[0, :3], expected)
+    torch.testing.assert_close(curriculum._success_grounded[0, :3], torch.tensor([True, True, False]))
+    assert not curriculum._success_targets.requires_grad
     torch.testing.assert_close(provider.outcome_state_ids, torch.full((4,), -1, dtype=torch.long))
 
 
-def test_success_targets_discard_non_finite_timeout_endpoints() -> None:
-    """Release a corrupt timeout without feeding it into the reset monitor."""
-    provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=1)
-    provider.outcome_state_ids[0] = 1
-    provider.outcome_next_features[0, 0] = torch.nan
+def test_success_outcomes_discard_invalid_targets_and_release_all_slots() -> None:
+    """Discard invalid outcomes, retain grounded results, and release every pending slot."""
+    provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=3)
+    provider.outcome_state_ids.copy_(torch.tensor([1, 0, 1]))
+    provider.outcome_next_features.fill_(torch.nan)
+    provider.outcome_hard_targets.copy_(torch.tensor([0.0, torch.nan, 1.0]))
+    provider.outcome_grounded.copy_(torch.tensor([False, True, True]))
     curriculum = StateCurriculum(
-        _make_storage(num_envs=1, num_steps=1),
+        _make_storage(num_envs=3, num_steps=1),
         "cpu",
         distributed=False,
         success_estimator_cfg={"hidden_dims": [4]},
     )
-    curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
+    curriculum.bind(provider, torch.zeros(3, dtype=torch.long), _Critic(1.0))
 
-    curriculum.update_success_targets()
+    curriculum.collect_success_outcomes()
 
-    torch.testing.assert_close(provider.recorded_valid, torch.tensor([False]))
-    torch.testing.assert_close(provider.outcome_state_ids, torch.tensor([-1]))
+    assert curriculum._success_state_ids is not None
+    torch.testing.assert_close(curriculum._success_state_ids[0], torch.tensor([-1, -1, 1]))
+    torch.testing.assert_close(provider.outcome_state_ids, torch.full((3,), -1, dtype=torch.long))
+    assert curriculum.update_success_estimator() is not None
+    assert provider.mean_success_target == 1.0
+    assert provider.success_target_grounded_fraction == 1.0
 
 
-def test_distributed_estimator_parameters_and_normalization_match(tmp_path: Path) -> None:
-    """Match a local reference when one distributed rank has no completed outcomes."""
-    init_file = tmp_path / "process_group"
-    mp.spawn(_distributed_estimator_worker, args=(2, str(init_file), str(tmp_path)), nprocs=2, join=True)
-    rank_0 = torch.load(tmp_path / "rank_0.pt", weights_only=True)
-    rank_1 = torch.load(tmp_path / "rank_1.pt", weights_only=True)
-
-    assert rank_0["state"].keys() == rank_1["state"].keys()
-    for name in rank_0["state"]:
-        torch.testing.assert_close(rank_0["state"][name], rank_1["state"][name])
-    torch.testing.assert_close(rank_0["loss"], rank_1["loss"])
-    torch.testing.assert_close(rank_0["state"]["normalizer._mean"], torch.zeros(1, 1))
-
-    torch.manual_seed(7)
-    reference_provider = _Provider(torch.tensor([[-2.0], [-1.0], [1.0], [2.0]]), num_envs=1)
-    reference_provider.success_rate.copy_(torch.tensor([0.0, 0.25, 0.75, 1.0]))
-    reference_provider.success_size.copy_(torch.tensor([8, 8, 0, 0]))
-    reference = StateCurriculum(
-        _make_storage(num_envs=1, num_steps=1),
+def test_success_metrics_are_episode_weighted_and_rollout_scoped() -> None:
+    """Count duplicate rows as episodes and forget their targets after each update."""
+    provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=2)
+    storage = _make_storage(num_envs=2, num_steps=2)
+    curriculum = StateCurriculum(
+        storage,
         "cpu",
         distributed=False,
-        success_estimator_cfg={
-            "hidden_dims": [8],
-            "learning_rate": 1.0e-2,
-            "num_batches": 2,
-            "batch_size": 8,
-            "evaluation_batch_size": 4,
-        },
+        success_estimator_cfg={"hidden_dims": [4], "num_batches": 1, "batch_size": 3},
     )
-    reference.bind(reference_provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
-    reference_loss = reference.update_success_estimator()
-    assert reference_loss is not None
-    reference_state = reference.save()["success_estimator_state_dict"]
+    curriculum.bind(provider, torch.zeros(2, dtype=torch.long), _Critic(1.0))
 
-    for name in rank_0["state"]:
-        torch.testing.assert_close(rank_0["state"][name], reference_state[name])
-    torch.testing.assert_close(rank_0["loss"], torch.tensor(reference_loss))
+    provider.outcome_state_ids.copy_(torch.tensor([0, 0]))
+    provider.outcome_hard_targets.fill_(1.0)
+    provider.outcome_grounded.copy_(torch.tensor([True, False]))
+    provider.outcome_next_features.zero_()
+    curriculum.collect_success_outcomes()
+    curriculum.collect_success_outcomes()
+    storage.step = 1
+    provider.outcome_state_ids.copy_(torch.tensor([1, -1]))
+    provider.outcome_hard_targets[0] = 0.0
+    provider.outcome_grounded[0] = True
+    curriculum.collect_success_outcomes()
+
+    assert curriculum.update_success_estimator() is not None
+    torch.testing.assert_close(provider.mean_success_target, torch.tensor(0.5))
+    torch.testing.assert_close(provider.success_target_grounded_fraction, torch.tensor(2.0 / 3.0))
+    assert curriculum.update_success_estimator() is None
+    assert provider.mean_success_target.isnan()
+    assert provider.success_target_grounded_fraction.isnan()
+
+    storage.step = 0
+    provider.outcome_state_ids.copy_(torch.tensor([1, -1]))
+    provider.outcome_hard_targets[0] = 0.0
+    curriculum.collect_success_outcomes()
+    assert curriculum.update_success_estimator() is not None
+    torch.testing.assert_close(provider.mean_success_target, torch.tensor(0.0))
+
+
+def test_distributed_estimator_reduces_uneven_outcome_counts(tmp_path: Path) -> None:
+    """Synchronize an empty rank and compute metrics from uneven global outcome totals."""
+    init_file = tmp_path / "process_group"
+    mp.spawn(_distributed_estimator_worker, args=(3, str(init_file), str(tmp_path)), nprocs=3, join=True)
+    ranks = [torch.load(tmp_path / f"rank_{rank}.pt", weights_only=True) for rank in range(3)]
+    rank_0 = ranks[0]
+
+    for rank in ranks[1:]:
+        assert rank_0["state"].keys() == rank["state"].keys()
+        for name in rank_0["state"]:
+            torch.testing.assert_close(rank_0["state"][name], rank["state"][name])
+        torch.testing.assert_close(rank_0["loss"], rank["loss"])
+    torch.testing.assert_close(rank_0["state"]["normalizer._mean"], torch.zeros(1, 1))
+    for rank in ranks:
+        torch.testing.assert_close(rank["mean_success_target"], torch.tensor(0.75))
+        torch.testing.assert_close(rank["grounded_fraction"], torch.tensor(1.0))

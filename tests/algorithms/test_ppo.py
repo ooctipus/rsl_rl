@@ -232,7 +232,7 @@ class TestTimeoutBootstrapping:
         class _CurriculumHook:
             calls = 0
 
-            def update_success_targets(self) -> None:
+            def collect_success_outcomes(self) -> None:
                 self.calls += 1
 
         hook = _CurriculumHook()

@@ -26,12 +26,6 @@ class StateCurriculumProvider(Protocol):
     state_features: torch.Tensor | None
     """Fixed reset-state features, or ``None`` when success estimation is disabled."""
 
-    success_rate: torch.Tensor
-    """Mean eventual-success target per state, shape ``[num_states]``."""
-
-    success_size: torch.Tensor
-    """Number of targets represented by each success rate, shape ``[num_states]``."""
-
     value_shift: torch.Tensor
     """Sampled-start critic drift written in place, shape ``[num_states]``.
 
@@ -40,8 +34,14 @@ class StateCurriculumProvider(Protocol):
     momentum instead of retaining stale priorities.
     """
 
-    estimated_success_rate: torch.Tensor
-    """Model-prior and empirical success estimate written in place, shape ``[num_states]``."""
+    estimated_success_rate: torch.Tensor | None
+    """Model success estimate, or ``None`` when success estimation is disabled."""
+
+    mean_success_target: torch.Tensor
+    """Current-rollout mean success target written in place, scalar."""
+
+    success_target_grounded_fraction: torch.Tensor
+    """Current-rollout fraction of success targets grounded by termination, scalar."""
 
     outcome_state_ids: torch.Tensor
     """Reset-bank rows awaiting targets, shape ``[num_envs]``; ``-1`` marks no outcome."""
@@ -54,9 +54,6 @@ class StateCurriculumProvider(Protocol):
 
     outcome_grounded: torch.Tensor
     """Whether each pending target comes from a semantic task termination, shape ``[num_envs]``."""
-
-    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) -> None:
-        """Commit valid targets and release all pending outcome slots."""
 
 
 class _SuccessEstimator(nn.Module):
@@ -125,7 +122,20 @@ class StateCurriculum:
         self._success_batch_size = 0
         self._success_eval_batch_size = 0
         self._success_max_grad_norm = 0.0
-        self._success_prior_count = 0.0
+        outcome_shape = (storage.num_transitions_per_env, storage.num_envs)
+        self._success_state_ids = (
+            torch.full(outcome_shape, -1, dtype=torch.long, device=self.device)
+            if success_estimator_cfg is not None
+            else None
+        )
+        self._success_targets = (
+            torch.zeros(outcome_shape, device=self.device) if success_estimator_cfg is not None else None
+        )
+        self._success_grounded = (
+            torch.zeros(outcome_shape, dtype=torch.bool, device=self.device)
+            if success_estimator_cfg is not None
+            else None
+        )
 
     @property
     def enabled(self) -> bool:
@@ -164,27 +174,29 @@ class StateCurriculum:
         self._start_value[step].copy_(values.squeeze(-1))
 
     @torch.no_grad()
-    def update_success_targets(self) -> None:
-        """Bootstrap pure timeouts from their endpoint state and commit pending outcomes."""
+    def collect_success_outcomes(self) -> None:
+        """Collect valid episode outcomes into the current rollout row."""
         if self._success_estimator is None:
             return
         assert self._provider is not None
-        env_ids = (self._provider.outcome_state_ids >= 0).nonzero().flatten()
-        if env_ids.numel() == 0:
-            return
+        assert self._success_state_ids is not None
+        assert self._success_targets is not None and self._success_grounded is not None
+        pending_ids = self._provider.outcome_state_ids
+        pending = pending_ids >= 0
+        grounded = self._provider.outcome_grounded
+        endpoint_targets = self._success_estimator(self._provider.outcome_next_features).sigmoid()
+        targets = torch.where(grounded, self._provider.outcome_hard_targets, endpoint_targets)
+        hard_valid = torch.isfinite(self._provider.outcome_hard_targets)
+        endpoint_valid = torch.isfinite(self._provider.outcome_next_features).all(dim=1)
+        endpoint_valid &= torch.isfinite(endpoint_targets)
+        valid = pending & torch.where(grounded, hard_valid, endpoint_valid)
 
-        targets = self._provider.outcome_hard_targets[env_ids].clone()
-        grounded = self._provider.outcome_grounded[env_ids]
-        valid = grounded & torch.isfinite(targets)
-        endpoint_features = self._provider.outcome_next_features[env_ids]
-        bootstrap = ~grounded & torch.isfinite(endpoint_features).all(dim=1)
-        bootstrap_env_ids = env_ids[bootstrap]
-        if bootstrap_env_ids.numel() > 0:
-            targets[bootstrap] = self._success_estimator(
-                self._provider.outcome_next_features[bootstrap_env_ids]
-            ).sigmoid()
-            valid[bootstrap] = torch.isfinite(targets[bootstrap])
-        self._provider.record_success_targets(env_ids, targets, valid)
+        step = self._storage.step
+        state_ids = self._success_state_ids[step]
+        state_ids.copy_(torch.where(pending, torch.where(valid, pending_ids, -1), state_ids))
+        self._success_targets[step].copy_(torch.where(pending, targets, self._success_targets[step]))
+        self._success_grounded[step].copy_(torch.where(pending, grounded, self._success_grounded[step]))
+        pending_ids.fill_(-1)
 
     @torch.no_grad()
     def update_value_shift(self, critic: nn.Module) -> None:
@@ -214,29 +226,41 @@ class StateCurriculum:
         self._start_state.fill_(-1)
 
     def update_success_estimator(self) -> float | None:
-        """Fit recorded success targets and refresh full-bank predictions."""
+        """Fit current-rollout success targets and refresh full-bank predictions."""
         if self._success_estimator is None:
             return None
         assert self._provider is not None and self._success_optimizer is not None
+        assert self._success_state_ids is not None
+        assert self._success_targets is not None and self._success_grounded is not None
 
-        local_outcomes = self._provider.success_size.sum().to(dtype=torch.float32)
-        global_outcomes = local_outcomes.clone()
+        selected = self._success_state_ids.flatten() >= 0
+        state_ids = self._success_state_ids.flatten()[selected]
+        targets = self._success_targets.flatten()[selected]
+        grounded = self._success_grounded.flatten()[selected]
+        local_outcomes = len(state_ids)
+        statistics = torch.empty(3, dtype=torch.float64, device=self.device)
+        statistics[0] = targets.sum()
+        statistics[1] = local_outcomes
+        statistics[2] = grounded.sum()
         if self.distributed:
-            torch.distributed.all_reduce(global_outcomes)
+            torch.distributed.all_reduce(statistics)
+        global_outcomes = statistics[1]
         if not bool(global_outcomes):
+            self._provider.mean_success_target.fill_(torch.nan)
+            self._provider.success_target_grounded_fraction.fill_(torch.nan)
             return None
+        self._provider.mean_success_target.copy_(statistics[0] / global_outcomes)
+        self._provider.success_target_grounded_fraction.copy_(statistics[2] / global_outcomes)
 
-        has_local_outcomes = bool(local_outcomes)
-        weights = self._provider.success_size.to(dtype=torch.float32) if has_local_outcomes else None
+        has_local_outcomes = local_outcomes > 0
         weighted_loss = torch.zeros((), device=self.device)
         for _ in range(self._success_num_batches):
             self._success_optimizer.zero_grad()
             if has_local_outcomes:
-                assert weights is not None and self._provider.state_features is not None
-                state_ids = torch.multinomial(weights, self._success_batch_size, replacement=True)
-                logits = self._success_estimator(self._provider.state_features[state_ids])
-                targets = self._provider.success_rate[state_ids]
-                local_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets)
+                assert self._provider.state_features is not None
+                sample = torch.randint(local_outcomes, (self._success_batch_size,), device=self.device)
+                logits = self._success_estimator(self._provider.state_features[state_ids[sample]])
+                local_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets[sample])
                 weighted_loss += local_loss.detach() * local_outcomes
                 objective = local_loss * local_outcomes if self.distributed else local_loss
             else:
@@ -251,6 +275,7 @@ class StateCurriculum:
         if self.distributed:
             torch.distributed.all_reduce(weighted_loss)
         self._predict_success_rates()
+        self._success_state_ids.fill_(-1)
         return (weighted_loss / global_outcomes).item()
 
     def train_mode(self) -> None:
@@ -301,15 +326,12 @@ class StateCurriculum:
         self._success_batch_size = int(cfg.pop("batch_size", 4096))
         self._success_eval_batch_size = int(cfg.pop("evaluation_batch_size", 16384))
         self._success_max_grad_norm = float(cfg.pop("max_grad_norm", 1.0))
-        self._success_prior_count = float(cfg.pop("prior_count", 1.0))
         if cfg:
             raise TypeError(f"Unexpected success-estimator options: {sorted(cfg)}")
         if min(self._success_num_batches, self._success_batch_size, self._success_eval_batch_size) <= 0:
             raise ValueError("Success-estimator batch counts and sizes must be positive.")
         if self._success_max_grad_norm <= 0.0:
             raise ValueError("Success-estimator max_grad_norm must be positive.")
-        if self._success_prior_count <= 0.0:
-            raise ValueError("Success-estimator prior_count must be positive.")
 
         assert self._provider.state_features is not None
         feature_dim = self._provider.state_features.shape[1]
@@ -324,14 +346,10 @@ class StateCurriculum:
         features = self._provider.state_features
         assert features is not None
         estimates = self._provider.estimated_success_rate
+        assert estimates is not None
         for start in range(0, len(features), self._success_eval_batch_size):
             stop = min(start + self._success_eval_batch_size, len(features))
-            model_rate = self._success_estimator(features[start:stop]).sigmoid()
-            count = self._provider.success_size[start:stop].to(dtype=model_rate.dtype)
-            observed_rate = torch.where(count > 0, self._provider.success_rate[start:stop], 0.0)
-            estimates[start:stop].copy_(
-                (count * observed_rate + self._success_prior_count * model_rate) / (count + self._success_prior_count)
-            )
+            estimates[start:stop].copy_(self._success_estimator(features[start:stop]).sigmoid())
 
     def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: torch.Tensor) -> None:
         params = [param for param in parameters if param.grad is not None]
@@ -370,22 +388,26 @@ class StateCurriculum:
         if features is None or features.ndim != 2 or not features.is_floating_point():
             raise ValueError("Success estimation requires floating-point state_features[num_states, feature_dim].")
         num_states = len(features)
-        vectors = {
-            "success_rate": provider.success_rate,
-            "success_size": provider.success_size,
-            "estimated_success_rate": provider.estimated_success_rate,
-        }
-        for name, value in vectors.items():
-            if value.shape != (num_states,):
-                raise ValueError(f"State-curriculum {name} must have shape ({num_states},), got {tuple(value.shape)}.")
-            if value.device != self.device:
-                raise ValueError(f"State-curriculum {name} is on {value.device}, expected {self.device}.")
-        if not provider.success_rate.is_floating_point() or not provider.estimated_success_rate.is_floating_point():
-            raise ValueError("State-curriculum success rates must use a floating-point dtype.")
         if features.device != self.device:
             raise ValueError(f"State-curriculum features are on {features.device}, expected {self.device}.")
-        if provider.success_size.dtype != torch.long:
-            raise ValueError("State-curriculum success_size must use torch.long counts.")
+        estimates = provider.estimated_success_rate
+        if estimates is None or estimates.shape != (num_states,) or not estimates.is_floating_point():
+            raise ValueError(
+                f"State-curriculum estimated_success_rate must be floating-point with shape ({num_states},)."
+            )
+        if estimates.device != self.device:
+            raise ValueError(
+                f"State-curriculum estimated_success_rate is on {estimates.device}, expected {self.device}."
+            )
+        metrics = {
+            "mean_success_target": provider.mean_success_target,
+            "success_target_grounded_fraction": provider.success_target_grounded_fraction,
+        }
+        for name, value in metrics.items():
+            if value.shape != () or not value.is_floating_point():
+                raise ValueError(f"State-curriculum {name} must be a floating-point scalar tensor.")
+            if value.device != self.device:
+                raise ValueError(f"State-curriculum {name} is on {value.device}, expected {self.device}.")
 
         outcome_vectors = {
             "outcome_state_ids": provider.outcome_state_ids,
