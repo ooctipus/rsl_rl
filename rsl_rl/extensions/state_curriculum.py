@@ -55,8 +55,8 @@ class StateCurriculumProvider(Protocol):
     outcome_grounded: torch.Tensor
     """Whether each pending target comes from a semantic task termination, shape ``[num_envs]``."""
 
-    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor) -> None:
-        """Commit pending targets to their original reset rows."""
+    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) -> None:
+        """Commit valid targets and release all pending outcome slots."""
 
 
 class _SuccessEstimator(nn.Module):
@@ -174,13 +174,17 @@ class StateCurriculum:
             return
 
         targets = self._provider.outcome_hard_targets[env_ids].clone()
-        bootstrap = ~self._provider.outcome_grounded[env_ids]
+        grounded = self._provider.outcome_grounded[env_ids]
+        valid = grounded & torch.isfinite(targets)
+        endpoint_features = self._provider.outcome_next_features[env_ids]
+        bootstrap = ~grounded & torch.isfinite(endpoint_features).all(dim=1)
         bootstrap_env_ids = env_ids[bootstrap]
         if bootstrap_env_ids.numel() > 0:
             targets[bootstrap] = self._success_estimator(
                 self._provider.outcome_next_features[bootstrap_env_ids]
             ).sigmoid()
-        self._provider.record_success_targets(env_ids, targets)
+            valid[bootstrap] = torch.isfinite(targets[bootstrap])
+        self._provider.record_success_targets(env_ids, targets, valid)
 
     @torch.no_grad()
     def update_value_shift(self, critic: nn.Module) -> None:

@@ -37,10 +37,12 @@ class _Provider:
         self.outcome_grounded = torch.zeros(num_envs, dtype=torch.bool)
         self.recorded_state_ids = torch.empty(0, dtype=torch.long)
         self.recorded_targets = torch.empty(0)
+        self.recorded_valid = torch.empty(0, dtype=torch.bool)
 
-    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor) -> None:
+    def record_success_targets(self, env_ids: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) -> None:
         self.recorded_state_ids = self.outcome_state_ids[env_ids].clone()
         self.recorded_targets = targets.clone()
+        self.recorded_valid = valid.clone()
         self.outcome_state_ids[env_ids] = -1
 
 
@@ -214,7 +216,27 @@ def test_success_targets_mix_ground_truth_with_detached_timeout_estimates() -> N
 
     torch.testing.assert_close(provider.recorded_state_ids, torch.tensor([1, 0, 1]))
     torch.testing.assert_close(provider.recorded_targets, torch.tensor([1.0, 0.0, 0.5]))
+    torch.testing.assert_close(provider.recorded_valid, torch.ones(3, dtype=torch.bool))
     torch.testing.assert_close(provider.outcome_state_ids, torch.full((4,), -1, dtype=torch.long))
+
+
+def test_success_targets_discard_non_finite_timeout_endpoints() -> None:
+    """Release a corrupt timeout without feeding it into the reset monitor."""
+    provider = _Provider(torch.tensor([[-1.0], [1.0]]), num_envs=1)
+    provider.outcome_state_ids[0] = 1
+    provider.outcome_next_features[0, 0] = torch.nan
+    curriculum = StateCurriculum(
+        _make_storage(num_envs=1, num_steps=1),
+        "cpu",
+        distributed=False,
+        success_estimator_cfg={"hidden_dims": [4]},
+    )
+    curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
+
+    curriculum.update_success_targets()
+
+    torch.testing.assert_close(provider.recorded_valid, torch.tensor([False]))
+    torch.testing.assert_close(provider.outcome_state_ids, torch.tensor([-1]))
 
 
 def test_distributed_estimator_parameters_and_normalization_match(tmp_path: Path) -> None:
