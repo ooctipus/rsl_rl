@@ -12,7 +12,13 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.extensions import (
+    RandomNetworkDistillation,
+    StateCurriculum,
+    Symmetry,
+    resolve_rnd_config,
+    resolve_symmetry_config,
+)
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import commit_normalization, distributed_mean_var
 from rsl_rl.storage import RolloutStorage
@@ -56,6 +62,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Reset-state curriculum parameters
+        state_curriculum_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -96,6 +104,18 @@ class PPO:
         # Add storage
         self.storage = storage
         self.transition = RolloutStorage.Transition()
+        self.state_curriculum = (
+            StateCurriculum(
+                storage,
+                device,
+                self.is_multi_gpu,
+                **state_curriculum_cfg,
+            )
+            if state_curriculum_cfg is not None
+            else None
+        )
+        if self.state_curriculum is not None and not self.state_curriculum.enabled:
+            self.state_curriculum = None
 
         # PPO parameters
         self.clip_param = clip_param
@@ -119,6 +139,8 @@ class PPO:
         # Compute the actions and values
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
+        if self.state_curriculum is not None:
+            self.state_curriculum.record_episode_starts(self.storage.step, self.transition.values)
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -344,6 +366,12 @@ class PPO:
             losses /= self.gpu_world_size
             loss_dict = dict(zip(loss_dict, losses.tolist()))
 
+        if self.state_curriculum is not None:
+            self.state_curriculum.update_value_shift(self.critic)
+            success_loss = self.state_curriculum.update_success_estimator()
+            if success_loss is not None:
+                loss_dict["success_estimator"] = success_loss
+
         commit_normalization((self.actor, self.critic, self.rnd), self.is_multi_gpu)
 
         # Clear the storage
@@ -357,6 +385,8 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.state_curriculum is not None:
+            self.state_curriculum.train_mode()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -364,6 +394,8 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.state_curriculum is not None:
+            self.state_curriculum.eval_mode()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -375,6 +407,8 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.state_curriculum is not None:
+            saved_dict["state_curriculum_state_dict"] = self.state_curriculum.save()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -387,6 +421,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "state_curriculum": True,
             }
 
         # Load the specified models
@@ -399,6 +434,8 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if load_cfg.get("state_curriculum") and self.state_curriculum is not None:
+            self.state_curriculum.load(loaded_dict.get("state_curriculum_state_dict", {}), strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -450,6 +487,12 @@ class PPO:
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
+        if alg.state_curriculum is not None:
+            provider = env.get_state_curriculum()
+            if provider is None:
+                raise ValueError("state_curriculum_cfg is enabled, but the environment returned no state curriculum.")
+            alg.state_curriculum.bind(provider, env.episode_length_buf, alg.critic)
+
         # Establish one shared normalization frame before collecting the first rollout.
         alg.actor.accumulate_normalization(obs)
         alg.critic.accumulate_normalization(obs)
@@ -475,6 +518,8 @@ class PPO:
         self._raw_critic.load_state_dict(model_params[1])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
+        if self.state_curriculum is not None:
+            self.state_curriculum.broadcast_parameters()
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.

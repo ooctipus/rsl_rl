@@ -221,6 +221,19 @@ class TestObservationNormalization:
         assert ppo.actor.obs_normalizer.count == 0
         torch.testing.assert_close(ppo.actor.obs_normalizer.mean, torch.zeros(OBS_DIM))
 
+        class _CurriculumHook:
+            def __init__(self) -> None:
+                self.normalizer_count = -1
+
+            def update_value_shift(self, critic: MLPModel) -> None:
+                self.normalizer_count = int(critic.obs_normalizer.count)
+
+            def update_success_estimator(self) -> None:
+                return None
+
+        curriculum = _CurriculumHook()
+        ppo.state_curriculum = curriculum  # type: ignore[assignment]
+
         update_counts = []
         handle = ppo.actor.obs_normalizer.register_forward_pre_hook(
             lambda normalizer, inputs: update_counts.append(int(normalizer.count))
@@ -230,6 +243,7 @@ class TestObservationNormalization:
 
         expected = torch.cat(observations)
         assert update_counts and not any(update_counts)
+        assert curriculum.normalizer_count == 0
         assert ppo.actor.obs_normalizer.count == expected.shape[0]
         torch.testing.assert_close(ppo.actor.obs_normalizer.mean, expected.mean(dim=0))
         torch.testing.assert_close(ppo.critic.obs_normalizer.mean, expected.mean(dim=0))
