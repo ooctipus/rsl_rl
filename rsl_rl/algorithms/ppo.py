@@ -363,7 +363,9 @@ class PPO:
 
         if self.state_curriculum is not None:
             self.state_curriculum.update_value_shift(self.critic)
-            success_loss = self.state_curriculum.update_success_estimator()
+            success_loss = self.state_curriculum.update_success_estimator(
+                self.num_learning_epochs, self.num_mini_batches
+            )
             if success_loss is not None:
                 loss_dict["success_estimator"] = success_loss
 

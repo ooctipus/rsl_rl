@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -73,20 +74,20 @@ def _distributed_estimator_worker(rank: int, world_size: int, init_file: str, ou
         success_estimator_cfg={
             "hidden_dims": [8],
             "learning_rate": 1.0e-2,
-            "num_batches": 2,
-            "batch_size": 8,
-            "evaluation_batch_size": 2,
         },
     )
     curriculum.bind(provider, torch.zeros(3, dtype=torch.long), _Critic(1.0))
     curriculum.collect_success_outcomes()
-    loss = curriculum.update_success_estimator()
+    loss = curriculum.update_success_estimator(2, 4)
     assert loss is not None
-    state = curriculum.save()["success_estimator_state_dict"]
+    checkpoint = curriculum.save()
+    state = checkpoint["success_estimator_state_dict"]
+    optimizer_state = next(iter(checkpoint["success_optimizer_state_dict"]["state"].values()))
     torch.save(
         {
             "state": state,
             "loss": torch.tensor(loss),
+            "optimizer_steps": optimizer_state["step"],
             "mean_success_target": provider.mean_success_target,
             "grounded_fraction": provider.success_target_grounded_fraction,
         },
@@ -141,9 +142,6 @@ def test_success_estimator_learns_rollout_outcomes_and_restores_checkpoint() -> 
     cfg = {
         "hidden_dims": [16],
         "learning_rate": 2.0e-2,
-        "num_batches": 80,
-        "batch_size": 32,
-        "evaluation_batch_size": 2,
     }
     curriculum = StateCurriculum(
         _make_storage(num_envs=4, num_steps=1),
@@ -159,7 +157,7 @@ def test_success_estimator_learns_rollout_outcomes_and_restores_checkpoint() -> 
     provider.outcome_hard_targets.copy_(torch.tensor([0.0, 0.0, 1.0, 1.0]))
     provider.outcome_grounded.fill_(True)
     curriculum.collect_success_outcomes()
-    assert curriculum.update_success_estimator() is not None
+    assert curriculum.update_success_estimator(80, 1) is not None
     assert provider.estimated_success_rate[:2].max() < provider.estimated_success_rate[2:].min()
     assert provider.estimated_success_rate.data_ptr() == prediction_storage
     assert curriculum._success_state_ids is not None
@@ -186,10 +184,63 @@ def test_success_estimator_learns_rollout_outcomes_and_restores_checkpoint() -> 
     curriculum.collect_success_outcomes()
     restored.collect_success_outcomes()
     torch.manual_seed(11)
-    curriculum.update_success_estimator()
+    curriculum.update_success_estimator(80, 1)
     torch.manual_seed(11)
-    restored.update_success_estimator()
+    restored.update_success_estimator(80, 1)
     torch.testing.assert_close(restored_provider.estimated_success_rate, provider.estimated_success_rate)
+
+
+def test_success_estimator_uses_the_ppo_update_schedule() -> None:
+    """Visit every rollout outcome once per PPO epoch across its minibatches."""
+    num_outcomes = 7
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    features = torch.arange(num_outcomes, dtype=torch.float32).unsqueeze(1)
+    provider = _Provider(features, num_envs=num_outcomes)
+    curriculum = StateCurriculum(
+        _make_storage(num_envs=num_outcomes, num_steps=1),
+        "cpu",
+        distributed=False,
+        success_estimator_cfg={"hidden_dims": [4], "learning_rate": 0.0},
+    )
+    curriculum.bind(provider, torch.zeros(num_outcomes, dtype=torch.long), _Critic(1.0))
+    provider.outcome_state_ids.copy_(torch.arange(num_outcomes))
+    provider.outcome_hard_targets.copy_(torch.arange(num_outcomes).remainder(2).float())
+    provider.outcome_grounded.fill_(True)
+    curriculum.collect_success_outcomes()
+
+    training_batches: list[torch.Tensor] = []
+
+    def record_training_batch(_module: nn.Module, inputs: tuple[torch.Tensor]) -> None:
+        if torch.is_grad_enabled():
+            training_batches.append(inputs[0][:, 0].to(dtype=torch.long))
+
+    assert curriculum._success_estimator is not None
+    handle = curriculum._success_estimator.register_forward_pre_hook(record_training_batch)
+    loss = curriculum.update_success_estimator(num_learning_epochs, num_mini_batches)
+    handle.remove()
+
+    assert loss == pytest.approx(math.log(2.0))
+    assert [len(batch) for batch in training_batches] == [2, 2, 2, 1] * num_learning_epochs
+    counts = torch.bincount(torch.cat(training_batches), minlength=num_outcomes)
+    torch.testing.assert_close(counts, torch.full((num_outcomes,), num_learning_epochs, dtype=torch.long))
+    optimizer_state = next(iter(curriculum.save()["success_optimizer_state_dict"]["state"].values()))
+    assert optimizer_state["step"] == num_learning_epochs * num_mini_batches
+
+
+@pytest.mark.parametrize("option", ["num_batches", "batch_size", "evaluation_batch_size"])
+def test_success_estimator_rejects_an_independent_batch_schedule(option: str) -> None:
+    """Keep PPO as the only owner of learning epochs and minibatches."""
+    provider = _Provider(torch.zeros(1, 1), num_envs=1)
+    curriculum = StateCurriculum(
+        _make_storage(num_envs=1, num_steps=1),
+        "cpu",
+        distributed=False,
+        success_estimator_cfg={"hidden_dims": [4], option: 1},
+    )
+
+    with pytest.raises(TypeError, match=option):
+        curriculum.bind(provider, torch.zeros(1, dtype=torch.long), _Critic(1.0))
 
 
 def test_success_estimate_is_the_raw_model_prediction() -> None:
@@ -268,7 +319,7 @@ def test_success_outcomes_discard_invalid_targets_and_release_all_slots() -> Non
     assert curriculum._success_state_ids is not None
     torch.testing.assert_close(curriculum._success_state_ids[0], torch.tensor([-1, -1, 1]))
     torch.testing.assert_close(provider.outcome_state_ids, torch.full((3,), -1, dtype=torch.long))
-    assert curriculum.update_success_estimator() is not None
+    assert curriculum.update_success_estimator(1, 1) is not None
     assert provider.mean_success_target == 1.0
     assert provider.success_target_grounded_fraction == 1.0
 
@@ -281,7 +332,7 @@ def test_success_metrics_are_episode_weighted_and_rollout_scoped() -> None:
         storage,
         "cpu",
         distributed=False,
-        success_estimator_cfg={"hidden_dims": [4], "num_batches": 1, "batch_size": 3},
+        success_estimator_cfg={"hidden_dims": [4]},
     )
     curriculum.bind(provider, torch.zeros(2, dtype=torch.long), _Critic(1.0))
 
@@ -297,10 +348,10 @@ def test_success_metrics_are_episode_weighted_and_rollout_scoped() -> None:
     provider.outcome_grounded[0] = True
     curriculum.collect_success_outcomes()
 
-    assert curriculum.update_success_estimator() is not None
+    assert curriculum.update_success_estimator(1, 1) is not None
     torch.testing.assert_close(provider.mean_success_target, torch.tensor(0.5))
     torch.testing.assert_close(provider.success_target_grounded_fraction, torch.tensor(2.0 / 3.0))
-    assert curriculum.update_success_estimator() is None
+    assert curriculum.update_success_estimator(1, 1) is None
     assert provider.mean_success_target.isnan()
     assert provider.success_target_grounded_fraction.isnan()
 
@@ -308,7 +359,7 @@ def test_success_metrics_are_episode_weighted_and_rollout_scoped() -> None:
     provider.outcome_state_ids.copy_(torch.tensor([1, -1]))
     provider.outcome_hard_targets[0] = 0.0
     curriculum.collect_success_outcomes()
-    assert curriculum.update_success_estimator() is not None
+    assert curriculum.update_success_estimator(1, 1) is not None
     torch.testing.assert_close(provider.mean_success_target, torch.tensor(0.0))
 
 
@@ -326,5 +377,6 @@ def test_distributed_estimator_reduces_uneven_outcome_counts(tmp_path: Path) -> 
         torch.testing.assert_close(rank_0["loss"], rank["loss"])
     torch.testing.assert_close(rank_0["state"]["normalizer._mean"], torch.zeros(1, 1))
     for rank in ranks:
+        assert rank["optimizer_steps"] == 8
         torch.testing.assert_close(rank["mean_success_target"], torch.tensor(0.75))
         torch.testing.assert_close(rank["grounded_fraction"], torch.tensor(1.0))

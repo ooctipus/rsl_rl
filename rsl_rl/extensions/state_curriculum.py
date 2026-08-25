@@ -118,9 +118,6 @@ class StateCurriculum:
         self._success_cfg = success_estimator_cfg
         self._success_estimator: _SuccessEstimator | None = None
         self._success_optimizer: torch.optim.Optimizer | None = None
-        self._success_num_batches = 0
-        self._success_batch_size = 0
-        self._success_eval_batch_size = 0
         self._success_max_grad_norm = 0.0
         outcome_shape = (storage.num_transitions_per_env, storage.num_envs)
         self._success_state_ids = (
@@ -225,10 +222,12 @@ class StateCurriculum:
         self._provider.value_shift[unique_ids] += mean_shift * (1.0 - self._value_momentum)
         self._start_state.fill_(-1)
 
-    def update_success_estimator(self) -> float | None:
+    def update_success_estimator(self, num_learning_epochs: int, num_mini_batches: int) -> float | None:
         """Fit current-rollout success targets and refresh full-bank predictions."""
         if self._success_estimator is None:
             return None
+        if min(num_learning_epochs, num_mini_batches) <= 0:
+            raise ValueError("Learning epochs and mini-batches must be positive.")
         assert self._provider is not None and self._success_optimizer is not None
         assert self._success_state_ids is not None
         assert self._success_targets is not None and self._success_grounded is not None
@@ -252,31 +251,47 @@ class StateCurriculum:
         self._provider.mean_success_target.copy_(statistics[0] / global_outcomes)
         self._provider.success_target_grounded_fraction.copy_(statistics[2] / global_outcomes)
 
-        has_local_outcomes = local_outcomes > 0
+        rank_offset = 0
+        if self.distributed:
+            world_size = torch.distributed.get_world_size()
+            rank_counts = torch.empty(world_size, dtype=torch.long, device=self.device)
+            local_count = torch.tensor([local_outcomes], dtype=torch.long, device=self.device)
+            torch.distributed.all_gather_into_tensor(rank_counts, local_count)
+            rank_offset = int(rank_counts[: torch.distributed.get_rank()].sum().item())
+        global_outcome_count = int(global_outcomes.item())
+        global_batch_sizes = [
+            (global_outcome_count + num_mini_batches - 1 - index) // num_mini_batches
+            for index in range(num_mini_batches)
+        ]
+
+        assert self._provider.state_features is not None
         weighted_loss = torch.zeros((), device=self.device)
-        for _ in range(self._success_num_batches):
-            self._success_optimizer.zero_grad()
-            if has_local_outcomes:
-                assert self._provider.state_features is not None
-                sample = torch.randint(local_outcomes, (self._success_batch_size,), device=self.device)
-                logits = self._success_estimator(self._provider.state_features[state_ids[sample]])
-                local_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets[sample])
-                weighted_loss += local_loss.detach() * local_outcomes
-                objective = local_loss * local_outcomes if self.distributed else local_loss
-            else:
-                objective = sum(param.sum() * 0.0 for param in self._success_estimator.parameters())
-            objective.backward()
-            if self.distributed:
-                self._reduce_gradients(self._success_estimator.parameters(), global_outcomes)
-            nn.utils.clip_grad_norm_(self._success_estimator.parameters(), self._success_max_grad_norm)
-            self._success_optimizer.step()
-        weighted_loss /= self._success_num_batches
+        for _ in range(num_learning_epochs):
+            order = torch.randperm(local_outcomes, device=self.device)
+            for index, global_batch_size in enumerate(global_batch_sizes):
+                if global_batch_size == 0:
+                    continue
+                batch = order[(index - rank_offset) % num_mini_batches :: num_mini_batches]
+                self._success_optimizer.zero_grad()
+                if len(batch):
+                    logits = self._success_estimator(self._provider.state_features[state_ids[batch]])
+                    local_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets[batch])
+                    weighted_loss += local_loss.detach() * len(batch)
+                    objective = local_loss * len(batch) if self.distributed else local_loss
+                else:
+                    objective = sum(param.sum() * 0.0 for param in self._success_estimator.parameters())
+                objective.backward()
+                if self.distributed:
+                    self._reduce_gradients(self._success_estimator.parameters(), global_batch_size)
+                nn.utils.clip_grad_norm_(self._success_estimator.parameters(), self._success_max_grad_norm)
+                self._success_optimizer.step()
 
         if self.distributed:
             torch.distributed.all_reduce(weighted_loss)
+        weighted_loss /= global_outcomes * num_learning_epochs
         self._predict_success_rates()
         self._success_state_ids.fill_(-1)
-        return (weighted_loss / global_outcomes).item()
+        return weighted_loss.item()
 
     def train_mode(self) -> None:
         """Set the success estimator to training mode."""
@@ -322,14 +337,9 @@ class StateCurriculum:
         activation = cfg.pop("activation", "elu")
         learning_rate = float(cfg.pop("learning_rate", 1.0e-4))
         optimizer = cfg.pop("optimizer", "adam")
-        self._success_num_batches = int(cfg.pop("num_batches", 4))
-        self._success_batch_size = int(cfg.pop("batch_size", 4096))
-        self._success_eval_batch_size = int(cfg.pop("evaluation_batch_size", 16384))
         self._success_max_grad_norm = float(cfg.pop("max_grad_norm", 1.0))
         if cfg:
             raise TypeError(f"Unexpected success-estimator options: {sorted(cfg)}")
-        if min(self._success_num_batches, self._success_batch_size, self._success_eval_batch_size) <= 0:
-            raise ValueError("Success-estimator batch counts and sizes must be positive.")
         if self._success_max_grad_norm <= 0.0:
             raise ValueError("Success-estimator max_grad_norm must be positive.")
 
@@ -347,11 +357,9 @@ class StateCurriculum:
         assert features is not None
         estimates = self._provider.estimated_success_rate
         assert estimates is not None
-        for start in range(0, len(features), self._success_eval_batch_size):
-            stop = min(start + self._success_eval_batch_size, len(features))
-            estimates[start:stop].copy_(self._success_estimator(features[start:stop]).sigmoid())
+        estimates.copy_(self._success_estimator(features).sigmoid())
 
-    def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: torch.Tensor) -> None:
+    def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: float) -> None:
         params = [param for param in parameters if param.grad is not None]
         flat = torch.cat([param.grad.view(-1) for param in params])
         torch.distributed.all_reduce(flat)
