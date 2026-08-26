@@ -377,8 +377,11 @@ def test_success_grounded_fraction_is_episode_weighted_and_rollout_scoped() -> N
     torch.testing.assert_close(provider.mean_estimated_success_rate, provider.estimated_success_rate.mean())
     torch.testing.assert_close(provider.success_target_grounded_fraction, torch.tensor(2.0 / 3.0))
     bank_mean = provider.mean_estimated_success_rate.clone()
+    bank_estimates = provider.estimated_success_rate.clone()
+    provider.estimated_success_rate.fill_(torch.nan)
     refresh_count = provider.refresh_count
     assert curriculum.update_success_estimator(1, 1) is None
+    torch.testing.assert_close(provider.estimated_success_rate, bank_estimates)
     torch.testing.assert_close(provider.mean_estimated_success_rate, bank_mean)
     assert provider.success_target_grounded_fraction.isnan()
     assert provider.refresh_count == refresh_count + 1
