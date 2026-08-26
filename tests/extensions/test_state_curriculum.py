@@ -36,6 +36,10 @@ class _Provider:
         self.outcome_next_features = torch.zeros((num_envs, feature_dim))
         self.outcome_hard_targets = torch.zeros(num_envs)
         self.outcome_grounded = torch.zeros(num_envs, dtype=torch.bool)
+        self.refresh_count = 0
+
+    def refresh_state_curriculum(self) -> None:
+        self.refresh_count += 1
 
 
 class _Critic(nn.Module):
@@ -110,6 +114,7 @@ def test_value_shift_uses_episode_starts_from_the_same_update() -> None:
         value_shift_cfg={"evaluation_batch_size": 1},
     )
     curriculum.bind(provider, episode_length, _Critic(1.0))
+    assert provider.refresh_count == 1
 
     first_obs = TensorDict({"policy": torch.tensor([[1.0], [2.0]])}, batch_size=[2])
     storage.observations[0].copy_(first_obs)
@@ -125,6 +130,7 @@ def test_value_shift_uses_episode_starts_from_the_same_update() -> None:
     curriculum.update_value_shift(_Critic(2.0))
 
     torch.testing.assert_close(provider.value_shift, torch.tensor([0.0, 2.0, 0.0, 4.0]))
+    assert provider.refresh_count == 2
 
 
 def test_enabled_curriculum_requires_an_environment_provider() -> None:
@@ -133,6 +139,11 @@ def test_enabled_curriculum_requires_an_environment_provider() -> None:
 
     with pytest.raises(ValueError, match="returned no state curriculum"):
         curriculum.bind(None, torch.zeros(2, dtype=torch.long), _Critic(1.0))
+
+    provider = _Provider(None, num_envs=2, num_states=2)
+    provider.refresh_state_curriculum = None  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="refresh_state_curriculum"):
+        curriculum.bind(provider, torch.zeros(2, dtype=torch.long), _Critic(1.0))
 
 
 def test_success_estimator_learns_rollout_outcomes_and_restores_checkpoint() -> None:
@@ -215,6 +226,7 @@ def test_success_estimator_uses_the_ppo_update_schedule() -> None:
 
     training_batches: list[torch.Tensor] = []
     full_bank_evaluations = 0
+    refresh_count = provider.refresh_count
 
     def record_training_batch(_module: nn.Module, inputs: tuple[torch.Tensor]) -> None:
         nonlocal full_bank_evaluations
@@ -233,6 +245,7 @@ def test_success_estimator_uses_the_ppo_update_schedule() -> None:
     counts = torch.bincount(torch.cat(training_batches), minlength=num_outcomes)
     torch.testing.assert_close(counts, torch.full((num_outcomes,), num_learning_epochs, dtype=torch.long))
     assert full_bank_evaluations == 1
+    assert provider.refresh_count == refresh_count + 1
     torch.testing.assert_close(provider.mean_estimated_success_rate, provider.estimated_success_rate.mean())
     optimizer_state = next(iter(curriculum.save()["success_optimizer_state_dict"]["state"].values()))
     assert optimizer_state["step"] == num_learning_epochs * num_mini_batches
@@ -364,9 +377,11 @@ def test_success_grounded_fraction_is_episode_weighted_and_rollout_scoped() -> N
     torch.testing.assert_close(provider.mean_estimated_success_rate, provider.estimated_success_rate.mean())
     torch.testing.assert_close(provider.success_target_grounded_fraction, torch.tensor(2.0 / 3.0))
     bank_mean = provider.mean_estimated_success_rate.clone()
+    refresh_count = provider.refresh_count
     assert curriculum.update_success_estimator(1, 1) is None
     torch.testing.assert_close(provider.mean_estimated_success_rate, bank_mean)
     assert provider.success_target_grounded_fraction.isnan()
+    assert provider.refresh_count == refresh_count + 1
 
     storage.step = 0
     provider.outcome_state_ids.copy_(torch.tensor([1, -1]))

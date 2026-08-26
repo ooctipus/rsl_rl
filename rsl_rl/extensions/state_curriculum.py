@@ -55,6 +55,10 @@ class StateCurriculumProvider(Protocol):
     outcome_grounded: torch.Tensor
     """Whether each pending target comes from a semantic task termination, shape ``[num_envs]``."""
 
+    def refresh_state_curriculum(self) -> None:
+        """Refresh cached sampling probabilities and reset-bank metrics."""
+        ...
+
 
 class _SuccessEstimator(nn.Module):
     """Predict reset-state success from compact bank features."""
@@ -143,6 +147,8 @@ class StateCurriculum:
         """Bind environment state after PPO and its rollout storage are constructed."""
         if provider is None:
             raise ValueError("state_curriculum_cfg is enabled, but the environment returned no state curriculum.")
+        if not callable(getattr(provider, "refresh_state_curriculum", None)):
+            raise ValueError("State-curriculum providers must define refresh_state_curriculum().")
         if self._value_shift_enabled:
             self._validate_value_shift_provider(provider, episode_length)
         if self._success_cfg is not None:
@@ -157,6 +163,8 @@ class StateCurriculum:
         self._episode_length = episode_length
         if self._success_cfg is not None:
             self._build_success_estimator(self._success_cfg.copy())
+        else:
+            provider.refresh_state_curriculum()
 
     def record_episode_starts(self, step: int, values: torch.Tensor) -> None:
         """Mark sampled episode starts and their pre-update values in the existing rollout storage."""
@@ -203,24 +211,24 @@ class StateCurriculum:
         assert self._provider is not None and self._start_state is not None and self._start_value is not None
         self._provider.value_shift.mul_(self._value_momentum)
         selected = self._start_state.flatten() >= 0
-        if not bool(selected.any()):
-            return
+        if bool(selected.any()):
+            state_ids = self._start_state.flatten()[selected]
+            old_values = self._start_value.flatten()[selected]
+            observations = self._storage.observations.reshape(-1)[selected]
+            new_values = torch.empty_like(old_values)
+            for start in range(0, len(state_ids), self._value_batch_size):
+                stop = min(start + self._value_batch_size, len(state_ids))
+                new_values[start:stop] = critic(observations[start:stop]).squeeze(-1)
 
-        state_ids = self._start_state.flatten()[selected]
-        old_values = self._start_value.flatten()[selected]
-        observations = self._storage.observations.reshape(-1)[selected]
-        new_values = torch.empty_like(old_values)
-        for start in range(0, len(state_ids), self._value_batch_size):
-            stop = min(start + self._value_batch_size, len(state_ids))
-            new_values[start:stop] = critic(observations[start:stop]).squeeze(-1)
-
-        shift = (new_values - old_values).abs()
-        unique_ids, inverse = torch.unique(state_ids, return_inverse=True)
-        sums = torch.zeros(len(unique_ids), device=self.device).scatter_add_(0, inverse, shift)
-        counts = torch.zeros_like(sums).scatter_add_(0, inverse, torch.ones_like(shift))
-        mean_shift = sums / counts
-        self._provider.value_shift[unique_ids] += mean_shift * (1.0 - self._value_momentum)
+            shift = (new_values - old_values).abs()
+            unique_ids, inverse = torch.unique(state_ids, return_inverse=True)
+            sums = torch.zeros(len(unique_ids), device=self.device).scatter_add_(0, inverse, shift)
+            counts = torch.zeros_like(sums).scatter_add_(0, inverse, torch.ones_like(shift))
+            mean_shift = sums / counts
+            self._provider.value_shift[unique_ids] += mean_shift * (1.0 - self._value_momentum)
         self._start_state.fill_(-1)
+        if self._success_estimator is None:
+            self._provider.refresh_state_curriculum()
 
     def update_success_estimator(self, num_learning_epochs: int, num_mini_batches: int) -> float | None:
         """Fit current-rollout success targets and refresh full-bank predictions."""
@@ -245,6 +253,7 @@ class StateCurriculum:
         global_outcomes = statistics[0]
         if not bool(global_outcomes):
             self._provider.success_target_grounded_fraction.fill_(torch.nan)
+            self._predict_success_rates()
             return None
         self._provider.success_target_grounded_fraction.copy_(statistics[1] / global_outcomes)
 
@@ -361,6 +370,7 @@ class StateCurriculum:
         if self.distributed:
             torch.distributed.all_reduce(statistics)
         self._provider.mean_estimated_success_rate.copy_(statistics[0] / statistics[1])
+        self._provider.refresh_state_curriculum()
 
     def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: float) -> None:
         params = [param for param in parameters if param.grad is not None]
