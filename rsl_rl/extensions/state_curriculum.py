@@ -37,8 +37,8 @@ class StateCurriculumProvider(Protocol):
     estimated_success_rate: torch.Tensor | None
     """Model success estimate, or ``None`` when success estimation is disabled."""
 
-    mean_success_target: torch.Tensor
-    """Current-rollout mean success target written in place, scalar."""
+    mean_estimated_success_rate: torch.Tensor
+    """Mean success estimate over every reset-bank state, written in place."""
 
     success_target_grounded_fraction: torch.Tensor
     """Current-rollout fraction of success targets grounded by termination, scalar."""
@@ -237,19 +237,16 @@ class StateCurriculum:
         targets = self._success_targets.flatten()[selected]
         grounded = self._success_grounded.flatten()[selected]
         local_outcomes = len(state_ids)
-        statistics = torch.empty(3, dtype=torch.float64, device=self.device)
-        statistics[0] = targets.sum()
-        statistics[1] = local_outcomes
-        statistics[2] = grounded.sum()
+        statistics = torch.empty(2, dtype=torch.float64, device=self.device)
+        statistics[0] = local_outcomes
+        statistics[1] = grounded.sum()
         if self.distributed:
             torch.distributed.all_reduce(statistics)
-        global_outcomes = statistics[1]
+        global_outcomes = statistics[0]
         if not bool(global_outcomes):
-            self._provider.mean_success_target.fill_(torch.nan)
             self._provider.success_target_grounded_fraction.fill_(torch.nan)
             return None
-        self._provider.mean_success_target.copy_(statistics[0] / global_outcomes)
-        self._provider.success_target_grounded_fraction.copy_(statistics[2] / global_outcomes)
+        self._provider.success_target_grounded_fraction.copy_(statistics[1] / global_outcomes)
 
         rank_offset = 0
         if self.distributed:
@@ -358,6 +355,12 @@ class StateCurriculum:
         estimates = self._provider.estimated_success_rate
         assert estimates is not None
         estimates.copy_(self._success_estimator(features).sigmoid())
+        statistics = torch.empty(2, dtype=torch.float64, device=self.device)
+        statistics[0] = estimates.sum()
+        statistics[1] = estimates.numel()
+        if self.distributed:
+            torch.distributed.all_reduce(statistics)
+        self._provider.mean_estimated_success_rate.copy_(statistics[0] / statistics[1])
 
     def _reduce_gradients(self, parameters: Iterable[nn.Parameter], denominator: float) -> None:
         params = [param for param in parameters if param.grad is not None]
@@ -408,7 +411,7 @@ class StateCurriculum:
                 f"State-curriculum estimated_success_rate is on {estimates.device}, expected {self.device}."
             )
         metrics = {
-            "mean_success_target": provider.mean_success_target,
+            "mean_estimated_success_rate": provider.mean_estimated_success_rate,
             "success_target_grounded_fraction": provider.success_target_grounded_fraction,
         }
         for name, value in metrics.items():
