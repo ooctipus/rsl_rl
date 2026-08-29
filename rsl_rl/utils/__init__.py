@@ -7,6 +7,7 @@
 
 from .log_writer import LogWriter
 from .neptune_log_writer import NeptuneLogWriter
+from .optimizers import MuonAdamW
 from .utils import (
     check_nan,
     compile_model,
@@ -23,6 +24,7 @@ from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
     "LogWriter",
+    "MuonAdamW",
     "NeptuneLogWriter",
     "WandbLogWriter",
     "check_nan",

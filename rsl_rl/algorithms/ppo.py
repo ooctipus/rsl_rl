@@ -20,8 +20,12 @@ from rsl_rl.extensions import (
     resolve_symmetry_config,
 )
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import HiddenState
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_class, resolve_obs_groups, resolve_optimizer
+
+from .sigreg import SIGReg
+from .value_loss import HLGaussValueLoss
 
 
 class PPO:
@@ -52,7 +56,9 @@ class PPO:
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
+        optimizer_kwargs: dict | None = None,
         weight_decay: float | None = None,
+        weight_decay_mode: str = "all",
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -65,6 +71,10 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Reset-state curriculum parameters
         state_curriculum_cfg: dict | None = None,
+        # Value and representation parameters
+        value_loss_cfg: dict | None = None,
+        actor_sigreg_cfg: dict | None = None,
+        critic_sigreg_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -97,15 +107,38 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
+        self.value_loss = HLGaussValueLoss(**value_loss_cfg).to(self.device) if value_loss_cfg is not None else None
+        if self.value_loss is not None and use_clipped_value_loss:
+            raise ValueError("HL-Gauss value loss does not support clipped value loss.")
+        self.actor_sigreg = SIGReg(**actor_sigreg_cfg).to(self.device) if actor_sigreg_cfg is not None else None
+        self.critic_sigreg = SIGReg(**critic_sigreg_cfg).to(self.device) if critic_sigreg_cfg is not None else None
+        for name, model, sigreg in (
+            ("actor", self.actor, self.actor_sigreg),
+            ("critic", self.critic, self.critic_sigreg),
+        ):
+            if sigreg is not None and not callable(getattr(model, "forward_with_features", None)):
+                raise TypeError(f"{name} SIGReg requires {type(model).__name__}.forward_with_features().")
+
         # Create the optimizer
         if weight_decay is not None and weight_decay < 0.0:
             raise ValueError(f"Weight decay must be non-negative; got {weight_decay}.")
-        optimizer_kwargs = {"lr": learning_rate}
+        if weight_decay_mode not in ("all", "matrix"):
+            raise ValueError("weight_decay_mode must be 'all' or 'matrix'.")
+        optimizer_kwargs = dict(optimizer_kwargs or {})
+        conflicting = {"lr", "weight_decay"}.intersection(optimizer_kwargs)
+        if conflicting:
+            raise ValueError(f"Use dedicated PPO fields instead of optimizer_kwargs for: {sorted(conflicting)}")
+        optimizer_kwargs["lr"] = learning_rate
         if weight_decay is not None:
             optimizer_kwargs["weight_decay"] = weight_decay
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), **optimizer_kwargs
-        )  # type: ignore
+        parameters = chain(self.actor.parameters(), self.critic.parameters())
+        if weight_decay_mode == "matrix":
+            unique_parameters = list({id(parameter): parameter for parameter in parameters}.values())
+            parameters = [
+                {"params": [parameter for parameter in unique_parameters if parameter.ndim >= 2]},
+                {"params": [parameter for parameter in unique_parameters if parameter.ndim < 2], "weight_decay": 0.0},
+            ]
+        self.optimizer = resolve_optimizer(optimizer)(parameters, **optimizer_kwargs)  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -139,13 +172,85 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.use_mixed_precision = use_mixed_precision
 
+    def _state_value(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+    ) -> torch.Tensor:
+        predictions = self.critic(obs, masks=masks, hidden_state=hidden_state)
+        return self.value_loss.decode(predictions) if self.value_loss is not None else predictions
+
+    def _normalize_advantages(self, advantages: torch.Tensor) -> torch.Tensor:
+        if not self.is_multi_gpu:
+            return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        local_mean = advantages.mean()
+        moments = torch.stack((advantages.new_tensor(advantages.numel()), local_mean, advantages.var(unbiased=False)))
+        gathered = torch.empty(self.gpu_world_size * 3, device=advantages.device, dtype=advantages.dtype)
+        torch.distributed.all_gather_into_tensor(gathered, moments)
+        count = advantages.new_zeros(())
+        mean = advantages.new_zeros(())
+        squared_deviation = advantages.new_zeros(())
+        for rank_count, rank_mean, rank_variance in gathered.view(-1, 3):
+            total = count + rank_count
+            delta = rank_mean - mean
+            mean += delta * rank_count / total
+            squared_deviation += rank_count * rank_variance + delta.square() * count * rank_count / total
+            count = total
+        variance = squared_deviation / (count - 1.0).clamp_min(1.0)
+        return (advantages - mean) / (variance.sqrt() + 1e-8)
+
+    @torch.no_grad()
+    def _project_models(self) -> None:
+        for model in (self._raw_actor, self._raw_critic):
+            project = getattr(model, "project_parameters", None)
+            if project is not None:
+                project()
+
+    def _average_losses(self, losses: dict[str, float]) -> dict[str, float]:
+        if not self.is_multi_gpu:
+            return losses
+        values = torch.tensor(list(losses.values()), device=self.device)
+        torch.distributed.all_reduce(values)
+        values /= self.gpu_world_size
+        return dict(zip(losses, values.tolist()))
+
+    @torch.no_grad()
+    def _value_target_statistics(self) -> dict[str, float]:
+        targets = self.storage.returns.float().flatten()
+        minimum = targets.min()
+        maximum = targets.max()
+        if not self.is_multi_gpu:
+            quantiles = torch.quantile(targets, targets.new_tensor((0.01, 0.5, 0.99)))
+        else:
+            torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+            if maximum == minimum:
+                quantiles = minimum.repeat(3)
+            else:
+                num_bins = 2048
+                histogram = torch.histc(targets, bins=num_bins, min=minimum.item(), max=maximum.item())
+                torch.distributed.all_reduce(histogram)
+                indices = torch.searchsorted(
+                    histogram.cumsum(0), histogram.sum() * histogram.new_tensor((0.01, 0.5, 0.99))
+                )
+                quantiles = minimum + (indices + 0.5) * (maximum - minimum) / num_bins
+        return {
+            "value_target_min": minimum.item(),
+            "value_target_p01": quantiles[0].item(),
+            "value_target_median": quantiles[1].item(),
+            "value_target_p99": quantiles[2].item(),
+            "value_target_max": maximum.item(),
+        }
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
+        self.transition.values = self._state_value(obs).detach()
         if self.state_curriculum is not None:
             self.state_curriculum.record_episode_starts(self.storage.step, self.transition.values)
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
@@ -190,7 +295,7 @@ class PPO:
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
-        last_values = self.critic(obs).detach()
+        last_values = self._state_value(obs).detach()
         # Restore the critic's hidden state so the next rollout is not affected by the forward pass
         self.critic.reset(hidden_state=critic_hidden_state)
         # Compute returns and advantages
@@ -210,13 +315,16 @@ class PPO:
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            st.advantages = self._normalize_advantages(st.advantages)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_value_support_clip_fraction = 0 if self.value_loss is not None else None
+        mean_actor_sigreg_loss = 0 if self.actor_sigreg is not None else None
+        mean_critic_sigreg_loss = 0 if self.critic_sigreg is not None else None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -230,12 +338,13 @@ class PPO:
 
         # Iterate over mini-batches
         for batch in generator:
+            assert batch.values is not None and batch.returns is not None
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+                    batch.advantages = self._normalize_advantages(batch.advantages)  # type: ignore
 
             # Perform symmetric augmentation if enabled
             if self.symmetry:
@@ -247,14 +356,32 @@ class PPO:
             ):
                 # Recompute actions log prob and entropy for current batch of transitions
                 # Note: We need to do this because we updated the policy with new parameters
-                self.actor(
-                    batch.observations,
-                    masks=batch.masks,
-                    hidden_state=batch.hidden_states[0],
-                    stochastic_output=True,
-                )
+                if self.actor_sigreg is not None:
+                    _, actor_features = self.actor.forward_with_features(  # type: ignore[attr-defined]
+                        batch.observations,
+                        masks=batch.masks,
+                        hidden_state=batch.hidden_states[0],
+                        stochastic_output=True,
+                    )
+                else:
+                    self.actor(
+                        batch.observations,
+                        masks=batch.masks,
+                        hidden_state=batch.hidden_states[0],
+                        stochastic_output=True,
+                    )
+                    actor_features = None
                 actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                if self.critic_sigreg is not None:
+                    value_predictions, critic_features = self.critic.forward_with_features(  # type: ignore[attr-defined]
+                        batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                    )
+                else:
+                    value_predictions = self.critic(
+                        batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                    )
+                    critic_features = None
+                values = self.value_loss.decode(value_predictions) if self.value_loss is not None else value_predictions
                 # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
                 distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
                 entropy = self.actor.output_entropy[:original_batch_size]
@@ -296,7 +423,9 @@ class PPO:
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
                 # Value function loss
-                if self.use_clipped_value_loss:
+                if self.value_loss is not None:
+                    value_loss, value_support_clip_fraction = self.value_loss(value_predictions, batch.returns)
+                elif self.use_clipped_value_loss:
                     value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
                     value_losses = (values - batch.returns).pow(2)
                     value_losses_clipped = (value_clipped - batch.returns).pow(2)
@@ -305,6 +434,14 @@ class PPO:
                     value_loss = (batch.returns - values).pow(2).mean()
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+                actor_sigreg_loss = None
+                if self.actor_sigreg is not None:
+                    actor_sigreg_loss = self.actor_sigreg(actor_features[:original_batch_size])  # type: ignore[index]
+                    loss = loss + self.actor_sigreg.loss_coef * actor_sigreg_loss
+                critic_sigreg_loss = None
+                if self.critic_sigreg is not None:
+                    critic_sigreg_loss = self.critic_sigreg(critic_features[:original_batch_size])  # type: ignore[index]
+                    loss = loss + self.critic_sigreg.loss_coef * critic_sigreg_loss
 
                 # RND loss
                 rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -331,6 +468,7 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._project_models()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -339,6 +477,12 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            if mean_value_support_clip_fraction is not None:
+                mean_value_support_clip_fraction += value_support_clip_fraction.item()
+            if mean_actor_sigreg_loss is not None:
+                mean_actor_sigreg_loss += actor_sigreg_loss.item()  # type: ignore[union-attr]
+            if mean_critic_sigreg_loss is not None:
+                mean_critic_sigreg_loss += critic_sigreg_loss.item()  # type: ignore[union-attr]
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -355,6 +499,12 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_value_support_clip_fraction is not None:
+            mean_value_support_clip_fraction /= num_updates
+        if mean_actor_sigreg_loss is not None:
+            mean_actor_sigreg_loss /= num_updates
+        if mean_critic_sigreg_loss is not None:
+            mean_critic_sigreg_loss /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -366,9 +516,19 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if mean_value_support_clip_fraction is not None:
+            loss_dict["value_support_clip_fraction"] = mean_value_support_clip_fraction
+        if mean_actor_sigreg_loss is not None:
+            loss_dict["actor_sigreg"] = mean_actor_sigreg_loss
+        if mean_critic_sigreg_loss is not None:
+            loss_dict["critic_sigreg"] = mean_critic_sigreg_loss
+        if self.value_loss is not None:
+            loss_dict.update(self._value_target_statistics())
+
+        loss_dict = self._average_losses(loss_dict)
 
         if self.state_curriculum is not None:
-            self.state_curriculum.update_value_shift(self.critic)
+            self.state_curriculum.update_value_shift(self._state_value)
             success_loss = self.state_curriculum.update_success_estimator(
                 self.num_learning_epochs, self.num_mini_batches
             )
@@ -445,6 +605,8 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("state_curriculum") and self.state_curriculum is not None:
             self.state_curriculum.load(loaded_dict.get("state_curriculum_state_dict", {}), strict=strict)
+        if load_cfg.get("actor") or load_cfg.get("critic"):
+            self._project_models()
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -487,7 +649,9 @@ class PPO:
         print(f"Actor Model: {actor}")
         if alg_cfg.pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             critic_cfg["cnns"] = actor.cnns
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
+        value_loss_cfg = alg_cfg.get("value_loss_cfg")
+        critic_output_dim = int(value_loss_cfg.get("num_bins", 101)) if value_loss_cfg is not None else 1
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", critic_output_dim, **critic_cfg).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
@@ -518,6 +682,7 @@ class PPO:
         # Load the model parameters on all GPUs from source GPU
         self._raw_actor.load_state_dict(model_params[0])
         self._raw_critic.load_state_dict(model_params[1])
+        self._project_models()
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
         if self.state_curriculum is not None:

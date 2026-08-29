@@ -8,13 +8,17 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Callable
 from tensordict import TensorDict
+from torch.nn import functional
 
 import pytest
 
 from rsl_rl.algorithms.ppo import PPO
+from rsl_rl.algorithms.value_loss import HLGaussValueLoss
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import MuonAdamW
 from tests.conftest import make_obs
 
 NUM_ENVS = 4
@@ -34,11 +38,11 @@ def _make_actor(obs: TensorDict, obs_groups: dict, num_actions: int = 4, **kwarg
     return MLPModel(obs, obs_groups, "actor", num_actions, **defaults)
 
 
-def _make_critic(obs: TensorDict, obs_groups: dict, **kwargs: object) -> MLPModel:
+def _make_critic(obs: TensorDict, obs_groups: dict, output_dim: int = 1, **kwargs: object) -> MLPModel:
     """Create an MLPModel critic (no distribution)."""
     defaults: dict[str, object] = {"hidden_dims": [32, 32], "activation": "elu"}
     defaults.update(kwargs)
-    return MLPModel(obs, obs_groups, "critic", 1, **defaults)
+    return MLPModel(obs, obs_groups, "critic", output_dim, **defaults)
 
 
 def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
@@ -46,7 +50,9 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     obs = make_obs(NUM_ENVS, OBS_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
-    critic = _make_critic(obs, obs_groups)
+    value_loss_cfg = overrides.get("value_loss_cfg")
+    critic_output_dim = value_loss_cfg.get("num_bins", 101) if isinstance(value_loss_cfg, dict) else 1
+    critic = _make_critic(obs, obs_groups, critic_output_dim)
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
 
     defaults = dict(
@@ -67,6 +73,17 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     return ppo, obs
 
 
+class _FeatureCritic(MLPModel):
+    """Small critic exposing its penultimate MLP features."""
+
+    def forward_with_features(self, obs: TensorDict, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+        latent = self.get_latent(obs, kwargs.get("masks"), kwargs.get("hidden_state"))  # type: ignore[arg-type]
+        features = latent
+        for layer in list(self.mlp)[:-1]:
+            features = layer(features)
+        return self.mlp[-1](features), features
+
+
 class TestOptimizerConfig:
     """Tests for PPO optimizer configuration."""
 
@@ -74,8 +91,8 @@ class TestOptimizerConfig:
         """An explicit weight decay is forwarded to the optimizer."""
         ppo, _ = _build_ppo(optimizer="adamw", weight_decay=0.1)
 
-        assert ppo.optimizer.defaults["weight_decay"] == 0.1
-        assert all(group["weight_decay"] == 0.1 for group in ppo.optimizer.param_groups)
+        assert ppo.optimizer.defaults["weight_decay"] == pytest.approx(0.1)
+        assert all(group["weight_decay"] == pytest.approx(0.1) for group in ppo.optimizer.param_groups)
 
     def test_default_weight_decay_is_preserved(self) -> None:
         """Omitting weight decay preserves the selected optimizer's default."""
@@ -88,6 +105,225 @@ class TestOptimizerConfig:
         """Weight decay must be non-negative."""
         with pytest.raises(ValueError, match="Weight decay must be non-negative"):
             _build_ppo(weight_decay=-1.0)
+
+    def test_matrix_weight_decay_excludes_vectors(self) -> None:
+        """Matrix-only decay leaves biases and normalization scales unchanged."""
+        ppo, _ = _build_ppo(optimizer="adamw", weight_decay=0.1, weight_decay_mode="matrix")
+
+        assert len(ppo.optimizer.param_groups) == 2
+        assert ppo.optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.1)
+        assert ppo.optimizer.param_groups[1]["weight_decay"] == pytest.approx(0.0)
+        assert all(parameter.ndim >= 2 for parameter in ppo.optimizer.param_groups[0]["params"])
+        assert all(parameter.ndim < 2 for parameter in ppo.optimizer.param_groups[1]["params"])
+
+    def test_optimizer_kwargs_are_forwarded(self) -> None:
+        """Optimizer-specific options do not need dedicated PPO fields."""
+        ppo, _ = _build_ppo(optimizer="adamw", optimizer_kwargs={"betas": (0.9, 0.95)})
+
+        assert ppo.optimizer.defaults["betas"] == (0.9, 0.95)
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="Torch does not provide Muon")
+    def test_muon_adamw_routes_parameters_and_restores_flat_state(self) -> None:
+        """Use native Muon for matrices and AdamW for the remaining tensors."""
+        ppo, obs = _build_ppo(
+            optimizer="muon_adamw",
+            optimizer_kwargs={"adjust_lr_fn": "match_rms_adamw"},
+            num_learning_epochs=1,
+            num_mini_batches=1,
+        )
+        assert isinstance(ppo.optimizer, MuonAdamW)
+        assert all(parameter.ndim == 2 for parameter in ppo.optimizer.param_groups[0]["params"])
+        assert all(parameter.ndim != 2 for group in ppo.optimizer.param_groups[1:] for parameter in group["params"])
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        ppo.update()
+
+        state_dict = ppo.optimizer.state_dict()
+        restored, _ = _build_ppo(optimizer="muon_adamw", optimizer_kwargs={"adjust_lr_fn": "match_rms_adamw"})
+        restored.optimizer.load_state_dict(state_dict)
+
+        assert set(state_dict) == {"state", "param_groups"}
+        assert len(restored.optimizer.state) == len(ppo.optimizer.state)
+
+    @pytest.mark.parametrize("name", ["lr", "weight_decay"])
+    def test_optimizer_kwargs_reject_dedicated_fields(self, name: str) -> None:
+        """Reject ambiguous duplicates of PPO-owned optimizer settings."""
+        with pytest.raises(ValueError, match=name):
+            _build_ppo(optimizer_kwargs={name: 0.1})
+
+
+class TestHLGaussValueLoss:
+    """Tests for categorical value training and scalar decoding."""
+
+    def test_uniform_logits_decode_to_support_midpoint(self) -> None:
+        """A zero-initialized head starts at the center of a symmetric support."""
+        objective = HLGaussValueLoss(-5.0, 5.0, num_bins=101)
+
+        values = objective.decode(torch.zeros(3, 101))
+
+        torch.testing.assert_close(values, torch.zeros(3, 1), atol=1e-7, rtol=0.0)
+
+    def test_loss_uses_gaussian_cdf_bin_masses_in_float32(self) -> None:
+        """Match an independent CDF-mass cross-entropy calculation."""
+        objective = HLGaussValueLoss(-1.0, 2.0, num_bins=5, sigma=0.3)
+        logits = torch.tensor([[0.1, -0.2, 0.5, 0.0, 0.3]], dtype=torch.bfloat16)
+        target = torch.tensor([[0.35]])
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            loss, clipped = objective(logits, target)
+        normal = torch.distributions.Normal(target, torch.tensor(0.3))
+        cdf = normal.cdf(torch.linspace(-1.0, 2.0, 6))
+        masses = cdf[:, 1:] - cdf[:, :-1]
+        masses /= masses.sum(dim=-1, keepdim=True)
+        expected = -(masses * functional.log_softmax(logits.float(), dim=-1)).sum(dim=-1).mean()
+
+        assert loss.dtype == torch.float32
+        torch.testing.assert_close(loss, expected)
+        torch.testing.assert_close(clipped, torch.tensor(0.0))
+
+    def test_support_clipping_is_reported(self) -> None:
+        """Expose how often fixed-support categorical targets need clipping."""
+        objective = HLGaussValueLoss(-1.0, 1.0, num_bins=11)
+
+        _, clipped = objective(torch.zeros(4, 11), torch.tensor([[-2.0], [-1.0], [0.0], [2.0]]))
+
+        torch.testing.assert_close(clipped, torch.tensor(0.5))
+
+    def test_rollout_and_gae_store_decoded_scalars(self) -> None:
+        """Categorical logits never enter rollout storage or GAE."""
+        value_loss_cfg = {"min_value": -5.0, "max_value": 5.0, "num_bins": 101}
+        ppo, obs = _build_ppo(value_loss_cfg=value_loss_cfg, use_clipped_value_loss=False)
+        for parameter in ppo.critic.parameters():
+            torch.nn.init.zeros_(parameter)
+
+        ppo.act(obs)
+        assert ppo.transition.values.shape == (NUM_ENVS, 1)
+        torch.testing.assert_close(ppo.transition.values, torch.zeros(NUM_ENVS, 1), atol=1e-7, rtol=0.0)
+        ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+
+        assert ppo.storage.values.shape[-1] == 1
+        assert ppo.storage.returns.shape[-1] == 1
+
+    def test_clipped_value_loss_is_rejected(self) -> None:
+        """Scalar value clipping has no categorical-logit equivalent."""
+        with pytest.raises(ValueError, match="does not support clipped"):
+            _build_ppo(value_loss_cfg={"min_value": -5.0, "max_value": 5.0})
+
+    def test_state_curriculum_receives_decoded_values(self) -> None:
+        """Value-shift refresh sees one scalar per state instead of categorical logits."""
+        value_loss_cfg = {"min_value": -5.0, "max_value": 5.0, "num_bins": 101}
+        ppo, obs = _build_ppo(
+            value_loss_cfg=value_loss_cfg,
+            use_clipped_value_loss=False,
+            num_learning_epochs=1,
+            num_mini_batches=1,
+        )
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+
+        class _CurriculumHook:
+            values: torch.Tensor | None = None
+
+            def update_value_shift(self, value_fn: Callable[[TensorDict], torch.Tensor]) -> None:
+                self.values = value_fn(obs)
+
+            def update_success_estimator(self, num_learning_epochs: int, num_mini_batches: int) -> None:
+                return None
+
+        hook = _CurriculumHook()
+        ppo.state_curriculum = hook  # type: ignore[assignment]
+        ppo.update()
+
+        assert hook.values is not None
+        assert hook.values.shape == (NUM_ENVS, 1)
+
+
+class TestSIGReg:
+    """Tests for optional actor and critic feature regularization."""
+
+    def test_model_must_expose_single_pass_features(self) -> None:
+        """Reject SIGReg instead of silently running a second model forward."""
+        with pytest.raises(TypeError, match="forward_with_features"):
+            _build_ppo(critic_sigreg_cfg={"loss_coef": 0.2})
+
+    def test_critic_sigreg_updates_with_finite_loss(self) -> None:
+        """Use the critic's single-pass features as an auxiliary objective."""
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+        actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
+        critic = _FeatureCritic(obs, obs_groups, "critic", 1, hidden_dims=[32, 32], activation="elu")
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        ppo = PPO(
+            actor,
+            critic,
+            storage,
+            num_learning_epochs=1,
+            num_mini_batches=1,
+            schedule="fixed",
+            critic_sigreg_cfg={"loss_coef": 0.2},
+        )
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+
+        losses = ppo.update()
+
+        assert torch.isfinite(torch.tensor(losses["critic_sigreg"]))
+
+
+class TestDistributedPPOStatistics:
+    """Tests for learner-wide normalization and loss reporting."""
+
+    def test_advantages_use_global_moments(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Normalize a rank against the combined learner batch."""
+        ppo, _ = _build_ppo(multi_gpu_cfg={"global_rank": 0, "world_size": 2})
+
+        def fake_all_gather(output: torch.Tensor, local: torch.Tensor) -> None:
+            output.copy_(torch.tensor([2.0, 1.0, 1.0, 2.0, 5.0, 1.0]))
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather)
+        actual = ppo._normalize_advantages(torch.tensor([0.0, 2.0]))
+        expected = (torch.tensor([0.0, 2.0]) - 3.0) / torch.tensor([0.0, 2.0, 4.0, 6.0]).std()
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_losses_are_averaged_across_ranks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Report learner-wide losses instead of rank-zero losses."""
+        ppo, _ = _build_ppo(multi_gpu_cfg={"global_rank": 0, "world_size": 2})
+
+        def fake_all_reduce(values: torch.Tensor, op: object = None) -> None:
+            values.add_(torch.tensor([3.0, 5.0]))
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        assert ppo._average_losses({"value": 1.0, "surrogate": 3.0}) == {"value": 2.0, "surrogate": 4.0}
+
+
+class TestModelProjection:
+    """Tests for model-owned parameter constraints."""
+
+    def test_projection_runs_after_optimizer_step_and_load(self) -> None:
+        """Keep constrained models valid through training and checkpoint restore."""
+        ppo, obs = _build_ppo(num_learning_epochs=1, num_mini_batches=1)
+        calls = {"actor": 0, "critic": 0}
+        ppo._raw_actor.project_parameters = lambda: calls.__setitem__("actor", calls["actor"] + 1)  # type: ignore[attr-defined]
+        ppo._raw_critic.project_parameters = lambda: calls.__setitem__("critic", calls["critic"] + 1)  # type: ignore[attr-defined]
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+
+        ppo.update()
+        assert calls == {"actor": 1, "critic": 1}
+        checkpoint = ppo.save()
+        ppo.load(checkpoint, {"actor": True, "critic": True}, strict=True)
+        assert calls == {"actor": 2, "critic": 2}
 
 
 class TestGAEComputation:

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from tensordict import TensorDict
 from typing import Protocol
 
 from rsl_rl.modules import MLP, EmpiricalNormalization
@@ -204,7 +205,7 @@ class StateCurriculum:
         pending_ids.fill_(-1)
 
     @torch.no_grad()
-    def update_value_shift(self, critic: nn.Module) -> None:
+    def update_value_shift(self, value_fn: Callable[[TensorDict], torch.Tensor]) -> None:
         """Update priorities only from sampled episode starts seen by the current PPO update."""
         if not self._value_shift_enabled:
             return
@@ -218,7 +219,7 @@ class StateCurriculum:
             new_values = torch.empty_like(old_values)
             for start in range(0, len(state_ids), self._value_batch_size):
                 stop = min(start + self._value_batch_size, len(state_ids))
-                new_values[start:stop] = critic(observations[start:stop]).squeeze(-1)
+                new_values[start:stop] = value_fn(observations[start:stop]).squeeze(-1)
 
             shift = (new_values - old_values).abs()
             unique_ids, inverse = torch.unique(state_ids, return_inverse=True)

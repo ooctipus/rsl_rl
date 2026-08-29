@@ -16,6 +16,8 @@ from typing import Any, Callable
 
 import rsl_rl
 
+from .optimizers import MuonAdamW
+
 
 def get_param(param: Any, idx: int) -> Any:
     """Get a parameter for the given index.
@@ -67,10 +69,10 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
         raise ValueError(f"Invalid activation function '{act_name}'. Valid activations are: {list(act_dict.keys())}")
 
 
-def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
+def resolve_optimizer(optimizer_name: str) -> type[torch.optim.Optimizer]:
     """Resolve the optimizer from the name.
 
-    Valid optimizer names are: ``"adam"``, ``"adamw"``, ``"sgd"``, ``"rmsprop"``.
+    Valid optimizer names are: ``"adam"``, ``"adamw"``, ``"muon_adamw"``, ``"sgd"``, ``"rmsprop"``.
 
     Args:
         optimizer_name: Name of the optimizer.
@@ -84,6 +86,7 @@ def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
     optimizer_dict = {
         "adam": torch.optim.Adam,
         "adamw": torch.optim.AdamW,
+        "muon_adamw": MuonAdamW,
         "sgd": torch.optim.SGD,
         "rmsprop": torch.optim.RMSprop,
     }
