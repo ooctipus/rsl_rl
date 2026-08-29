@@ -52,6 +52,7 @@ class PPO:
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
+        weight_decay: float | None = None,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -97,8 +98,13 @@ class PPO:
         self._raw_critic = self.critic
 
         # Create the optimizer
+        if weight_decay is not None and weight_decay < 0.0:
+            raise ValueError(f"Weight decay must be non-negative; got {weight_decay}.")
+        optimizer_kwargs = {"lr": learning_rate}
+        if weight_decay is not None:
+            optimizer_kwargs["weight_decay"] = weight_decay
         self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            chain(self.actor.parameters(), self.critic.parameters()), **optimizer_kwargs
         )  # type: ignore
 
         # Add storage
