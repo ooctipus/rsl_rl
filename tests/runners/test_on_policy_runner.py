@@ -11,7 +11,7 @@ import copy
 import tempfile
 import torch
 from tensordict import TensorDict
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
@@ -193,6 +193,25 @@ class TestLearnLoop:
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
+
+    def test_learn_logs_actor_and_critic_weight_norms(self) -> None:
+        """Actor and critic parameter norms should be logged separately."""
+        runner = _build_runner(log_dir=".")
+        writer = MagicMock()
+        runner.logger.writer = writer
+
+        with (
+            patch.object(runner.logger, "init_logging_writer"),
+            patch.object(runner.logger, "stop_logging_writer"),
+            patch.object(runner, "save"),
+        ):
+            runner.learn(num_learning_iterations=1)
+
+        logged = {call.args[0]: call.args[1] for call in writer.add_scalar.call_args_list}
+        expected_actor = torch.stack([parameter.norm() for parameter in runner.alg.actor.parameters()]).norm().item()
+        expected_critic = torch.stack([parameter.norm() for parameter in runner.alg.critic.parameters()]).norm().item()
+        assert logged["Info/ActorWeightL2"] == expected_actor
+        assert logged["Info/CriticWeightL2"] == expected_critic
 
 
 class TestSaveLoad:

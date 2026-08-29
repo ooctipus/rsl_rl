@@ -164,6 +164,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        metrics_dict: dict[str, float] | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -206,6 +207,9 @@ class Logger:
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+
+            for key, value in (metrics_dict or {}).items():
+                self.writer.add_scalar(key, value, it)
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)

@@ -107,6 +107,19 @@ class OnPolicyRunner:
             # Update policy
             loss_dict = self.alg.update()
 
+            metrics_dict = {}
+            if self.gpu_global_rank == 0:
+                with torch.no_grad():
+                    weight_l2 = [
+                        torch.stack([parameter.norm() for parameter in model.parameters()]).norm()
+                        for model in (self.alg.actor, self.alg.critic)
+                    ]
+                actor_weight_l2, critic_weight_l2 = torch.stack(weight_l2).tolist()
+                metrics_dict = {
+                    "Info/ActorWeightL2": actor_weight_l2,
+                    "Info/CriticWeightL2": critic_weight_l2,
+                }
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -119,6 +132,7 @@ class OnPolicyRunner:
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
+                metrics_dict=metrics_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"].get("rnd_cfg") else None,
