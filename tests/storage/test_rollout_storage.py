@@ -11,6 +11,7 @@ from tensordict import TensorDict
 import pytest
 
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import split_and_pad_trajectories
 from tests.conftest import make_obs
 
 NUM_ENVS = 6
@@ -118,6 +119,82 @@ class TestMiniBatchGenerator:
 
 class TestRecurrentMiniBatchGenerator:
     """Tests for ``recurrent_mini_batch_generator`` — trajectory counting, env/trajectory alignment."""
+
+    @pytest.mark.parametrize("num_mini_batches", [1, 2, 4])
+    @pytest.mark.parametrize("reset_pattern", ["none", "mixed", "every_step"])
+    def test_matches_full_rollout_padding_reference(self, num_mini_batches: int, reset_pattern: str) -> None:
+        """Preserve every legacy batch field, trajectory order, and epoch for GRU and LSTM states."""
+        storage, obs = _make_storage_and_obs()
+        _fill_with_identifiable_data(storage, obs)
+        storage.observations["policy"] = (
+            torch.arange(NUM_STEPS * NUM_ENVS * OBS_DIM).reshape(NUM_STEPS, NUM_ENVS, OBS_DIM).float()
+        )
+        storage.observations["slots"] = torch.randn(NUM_STEPS, NUM_ENVS, 2, 3, 5)
+        storage.saved_hidden_state_a = [torch.randn(NUM_STEPS, 2, NUM_ENVS, 7)]
+        storage.saved_hidden_state_c = [torch.randn(NUM_STEPS, 1, NUM_ENVS, 5) for _ in range(2)]
+        if reset_pattern == "every_step":
+            storage.dones.fill_(1)
+        elif reset_pattern == "mixed":
+            storage.dones[0, 0] = 1
+            storage.dones[2:5, 1] = 1
+            storage.dones[-1, 2] = 1
+            storage.dones[::2, 4] = 1
+        original_dones = storage.dones.clone()
+        padded, masks = split_and_pad_trajectories(storage.observations, storage.dones)
+        starts = torch.ones(NUM_STEPS, NUM_ENVS, dtype=torch.bool)
+        starts[1:] = storage.dones[:-1, :, 0].bool()
+        envs_per_batch = NUM_ENVS // num_mini_batches
+        count = 0
+        first_traj = 0
+        for index, batch in enumerate(storage.recurrent_mini_batch_generator(num_mini_batches, num_epochs=3)):
+            batch_index = index % num_mini_batches
+            if batch_index == 0:
+                first_traj = 0
+            start, stop = batch_index * envs_per_batch, (batch_index + 1) * envs_per_batch
+            last_traj = first_traj + int(starts[:, start:stop].sum())
+            assert batch.observations.keys() == padded.keys()
+            for name, expected in padded.items():
+                torch.testing.assert_close(batch.observations[name], expected[:, first_traj:last_traj], rtol=0, atol=0)
+            torch.testing.assert_close(batch.masks, masks[:, first_traj:last_traj], rtol=0, atol=0)
+            for name in ("actions", "values", "advantages", "returns"):
+                torch.testing.assert_close(getattr(batch, name), getattr(storage, name)[:, start:stop], rtol=0, atol=0)
+            torch.testing.assert_close(
+                batch.old_actions_log_prob, storage.actions_log_prob[:, start:stop], rtol=0, atol=0
+            )
+            assert len(batch.old_distribution_params) == len(storage.distribution_params)
+            for actual, stored in zip(batch.old_distribution_params, storage.distribution_params):
+                torch.testing.assert_close(actual, stored[:, start:stop], rtol=0, atol=0)
+            for actual, stored in zip(
+                batch.hidden_states, (storage.saved_hidden_state_a, storage.saved_hidden_state_c)
+            ):
+                actual_states = actual if isinstance(actual, tuple) else (actual,)
+                assert len(actual_states) == len(stored)
+                for state, saved in zip(actual_states, stored):
+                    expected = saved.permute(2, 0, 1, 3)[starts.T][first_traj:last_traj].transpose(1, 0).contiguous()
+                    torch.testing.assert_close(state, expected, rtol=0, atol=0)
+            first_traj = last_traj
+            count += 1
+        assert count == 3 * num_mini_batches
+        torch.testing.assert_close(storage.dones, original_dones, rtol=0, atol=0)
+
+    def test_padding_is_limited_to_current_environment_minibatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Bound each padded allocation by the current minibatch, including one-step trajectories."""
+        storage, obs = _make_storage_and_obs()
+        _fill_with_identifiable_data(storage, obs)
+        storage.dones.fill_(1)
+        padded_sizes = []
+
+        def record_padding(observations: TensorDict, dones: torch.Tensor) -> tuple[TensorDict, torch.Tensor]:
+            padded, masks = split_and_pad_trajectories(observations, dones)
+            padded_sizes.append((observations.batch_size[1], padded.batch_size[1]))
+            return padded, masks
+
+        monkeypatch.setattr("rsl_rl.storage.rollout_storage.split_and_pad_trajectories", record_padding)
+        num_mini_batches, num_epochs = 3, 2
+        for _ in storage.recurrent_mini_batch_generator(num_mini_batches, num_epochs):
+            pass
+        envs_per_batch = NUM_ENVS // num_mini_batches
+        assert padded_sizes == [(envs_per_batch, NUM_STEPS * envs_per_batch)] * num_mini_batches * num_epochs
 
     def test_trajectory_count_matches_env_slice(self) -> None:
         """The number of trajectories in each batch should match dones in the corresponding env slice."""

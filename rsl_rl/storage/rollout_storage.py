@@ -264,7 +264,6 @@ class RolloutStorage:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         mini_batch_size = self.num_envs // num_mini_batches
 
         for ep in range(num_epochs):
@@ -313,9 +312,14 @@ class RolloutStorage:
                 else:
                     hidden_state_c_batch = None
 
+                # Padding can grow with every episode boundary; materialize only this environment minibatch.
+                padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
+                    self.observations[:, start:stop], self.dones[:, start:stop]
+                )
+
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
-                    observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
+                    observations=padded_obs_trajectories,
                     actions=self.actions[:, start:stop],
                     values=self.values[:, start:stop],
                     advantages=self.advantages[:, start:stop],
@@ -323,7 +327,7 @@ class RolloutStorage:
                     old_actions_log_prob=self.actions_log_prob[:, start:stop],
                     old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore
                     hidden_states=(hidden_state_a_batch, hidden_state_c_batch),  # type: ignore
-                    masks=trajectory_masks[:, first_traj:last_traj],
+                    masks=trajectory_masks,
                 )
 
                 first_traj = last_traj
