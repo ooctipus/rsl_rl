@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from itertools import chain
 from tensordict import TensorDict
+from typing import cast
 
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import (
@@ -77,8 +78,11 @@ class PPO:
         critic_sigreg_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        max_learning_rate: float = 1e-2,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
+        if not 1e-5 <= max_learning_rate < float("inf"):
+            raise ValueError("max_learning_rate must be finite and at least the adaptive scheduler floor (1e-5).")
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -169,6 +173,7 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.max_learning_rate = max_learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.use_mixed_precision = use_mixed_precision
 
@@ -260,9 +265,9 @@ class PPO:
         return self.transition.actions  # type: ignore
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor | TensorDict]
     ) -> None:
-        """Record one environment step."""
+        """Record a step, bootstrapping pure timeouts from pre-reset ``final_obs`` when supplied."""
         if self.state_curriculum is not None:
             self.state_curriculum.collect_success_outcomes()
         # Record the rewards and dones
@@ -279,10 +284,16 @@ class PPO:
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
-                1,
-            )
+            time_outs = extras["time_outs"].to(device=self.device, dtype=torch.bool)
+            timeout_values = self.transition.values
+            if "final_obs" in extras and time_outs.any():
+                # Keep fixed batch shapes while excluding invalid, genuinely terminated endpoints.
+                final_obs = cast(TensorDict, extras["final_obs"]).to(self.device).where(time_outs, 0.0)
+                critic_hidden_state = self.critic.get_hidden_state()
+                with torch.no_grad():
+                    timeout_values = self._state_value(final_obs)
+                self.critic.reset(hidden_state=critic_hidden_state)
+            self.transition.rewards += self.gamma * torch.where(time_outs, timeout_values.squeeze(1), 0.0)
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -322,6 +333,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        policy_statistics = torch.zeros(4, device=self.device)  # KL sum/count, clipped-ratio count/sample count
         mean_value_support_clip_fraction = 0 if self.value_loss is not None else None
         mean_actor_sigreg_loss = 0 if self.actor_sigreg is not None else None
         mean_critic_sigreg_loss = 0 if self.critic_sigreg is not None else None
@@ -386,23 +398,26 @@ class PPO:
                 distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
                 entropy = self.actor.output_entropy[:original_batch_size]
 
+                # Measure policy drift even when adaptive scheduling is disabled.
+                with torch.no_grad():
+                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                    kl_sum_count = torch.stack((kl.float().sum(), kl.new_tensor(kl.numel(), dtype=torch.float32)))
+                    policy_statistics[:2] += kl_sum_count
+
                 # Compute KL divergence and adapt the learning rate
                 if self.desired_kl is not None and self.schedule == "adaptive":
                     with torch.inference_mode():
-                        kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                        kl_mean = torch.mean(kl)
-
                         # Reduce the KL divergence across all GPUs
                         if self.is_multi_gpu:
-                            torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                            kl_mean /= self.gpu_world_size
+                            torch.distributed.all_reduce(kl_sum_count, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean = kl_sum_count[0] / kl_sum_count[1]
 
                         # Update the learning rate only on the main process
                         if self.gpu_global_rank == 0:
                             if kl_mean > self.desired_kl * 2.0:
                                 self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                                self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
 
                         # Update the learning rate for all GPUs
                         if self.is_multi_gpu:
@@ -416,6 +431,10 @@ class PPO:
 
                 # Surrogate loss
                 ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+                with torch.no_grad():
+                    original_ratio = ratio[:original_batch_size]
+                    policy_statistics[2] += (torch.abs(original_ratio - 1.0) > self.clip_param).sum()
+                    policy_statistics[3] += original_ratio.numel()
                 surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
                 surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -526,6 +545,10 @@ class PPO:
             loss_dict.update(self._value_target_statistics())
 
         loss_dict = self._average_losses(loss_dict)
+        if self.is_multi_gpu:
+            torch.distributed.all_reduce(policy_statistics, op=torch.distributed.ReduceOp.SUM)
+        loss_dict["kl"] = (policy_statistics[0] / policy_statistics[1]).item()
+        loss_dict["clip_fraction"] = (policy_statistics[2] / policy_statistics[3]).item()
 
         if self.state_curriculum is not None:
             self.state_curriculum.update_value_shift(self._state_value)

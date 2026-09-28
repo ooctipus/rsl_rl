@@ -16,7 +16,7 @@ import pytest
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.algorithms.value_loss import HLGaussValueLoss
-from rsl_rl.models import MLPModel
+from rsl_rl.models import MLPModel, RNNModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import MuonAdamW
 from tests.conftest import make_obs
@@ -280,6 +280,20 @@ class TestSIGReg:
 class TestDistributedPPOStatistics:
     """Tests for learner-wide normalization and loss reporting."""
 
+    def test_policy_diagnostics_measure_unclipped_likelihood_ratios(self) -> None:
+        """Report changed action likelihoods even with a fixed learning rate."""
+        ppo, obs = _build_ppo(learning_rate=0.0)
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        ppo.storage.actions_log_prob[:, : NUM_ENVS // 2] += torch.log(torch.tensor(2.0))
+
+        losses = ppo.update()
+
+        assert losses["clip_fraction"] == pytest.approx(0.5)
+        assert losses["kl"] == pytest.approx(0.0, abs=1e-7)
+
     def test_advantages_use_global_moments(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Normalize a rank against the combined learner batch."""
         ppo, _ = _build_ppo(multi_gpu_cfg={"global_rank": 0, "world_size": 2})
@@ -303,6 +317,32 @@ class TestDistributedPPOStatistics:
         monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
         assert ppo._average_losses({"value": 1.0, "surrogate": 3.0}) == {"value": 2.0, "surrogate": 4.0}
+
+    def test_policy_statistics_weight_samples_across_ranks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """KL and clip fraction use global sums/counts, not rank-zero or mean-of-rank means."""
+        ppo, obs = _build_ppo(num_learning_epochs=1, num_mini_batches=1, learning_rate=0.0)
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        ppo.is_multi_gpu = True
+        ppo.gpu_world_size = 2
+        monkeypatch.setattr(ppo, "reduce_parameters", lambda: None)
+        monkeypatch.setattr(ppo.actor, "get_kl_divergence", lambda old, new: torch.full((NUM_ENVS * NUM_STEPS,), 2.0))
+        local_count = NUM_ENVS * NUM_STEPS
+        remote_count = local_count * 3
+
+        def fake_all_reduce(values: torch.Tensor, op: object = None) -> None:
+            if values.numel() == 4:
+                values.add_(values.new_tensor([4.0 * remote_count, remote_count, 0.75 * remote_count, remote_count]))
+            else:
+                values.mul_(2.0)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        losses = ppo.update()
+
+        assert losses["kl"] == pytest.approx((2.0 * local_count + 4.0 * remote_count) / (local_count + remote_count))
+        assert losses["clip_fraction"] == pytest.approx(0.75 * remote_count / (local_count + remote_count))
 
 
 class TestModelProjection:
@@ -485,6 +525,60 @@ class TestTimeoutBootstrapping:
         stored_reward_env1 = ppo.storage.rewards[0, 1, 0].item()
         assert abs(stored_reward_env1 - 1.0) < 1e-5
 
+    def test_timeout_uses_endpoint_not_pre_action_or_reset_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Bootstrap only pure timeouts from their endpoint, without evaluating failed endpoints."""
+        ppo, obs = _build_ppo()
+        monkeypatch.setattr(ppo, "_state_value", lambda observations: observations["policy"][:, :1])
+        obs["policy"].fill_(2.0)
+        ppo.act(obs)
+        final_obs = obs.clone()
+        final_obs["policy"].fill_(float("nan"))
+        final_obs["policy"][0] = 7.0
+        reset_obs = obs.clone()
+        reset_obs["policy"].fill_(19.0)
+
+        def endpoint_value(observations: TensorDict) -> torch.Tensor:
+            assert torch.isfinite(observations["policy"]).all()
+            return observations["policy"][:, :1]
+
+        monkeypatch.setattr(ppo, "_state_value", endpoint_value)
+        time_outs = torch.tensor([True, False, False, False])
+        ppo.process_env_step(
+            reset_obs, torch.ones(NUM_ENVS), torch.ones(NUM_ENVS), {"time_outs": time_outs, "final_obs": final_obs}
+        )
+
+        expected = torch.ones(NUM_ENVS)
+        expected[0] += ppo.gamma * 7.0
+        torch.testing.assert_close(ppo.storage.rewards[0, :, 0], expected)
+        assert torch.isnan(final_obs["policy"][1:]).all(), "Do not mutate the environment's endpoint buffers"
+
+    @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
+    def test_endpoint_evaluation_preserves_unfinished_recurrent_state(self, rnn_type: str) -> None:
+        """An extra endpoint evaluation must not advance surviving environments' critic memory."""
+        ppo, obs = _build_ppo()
+        ppo.critic = RNNModel(
+            obs, {"critic": ["policy"]}, "critic", 1, hidden_dims=[8], rnn_hidden_dim=8, rnn_type=rnn_type
+        )
+        ppo.act(obs)
+        before = ppo.critic.get_hidden_state()
+        expected = tuple(value.clone() for value in before) if isinstance(before, tuple) else before.clone()
+        final_obs = obs.clone()
+        final_obs["policy"].add_(3.0)
+        with torch.no_grad():
+            endpoint_values = ppo.critic(final_obs).clone()
+        ppo.critic.reset(hidden_state=before)
+        dones = torch.tensor([1, 0, 0, 0])
+
+        ppo.process_env_step(obs, torch.ones(NUM_ENVS), dones, {"time_outs": dones.bool(), "final_obs": final_obs})
+
+        after = ppo.critic.get_hidden_state()
+        for actual, saved in zip(
+            after if isinstance(after, tuple) else (after,), expected if isinstance(expected, tuple) else (expected,)
+        ):
+            saved[:, 0] = 0.0
+            torch.testing.assert_close(actual, saved)
+        assert ppo.storage.rewards[0, 0, 0].item() == pytest.approx(1.0 + ppo.gamma * endpoint_values[0, 0].item())
+
     def test_environment_outcomes_are_resolved_before_the_transition_is_stored(self) -> None:
         """Let the curriculum consume pre-reset endpoint data on every environment step."""
         ppo, obs = _build_ppo()
@@ -593,48 +687,50 @@ class TestPPOLosses:
 class TestAdaptiveLearningRate:
     """Tests for adaptive KL-based learning rate scheduling."""
 
-    def test_lr_decreases_when_kl_too_high(self) -> None:
-        """LR should decrease when KL > 2 * desired_kl."""
-        ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
-        initial_lr = ppo.learning_rate
+    @pytest.mark.parametrize(
+        "kl, initial_lr, cap, expected",
+        [
+            (0.03, 1e-3, 1e-2, 1e-3 / 1.5),
+            (0.002, 1e-3, 1e-2, 1.5e-3),
+            (0.01, 1e-3, 1e-2, 1e-3),
+            (0.002, 1e-3, 1e-3, 1e-3),
+            (0.002, 9e-3, 1e-2, 1e-2),
+        ],
+    )
+    def test_update_uses_kl_and_configured_cap(
+        self, monkeypatch: pytest.MonkeyPatch, kl: float, initial_lr: float, cap: float, expected: float
+    ) -> None:
+        """Exercise the real scheduler and every optimizer group, including historical and tightened caps."""
+        ppo, obs = _build_ppo(
+            schedule="adaptive",
+            learning_rate=initial_lr,
+            max_learning_rate=cap,
+            num_learning_epochs=1,
+            num_mini_batches=1,
+        )
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        monkeypatch.setattr(ppo.actor, "get_kl_divergence", lambda old, new: torch.full((NUM_ENVS * NUM_STEPS,), kl))
 
-        # Simulate high KL scenario
-        ppo.learning_rate = initial_lr
-        kl_mean = torch.tensor(0.03)  # > 2 * 0.01
+        losses = ppo.update()
 
-        # Apply the same logic as PPO.update
-        if kl_mean > ppo.desired_kl * 2.0:
-            ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
+        assert ppo.learning_rate == pytest.approx(expected)
+        assert all(group["lr"] == pytest.approx(expected) for group in ppo.optimizer.param_groups)
+        assert losses["kl"] == pytest.approx(kl)
+        assert losses["clip_fraction"] == pytest.approx(0.0)
 
-        assert ppo.learning_rate < initial_lr
-        assert ppo.learning_rate == max(1e-5, initial_lr / 1.5)
+    def test_default_cap_preserves_historical_scheduler(self) -> None:
+        """Existing configurations retain the former hard-coded ceiling."""
+        ppo, _ = _build_ppo()
+        assert ppo.max_learning_rate == pytest.approx(1e-2)
 
-    def test_lr_increases_when_kl_too_low(self) -> None:
-        """LR should increase when 0 < KL < desired_kl / 2."""
-        ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
-        initial_lr = ppo.learning_rate
-
-        kl_mean = torch.tensor(0.002)  # < 0.01 / 2 = 0.005
-
-        if kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
-            ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
-
-        assert ppo.learning_rate > initial_lr
-        assert ppo.learning_rate == min(1e-2, initial_lr * 1.5)
-
-    def test_lr_unchanged_in_stable_range(self) -> None:
-        """LR should remain unchanged when KL is in [desired_kl/2, 2*desired_kl]."""
-        ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
-        initial_lr = ppo.learning_rate
-
-        kl_mean = torch.tensor(0.01)  # Exactly desired_kl — in stable range
-
-        if kl_mean > ppo.desired_kl * 2.0:
-            ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
-        elif kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
-            ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
-
-        assert ppo.learning_rate == initial_lr
+    @pytest.mark.parametrize("cap", [0.0, 1e-6, float("nan"), float("inf")])
+    def test_invalid_learning_rate_cap_raises(self, cap: float) -> None:
+        """The cap cannot contradict the scheduler floor or produce a non-finite learning rate."""
+        with pytest.raises(ValueError, match="max_learning_rate"):
+            _build_ppo(max_learning_rate=cap)
 
 
 class TestMixedPrecision:
