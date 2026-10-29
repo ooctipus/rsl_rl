@@ -12,6 +12,8 @@ import tempfile
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
@@ -170,6 +172,29 @@ class TestLearnLoop:
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA memory accounting")
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_optional_cuda_cache_release(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+        """Unused update memory is available to a separate simulator allocator when enabled."""
+        torch.cuda.empty_cache()
+        cfg = _make_train_cfg()
+        cfg["release_cuda_cache_after_update"] = enabled
+        runner = OnPolicyRunner(DummyEnv(device="cuda:0"), cfg, device="cuda:0")
+        update = runner.alg.update
+
+        def update_with_scratch() -> dict:
+            losses = update()
+            # Represent a temporary training activation that dies when the update returns.
+            scratch = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+            scratch.zero_()
+            return losses
+
+        monkeypatch.setattr(runner.alg, "update", update_with_scratch)
+        runner.learn(num_learning_iterations=2)
+        torch.cuda.synchronize()
+        idle_bytes = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        assert (idle_bytes < 32 * 1024 * 1024) == enabled
 
 
 class TestSaveLoad:

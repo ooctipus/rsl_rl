@@ -76,6 +76,9 @@ class OnPolicyRunner:
         # Start training
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        release_cuda_cache = (
+            self.cfg.get("release_cuda_cache_after_update", False) and torch.device(self.device).type == "cuda"
+        )
         for it in range(start_it, total_it):
             start = time.time()
             # Rollout
@@ -106,6 +109,10 @@ class OnPolicyRunner:
 
             # Update policy
             loss_dict = self.alg.update()
+            if release_cuda_cache:
+                # Return unused training memory to other CUDA allocators before the next rollout.
+                with torch.cuda.device(self.device):
+                    torch.cuda.empty_cache()
 
             stop = time.time()
             learn_time = stop - start

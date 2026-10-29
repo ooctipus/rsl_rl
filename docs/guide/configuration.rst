@@ -73,6 +73,11 @@ OnPolicyRunner
      - ``None``
      - Compile mode for the PyTorch models to accelerate training.
        Valid values: ``None``, ``"default"``, ``"max-autotune-no-cudagraphs"``.
+   * - ``release_cuda_cache_after_update``
+     - bool
+     - ``False``
+     - Release unused PyTorch CUDA memory after each learning update for simulators using
+       a separate CUDA allocator. Repeated allocations can increase training time.
    * - ``logger``
      - str | dict
      - ``"tensorboard"``
