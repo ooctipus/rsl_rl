@@ -8,6 +8,8 @@
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.utils import split_and_pad_trajectories, unpad_trajectories
 
 
@@ -25,11 +27,14 @@ class TestSplitAndPad:
         n_steps, n_envs, feature_dim = 5, 2, 5
 
         data = torch.arange(n_steps * n_envs * feature_dim).float().reshape(n_steps, n_envs, feature_dim)
+        data.requires_grad_()
+        original_data = data.detach().clone()
 
         # Dones
         dones = torch.zeros(n_steps, n_envs, dtype=torch.bool)
         dones[1, 0] = True
 
+        original_dones = dones.clone()
         padded_traj, masks = split_and_pad_trajectories(data, dones)
 
         # Expected Trajectories:
@@ -55,6 +60,12 @@ class TestSplitAndPad:
         # Check Traj 3 (Length 5)
         assert torch.all(masks[:, 2])
         assert torch.allclose(padded_traj[:, 2], data[:, 1])
+        assert torch.equal(data, original_data)
+        assert torch.equal(dones, original_dones)
+        assert torch.all(padded_traj[~masks] == 0)
+        # Padding must not contribute gradients to the gathered input positions.
+        padded_traj.sum().backward()
+        assert torch.equal(data.grad, torch.ones_like(data))
 
     def test_split_and_pad_tensor_high_dim(self) -> None:
         """Test split and pad with higher dimensional tensors (e.g. images).
@@ -66,7 +77,7 @@ class TestSplitAndPad:
         extra_dims = (3, 4, 4)  # C, H, W
 
         # Create data
-        data = torch.randn(n_steps, n_envs, *extra_dims)
+        data = torch.randn(n_steps, n_envs, *extra_dims, dtype=torch.float64)
 
         dones = torch.zeros(n_steps, n_envs, dtype=torch.bool)
         dones[1, 0] = True
@@ -76,6 +87,7 @@ class TestSplitAndPad:
         # Expected shape: [5, 3, 3, 4, 4]
         # Max length is 5. Number of trajs is 3.
         assert padded_traj.shape == (n_steps, 3, *extra_dims)
+        assert padded_traj.dtype == data.dtype
         assert masks.shape == (n_steps, 3)
 
         # Verify data
@@ -87,26 +99,27 @@ class TestSplitAndPad:
         assert torch.allclose(padded_traj[:, 2], data[:, 1])
 
     def test_split_and_pad_tensordict(self) -> None:
-        """Test that TensorDicts are handled recursively and shapes match.
+        """Test mixed observation shapes and dtypes when all trajectories are shorter than the rollout.
 
         Scenario:
             - 2 Environments (n_envs), 5 timesteps (n_steps).
             - Env 0 splits into len 2 and len 3.
-            - Env 1 remains len 5.
+            - Env 1 splits into len 3 and len 2.
         """
         n_steps, n_envs = 5, 2
         obs_0 = torch.randn(n_steps, n_envs, 4)
-        obs_1 = torch.randn(n_steps, n_envs, 2, 2)
+        obs_1 = torch.randn(n_steps, n_envs, 2, 2, dtype=torch.bfloat16)
 
         td = TensorDict({"obs_0": obs_0, "obs_1": obs_1}, batch_size=(n_steps, n_envs))
 
         dones = torch.zeros(n_steps, n_envs, dtype=torch.bool)
         dones[1, 0] = True
+        dones[2, 1] = True
 
-        padded_td, _ = split_and_pad_trajectories(td, dones)
+        padded_td, masks = split_and_pad_trajectories(td, dones)
 
-        # Expect 3 trajectories: Env0(Len2), Env0(Len3), Env1(Len5)
-        expected_trajs = 3
+        # Expect four trajectories: Env0(Len2), Env0(Len3), Env1(Len3), Env1(Len2)
+        expected_trajs = 4
         expected_len = 5
 
         assert isinstance(padded_td, TensorDict)
@@ -116,6 +129,12 @@ class TestSplitAndPad:
 
         # Check integrity of one specific value
         assert torch.allclose(padded_td["obs_0"][:3, 1], obs_0[2:, 0])
+        assert torch.equal(padded_td["obs_1"][:2, 3], obs_1[3:, 1])
+        assert not masks[3:].any()
+        for key, value in td.items():
+            assert padded_td[key].dtype == value.dtype
+            assert padded_td[key].device == value.device
+            assert torch.all(padded_td[key][~masks] == 0)
 
 
 class TestUnpad:
@@ -152,18 +171,19 @@ class TestUnpad:
         assert output.shape == data.shape
         assert torch.allclose(output, data)
 
-    def test_unpad_round_trip(self) -> None:
+    @pytest.mark.parametrize("done_steps", [[], [1], [0, 1, 2, 3, 4]], ids=["no_resets", "one_reset", "every_step"])
+    def test_unpad_round_trip(self, done_steps: list[int]) -> None:
         """Test that `unpad_trajectories` correctly reconstructs the original tensor after `split_and_pad_trajectories`.
 
         Scenario:
             - n_steps=5, n_envs=1.
-            - Split into len 2 and len 3 trajectories.
+            - No reset, one reset, or a reset at every step.
         """
         n_steps, n_envs, feature_dim = 5, 1, 2
         data = torch.randn(n_steps, n_envs, feature_dim)
 
         dones = torch.zeros(n_steps, n_envs, dtype=torch.bool)
-        dones[1, 0] = True
+        dones[done_steps, 0] = True
 
         # Split and Pad
         padded_traj, masks = split_and_pad_trajectories(data, dones)
