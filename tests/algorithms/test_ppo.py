@@ -382,3 +382,29 @@ class TestMixedPrecision:
         assert all(torch.isfinite(torch.tensor(v)) for v in loss_dict.values())
         after = list(ppo.actor.parameters())
         assert any(not torch.equal(b, a) for b, a in zip(before, after)), "actor params should change"
+
+
+def test_auxiliary_loss_trains_with_ordinary_losses_disabled() -> None:
+    """The callback contributes gradients and reports its weighted loss through PPO's update."""
+    ppo, obs = _build_ppo(
+        value_loss_coef=0.0,
+        entropy_coef=0.0,
+        num_learning_epochs=1,
+        num_mini_batches=1,
+        auxiliary_loss_fn=lambda batch: {"prediction": (ppo.critic(batch) - 1.0).square().mean()},
+    )
+    with torch.inference_mode():
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        ppo.storage.advantages.zero_()
+        before_loss = (ppo.critic(obs) - 1.0).square().mean()
+        before_actor = [p.clone() for p in ppo.actor.parameters()]
+
+    losses = ppo.update()
+
+    torch.testing.assert_close(torch.tensor(losses["prediction"]), before_loss)
+    assert (ppo.critic(obs) - 1.0).square().mean() < before_loss
+    for before, after in zip(before_actor, ppo.actor.parameters()):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)

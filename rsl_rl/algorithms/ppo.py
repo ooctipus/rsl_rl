@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from collections.abc import Callable
 from itertools import chain
 from tensordict import TensorDict
 
@@ -65,6 +66,7 @@ class PPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         grad_reduce_bucket_mb: float = 25,
+        auxiliary_loss_fn: Callable[[TensorDict], dict[str, torch.Tensor]] | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -79,6 +81,8 @@ class PPO:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
         self.grad_reduce_bucket_mb = grad_reduce_bucket_mb
+        # Caller-owned representation losses share PPO's backward, reduction, clipping, and optimizer step.
+        self.auxiliary_loss_fn = auxiliary_loss_fn
 
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
@@ -195,6 +199,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_auxiliary_losses = {}
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -283,6 +288,11 @@ class PPO:
                     value_loss = (batch.returns - values).pow(2).mean()
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+                auxiliary_losses = (
+                    self.auxiliary_loss_fn(batch.observations[:original_batch_size]) if self.auxiliary_loss_fn else {}
+                )
+                for auxiliary_loss in auxiliary_losses.values():
+                    loss = loss + auxiliary_loss
 
                 # RND loss
                 rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -317,6 +327,8 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            for name, auxiliary_loss in auxiliary_losses.items():
+                mean_auxiliary_losses[name] = mean_auxiliary_losses.get(name, 0.0) + auxiliary_loss.item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -351,6 +363,7 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        loss_dict.update({name: value / num_updates for name, value in mean_auxiliary_losses.items()})
 
         # Clear the storage
         self.storage.clear()
