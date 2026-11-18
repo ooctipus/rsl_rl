@@ -385,13 +385,14 @@ class TestMixedPrecision:
 
 
 def test_auxiliary_loss_trains_with_ordinary_losses_disabled() -> None:
-    """The callback contributes gradients and reports its weighted loss through PPO's update."""
+    """Callbacks share encoded inputs and gradients while rollout storage keeps raw observations."""
     ppo, obs = _build_ppo(
         value_loss_coef=0.0,
         entropy_coef=0.0,
         num_learning_epochs=1,
         num_mini_batches=1,
         auxiliary_loss_fn=lambda batch: {"prediction": (ppo.critic(batch) - 1.0).square().mean()},
+        observation_encoder=lambda batch: batch.apply(lambda value: 2 * value),
     )
     with torch.inference_mode():
         for _ in range(NUM_STEPS):
@@ -399,12 +400,14 @@ def test_auxiliary_loss_trains_with_ordinary_losses_disabled() -> None:
             ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
         ppo.compute_returns(obs)
         ppo.storage.advantages.zero_()
-        before_loss = (ppo.critic(obs) - 1.0).square().mean()
+        torch.testing.assert_close(ppo.storage.observations["policy"][0], obs["policy"])
+        torch.testing.assert_close(ppo.storage.values[0], ppo.critic(obs * 2))
+        before_loss = (ppo.critic(obs * 2) - 1.0).square().mean()
         before_actor = [p.clone() for p in ppo.actor.parameters()]
 
     losses = ppo.update()
 
     torch.testing.assert_close(torch.tensor(losses["prediction"]), before_loss)
-    assert (ppo.critic(obs) - 1.0).square().mean() < before_loss
+    assert (ppo.critic(obs * 2) - 1.0).square().mean() < before_loss
     for before, after in zip(before_actor, ppo.actor.parameters()):
         torch.testing.assert_close(before, after, rtol=0, atol=0)

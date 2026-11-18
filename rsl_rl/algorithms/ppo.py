@@ -67,6 +67,7 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         grad_reduce_bucket_mb: float = 25,
         auxiliary_loss_fn: Callable[[TensorDict], dict[str, torch.Tensor]] | None = None,
+        observation_encoder: Callable[[TensorDict], TensorDict] | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -83,6 +84,9 @@ class PPO:
         self.grad_reduce_bucket_mb = grad_reduce_bucket_mb
         # Caller-owned representation losses share PPO's backward, reduction, clipping, and optimizer step.
         self.auxiliary_loss_fn = auxiliary_loss_fn
+        # Compute shared representations once per forward transaction. Storage retains raw inputs;
+        # the callback's parameters must belong to one of the models in the optimizer.
+        self.observation_encoder = observation_encoder
 
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
@@ -130,8 +134,9 @@ class PPO:
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
+        encoded_obs = self.observation_encoder(obs) if self.observation_encoder else obs
+        self.transition.actions = self.actor(encoded_obs, stochastic_output=True).detach()
+        self.transition.values = self.critic(encoded_obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -172,7 +177,8 @@ class PPO:
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
-        last_values = self.critic(obs).detach()
+        encoded_obs = self.observation_encoder(obs) if self.observation_encoder else obs
+        last_values = self.critic(encoded_obs).detach()
         # Restore the critic's hidden state so the next rollout is not affected by the forward pass
         self.critic.reset(hidden_state=critic_hidden_state)
         # Compute returns and advantages
@@ -230,14 +236,17 @@ class PPO:
             ):
                 # Recompute actions log prob and entropy for current batch of transitions
                 # Note: We need to do this because we updated the policy with new parameters
+                encoded_obs = (
+                    self.observation_encoder(batch.observations) if self.observation_encoder else batch.observations
+                )
                 self.actor(
-                    batch.observations,
+                    encoded_obs,
                     masks=batch.masks,
                     hidden_state=batch.hidden_states[0],
                     stochastic_output=True,
                 )
                 actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                values = self.critic(encoded_obs, masks=batch.masks, hidden_state=batch.hidden_states[1])
                 # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
                 distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
                 entropy = self.actor.output_entropy[:original_batch_size]
@@ -289,7 +298,7 @@ class PPO:
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
                 auxiliary_losses = (
-                    self.auxiliary_loss_fn(batch.observations[:original_batch_size]) if self.auxiliary_loss_fn else {}
+                    self.auxiliary_loss_fn(encoded_obs[:original_batch_size]) if self.auxiliary_loss_fn else {}
                 )
                 for auxiliary_loss in auxiliary_losses.values():
                     loss = loss + auxiliary_loss
@@ -435,6 +444,8 @@ class PPO:
         """
         self.actor = compile_model(self._raw_actor, mode)  # type: ignore
         self.critic = compile_model(self._raw_critic, mode)  # type: ignore
+        if self.observation_encoder is not None and mode is not None:
+            self.observation_encoder = torch.compile(self.observation_encoder, mode=mode)
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
